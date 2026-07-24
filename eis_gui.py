@@ -179,6 +179,7 @@ class NyquistEditor:
         self._param_hi_boxes: dict[str, TextBox] = {}
         self._fmin_box: TextBox | None = None
         self._fmax_box: TextBox | None = None
+        self._ui_axes: set[object] = set()
 
         self._init_param_panel()
 
@@ -243,6 +244,7 @@ class NyquistEditor:
             ax_init = self.fig.add_axes([x0 + 0.10, y, 0.055, h])
             ax_lo = self.fig.add_axes([x0 + 0.160, y, 0.045, h])
             ax_hi = self.fig.add_axes([x0 + 0.210, y, 0.045, h])
+            self._ui_axes.update({ax_init, ax_lo, ax_hi})
             init_box = TextBox(ax_init, "", initial=f"{self._infer_init_value(name):g}")
             lo_box = TextBox(ax_lo, "", initial=f"{lo:g}")
             hi_box = TextBox(ax_hi, "", initial=f"{hi:g}")
@@ -258,6 +260,7 @@ class NyquistEditor:
         self.fig.text(x0 + 0.12, y + 0.005, "max", ha="left", va="bottom", fontsize=9)
         ax_fmin = self.fig.add_axes([x0 + 0.03, y, 0.09, h])
         ax_fmax = self.fig.add_axes([x0 + 0.15, y, 0.09, h])
+        self._ui_axes.update({ax_fmin, ax_fmax})
         fmin0 = float(np.nanmin(self.selection.freq_hz)) if self.selection.freq_hz.size else 0.0
         fmax0 = float(np.nanmax(self.selection.freq_hz)) if self.selection.freq_hz.size else 0.0
         self._fmin_box = TextBox(ax_fmin, "", initial=f"{fmin0:g}")
@@ -359,9 +362,6 @@ class NyquistEditor:
 
         self.scatter_included.set_data(x[inc], y[inc])
         self.scatter_excluded.set_data(x[exc], y[exc])
-
-        self.ax.relim()
-        self.ax.autoscale_view()
         self.fig.canvas.draw_idle()
 
     def _nearest_point_index(self, xdata: float, ydata: float) -> int | None:
@@ -524,6 +524,10 @@ class NyquistEditor:
 
     def _on_key_press(self, event) -> None:
         if not getattr(event, "key", None):
+            return
+        # While editing TextBoxes, ignore global hotkeys (arrows/f/r/s)
+        # so typing/navigation doesn't trigger expensive cycle reloads/fits.
+        if getattr(event, "inaxes", None) in self._ui_axes:
             return
         self._pressed_keys.add(event.key)
         key = event.key.lower()
