@@ -3,13 +3,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from eis_gui import launch_nyquist_editor
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="eis-fitting",
-        description="Interactive Nyquist editor with automatic outlier filtering.",
+        description="Interactive Nyquist spectrum editor and fitting GUI.",
     )
     parser.add_argument("mpt", type=Path, help="Path to a BioLogic .mpt file")
     parser.add_argument("--cycle", type=int, default=1, help="Cycle number to load")
@@ -23,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
         "--threshold",
         type=float,
         default=1.0,
-        help="Outlier threshold passed to wepy.eis.find_outliers/remove_outliers.",
+        help="Initial threshold shown for the manual outlier search.",
     )
     parser.add_argument(
         "--circuit",
@@ -31,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
         help="EEC string for impedance CustomCircuit fitting.",
     )
     args = parser.parse_args(argv)
+
+    from eis_gui import launch_nyquist_editor
 
     launch_nyquist_editor(
         mpt_path=args.mpt,

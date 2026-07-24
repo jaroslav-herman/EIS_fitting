@@ -1,589 +1,833 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterable
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from typing import Callable
 
-import matplotlib as mpl
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.widgets import TextBox
-from impedance.models.circuits import CustomCircuit
-from impedance.models.circuits.circuits import calculateCircuitLength
 
-from wepy import read_mpt_dataframe
-from wepy.eis import find_outliers
-from wepy.eis import fit_spectrum as wepy_fit_spectrum
-from wepy.eis import show_fit as wepy_show_fit
-
-
-def _as_1d_array(x) -> np.ndarray:
-    arr = np.asarray(x)
-    return arr.reshape(-1)
-
-
-def _sort_by_freq_desc(freq: np.ndarray, Z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    idx = np.argsort(freq)[::-1]
-    return freq[idx], Z[idx]
-
-def _load_cycle_spectrum(
-    df,
-    *,
-    cycle: int,
-    control: str,
-) -> tuple[np.ndarray, np.ndarray, float, float]:
-    if "freq_hz" not in df.columns:
-        raise KeyError(
-            "Missing 'freq_hz' column (is this an EC-Lab PEIS .mpt?). "
-            f"Available columns include: {list(df.columns)[:20]}"
-        )
-
-    if "cycle_number" in df.columns:
-        rows = (df["cycle_number"] == cycle) & (df["freq_hz"] != 0)
-    else:
-        rows = df["freq_hz"] != 0
-
-    if control == "Ewe":
-        re_col = "re_z_ohm"
-        mi_col = "minus_im_z_ohm"
-        e_col = "ewe_v"
-    else:
-        re_col = "re_zwe_ce_ohm"
-        mi_col = "minus_im_zwe_ce_ohm"
-        e_col = "ewe_ece_v"
-
-    missing = [c for c in (re_col, mi_col) if c not in df.columns]
-    if missing:
-        raise KeyError(
-            f"Missing expected impedance columns {missing}. "
-            f"Try switching --control, or verify the file contains EIS columns."
-        )
-
-    f = df.loc[rows, "freq_hz"].to_numpy()
-    Z = df.loc[rows, re_col].to_numpy() - 1j * df.loc[rows, mi_col].to_numpy()
-    E = float(np.nanmean(df.loc[rows, e_col].to_numpy())) if e_col in df.columns else 0.0
-    I = float(np.nanmean(df.loc[rows, "i_ma"].to_numpy())) if "i_ma" in df.columns else 0.0
-    return f, Z, E, I
+from eis_model import ParameterValue, ProjectState
+from eis_project import export_fit_parameters, load_project_file, save_project_file
+from eis_services import (
+    BatchFitReport,
+    LoadedProject,
+    batch_fit_from_cycle,
+    circuit_parameters,
+    find_outlier_indices,
+    find_outliers_for_all_cycles,
+    fit_cycle,
+    load_cycle,
+    load_project,
+)
 
 
-@dataclass
-class SpectrumSelection:
-    freq_hz: np.ndarray
-    Z: np.ndarray
-    manual_included: np.ndarray  # bool mask, same length
-    auto_outliers: np.ndarray  # bool mask, same length
-    freq_window: tuple[float, float] | None = None  # (f_min, f_max) in Hz
-    included: np.ndarray | None = None  # derived mask
-    E_V: float = 0.0
-    I_mA: float = 0.0
-    source_path: Path | None = None
-    cycle: int | None = None
-
-    def update_included(self) -> None:
-        freq = self.freq_hz
-        base = self.manual_included
-        if self.freq_window is None:
-            self.included = base.copy()
-            return
-        f_min, f_max = self.freq_window
-        lo = min(float(f_min), float(f_max))
-        hi = max(float(f_min), float(f_max))
-        freq_mask = (freq >= lo) & (freq <= hi)
-        self.included = base & freq_mask
-
-    def included_freq(self) -> np.ndarray:
-        self.update_included()
-        assert self.included is not None
-        return self.freq_hz[self.included]
-
-    def included_Z(self) -> np.ndarray:
-        self.update_included()
-        assert self.included is not None
-        return self.Z[self.included]
+MODEL_PRESETS = (
+    "R0-L0-p(R1,CPE1)",
+    "R0-p(R1,CPE1)",
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+    "R0-p(R1,C1)",
+    "R0-p(R1,CPE1)-W1",
+)
 
 
-class NyquistEditor:
+class ParameterTable(ttk.Frame):
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent)
+        self._rows: list[tuple[str, str, tk.StringVar, tk.StringVar, tk.StringVar]] = []
+        headers = ("Parameter", "Unit", "Initial", "Lower", "Upper")
+        for column, text in enumerate(headers):
+            ttk.Label(self, text=text, style="Heading.TLabel").grid(
+                row=0, column=column, padx=3, pady=(0, 4), sticky="ew"
+            )
+        for column in range(5):
+            self.columnconfigure(column, weight=1 if column >= 2 else 0)
+
+    def set_parameters(self, parameters: list[ParameterValue]) -> None:
+        for child in self.grid_slaves():
+            if int(child.grid_info()["row"]) > 0:
+                child.destroy()
+        self._rows.clear()
+        for row, parameter in enumerate(parameters, start=1):
+            initial = tk.StringVar(value=f"{parameter.initial:g}")
+            lower = tk.StringVar(value=f"{parameter.lower:g}")
+            upper = tk.StringVar(value=f"{parameter.upper:g}")
+            ttk.Label(self, text=parameter.name).grid(row=row, column=0, padx=3, pady=2)
+            ttk.Label(self, text=parameter.unit).grid(row=row, column=1, padx=3, pady=2)
+            for column, variable in enumerate((initial, lower, upper), start=2):
+                ttk.Entry(self, textvariable=variable, width=10).grid(
+                    row=row, column=column, padx=3, pady=2, sticky="ew"
+                )
+            self._rows.append((parameter.name, parameter.unit, initial, lower, upper))
+
+    def values(self) -> list[ParameterValue]:
+        parameters = []
+        for name, unit, initial, lower, upper in self._rows:
+            parameters.append(
+                ParameterValue(
+                    name,
+                    unit,
+                    float(initial.get()),
+                    float(lower.get()),
+                    float(upper.get()),
+                )
+            )
+        return parameters
+
+
+class EISApplication:
     def __init__(
         self,
-        selection: SpectrumSelection,
-        *,
+        root: tk.Tk,
+        path: Path,
+        cycle: int,
+        control: str,
+        threshold: float,
         circuit: str,
-        title: str,
-        df=None,
-        cycles: list[int] | None = None,
-        control: str = "Ewe",
-        outlier_threshold: float = 1.0,
     ) -> None:
-        # Matplotlib default keymap binds 'f' to fullscreen in some backends.
-        # Clear it so our 'f' hotkey always triggers fitting.
-        mpl.rcParams["keymap.fullscreen"] = []
-
-        self.selection = selection
-        self.circuit = circuit
-        self.df = df
-        self.cycles = cycles or ([] if df is not None else [])
+        self.root = root
+        self.path = path
+        self.requested_cycle = cycle
         self.control = control
-        self.outlier_threshold = float(outlier_threshold)
-        self._base_title = title
+        self.circuit = circuit
+        self.loaded: LoadedProject | None = None
+        self.state: ProjectState | None = None
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eis-worker")
+        self.busy = False
+        self._plot_imports = None
 
-        self.fig, self.ax = plt.subplots()
-        self.fig.canvas.manager.set_window_title("EIS Nyquist Editor")
-        self.ax.set_title(title)
-        self.ax.set_xlabel("Re(Z) / Ω")
-        self.ax.set_ylabel("-Im(Z) / Ω")
-        self.ax.set_aspect("equal", adjustable="datalim")
-        self.ax.grid(True, alpha=0.25)
+        self.threshold_var = tk.StringVar(value=f"{threshold:g}")
+        self.model_var = tk.StringVar(value=circuit)
+        self.minimum_frequency_var = tk.StringVar()
+        self.maximum_frequency_var = tk.StringVar()
+        self.cycle_var = tk.StringVar(value=str(cycle))
+        self.status_var = tk.StringVar(value="Opening application…")
 
-        self.fig.subplots_adjust(right=0.72)
+        self._configure_window()
+        self._build_interface()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.bind("<Left>", lambda _event: self.change_cycle(-1))
+        self.root.bind("<Right>", lambda _event: self.change_cycle(1))
+        self.root.bind("<Control-s>", lambda _event: self.save_mask())
+        self.root.bind("<Alt-a>", lambda _event: self.copy_neighbor_fit(-1))
+        self.root.bind("<Alt-d>", lambda _event: self.copy_neighbor_fit(1))
+        self.root.after(30, self._begin_loading)
 
-        (self.scatter_included,) = self.ax.plot(
-            [],
-            [],
-            linestyle="",
-            marker="o",
-            markersize=5,
-            color="#1f77b4",
-            label="Included",
-            picker=True,
-            pickradius=6,
+    def _configure_window(self) -> None:
+        self.root.title("EIS Fitting")
+        self.root.geometry("1220x760")
+        self.root.minsize(940, 620)
+        style = ttk.Style(self.root)
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+        style.configure("Heading.TLabel", font=("Segoe UI", 9, "bold"))
+
+    def _build_interface(self) -> None:
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        body.grid(row=0, column=0, sticky="nsew")
+
+        self.plot_frame = ttk.Frame(body, padding=8)
+        controls = ttk.Frame(body, padding=(8, 10, 12, 8), width=390)
+        body.add(self.plot_frame, weight=4)
+        body.add(controls, weight=0)
+        self._build_plot()
+        self._build_controls(controls)
+
+        ttk.Separator(self.root).grid(row=1, column=0, sticky="ew")
+        ttk.Label(self.root, textvariable=self.status_var, padding=(8, 5)).grid(
+            row=2, column=0, sticky="ew"
         )
-        (self.scatter_excluded,) = self.ax.plot(
-            [],
-            [],
-            linestyle="",
-            marker="x",
-            markersize=6,
-            color="#d62728",
-            label="Excluded",
-            picker=True,
-            pickradius=6,
+
+    def _build_plot(self) -> None:
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        from matplotlib.collections import LineCollection
+        from matplotlib.figure import Figure
+
+        figure = Figure(figsize=(7.5, 6.5), dpi=100, constrained_layout=True)
+        self.axes = figure.add_subplot(111)
+        self.axes.set_xlabel("Re(Z) / Ω")
+        self.axes.set_ylabel("−Im(Z) / Ω")
+        self.axes.set_aspect("equal", adjustable="datalim")
+        self.axes.grid(True, alpha=0.25)
+        self.included_artist, = self.axes.plot(
+            [], [], "o", color="#1769aa", markersize=5, label="Included"
         )
-        (self.fit_line,) = self.ax.plot(
+        self.excluded_artist, = self.axes.plot(
+            [], [], "x", color="#c62828", markersize=6, label="Excluded"
+        )
+        self.fit_artist, = self.axes.plot(
+            [], [], "-", color="#202020", linewidth=2, alpha=0.8, label="Fit"
+        )
+        self.fit_points_artist, = self.axes.plot(
             [],
             [],
-            linestyle="-",
-            linewidth=2,
-            color="black",
-            alpha=0.65,
-            label="Fit",
+            "o",
+            color="#f57c00",
+            markersize=4,
+            label="Fit at measured frequencies",
+        )
+        self.residual_artist = LineCollection(
+            [],
+            colors="#777777",
+            linewidths=0.9,
+            linestyles="dashed",
+            alpha=0.35,
+            zorder=1,
+            label="Measured-to-fit difference",
+        )
+        self.axes.add_collection(self.residual_artist)
+        self.axes.legend(loc="best")
+        self.canvas = FigureCanvasTkAgg(figure, master=self.plot_frame)
+        self.canvas.draw()
+        toolbar = NavigationToolbar2Tk(self.canvas, self.plot_frame, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas.mpl_connect("button_press_event", self._on_plot_click)
+
+    def _build_controls(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        cycle_group = ttk.LabelFrame(parent, text="Cycle", padding=8)
+        cycle_group.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        cycle_group.columnconfigure(1, weight=1)
+        self.previous_button = ttk.Button(
+            cycle_group, text="◀", width=4, command=lambda: self.change_cycle(-1)
+        )
+        self.previous_button.grid(row=0, column=0, padx=(0, 5))
+        self.cycle_box = ttk.Combobox(
+            cycle_group, textvariable=self.cycle_var, state="readonly", width=12
+        )
+        self.cycle_box.grid(row=0, column=1, sticky="ew")
+        self.cycle_box.bind("<<ComboboxSelected>>", self._select_cycle)
+        self.next_button = ttk.Button(
+            cycle_group, text="▶", width=4, command=lambda: self.change_cycle(1)
+        )
+        self.next_button.grid(row=0, column=2, padx=(5, 0))
+
+        model_group = ttk.LabelFrame(parent, text="Fitting model", padding=8)
+        model_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        model_group.columnconfigure(0, weight=1)
+        self.model_box = ttk.Combobox(
+            model_group,
+            textvariable=self.model_var,
+            values=MODEL_PRESETS,
+            state="normal",
+        )
+        self.model_box.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+        self.model_box.bind("<Return>", lambda _event: self.apply_model())
+        self.model_button = ttk.Button(model_group, text="Set model", command=self.apply_model)
+        self.model_button.grid(row=0, column=1)
+
+        parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
+        parameters_group.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        parent.rowconfigure(2, weight=1)
+        self.parameter_table = ParameterTable(parameters_group)
+        self.parameter_table.pack(fill=tk.BOTH, expand=True)
+
+        options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
+        options_group.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        options_group.columnconfigure(1, weight=1)
+        ttk.Label(options_group, text="Min frequency (Hz)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(options_group, textvariable=self.minimum_frequency_var).grid(
+            row=0, column=1, padx=(8, 0), pady=2, sticky="ew"
+        )
+        ttk.Label(options_group, text="Max frequency (Hz)").grid(row=1, column=0, sticky="w")
+        ttk.Entry(options_group, textvariable=self.maximum_frequency_var).grid(
+            row=1, column=1, padx=(8, 0), pady=2, sticky="ew"
+        )
+        self.frequency_button = ttk.Button(
+            options_group,
+            text="Apply to current cycle",
+            command=self.apply_frequency_window,
+        )
+        self.frequency_button.grid(row=2, column=0, padx=(0, 4), pady=(6, 0), sticky="ew")
+        self.frequency_all_button = ttk.Button(
+            options_group,
+            text="Apply to all cycles",
+            command=self.apply_frequency_window_to_all,
+        )
+        self.frequency_all_button.grid(row=2, column=1, padx=(4, 0), pady=(6, 0), sticky="ew")
+        ttk.Label(options_group, text="Outlier threshold").grid(row=3, column=0, pady=(8, 2), sticky="w")
+        ttk.Entry(options_group, textvariable=self.threshold_var).grid(
+            row=3, column=1, padx=(8, 0), pady=(8, 2), sticky="ew"
         )
 
-        self.status = self.fig.text(0.01, 0.01, "", ha="left", va="bottom")
-        self.ax.legend(loc="best")
+        actions = ttk.LabelFrame(parent, text="Actions", padding=8)
+        actions.grid(row=4, column=0, sticky="ew")
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        self.fit_button = ttk.Button(actions, text="Fit spectrum", command=self.fit)
+        self.fit_button.grid(row=0, column=0, padx=(0, 4), pady=3, sticky="ew")
+        self.outlier_button = ttk.Button(actions, text="Outliers: current", command=self.find_outliers)
+        self.outlier_button.grid(row=0, column=1, padx=(4, 0), pady=3, sticky="ew")
+        self.outlier_all_button = ttk.Button(
+            actions,
+            text="Outliers: all cycles",
+            command=self.find_outliers_for_all,
+        )
+        self.outlier_all_button.grid(row=1, column=0, padx=(0, 4), pady=3, sticky="ew")
+        self.reset_button = ttk.Button(actions, text="Reset points", command=self.reset_points)
+        self.reset_button.grid(row=1, column=1, padx=(4, 0), pady=3, sticky="ew")
+        self.batch_fit_button = ttk.Button(
+            actions,
+            text="Batch fit from current",
+            command=self.batch_fit,
+        )
+        self.batch_fit_button.grid(row=2, column=0, columnspan=2, pady=3, sticky="ew")
+        self.save_button = ttk.Button(actions, text="Save mask", command=self.save_mask)
+        self.save_button.grid(row=3, column=0, columnspan=2, pady=3, sticky="ew")
 
-        self._pressed_keys: set[str] = set()
-        self._last_fit_params: np.ndarray | None = None
-        self._param_names: list[str] = []
-        self._param_init_boxes: dict[str, TextBox] = {}
-        self._param_lo_boxes: dict[str, TextBox] = {}
-        self._param_hi_boxes: dict[str, TextBox] = {}
-        self._fmin_box: TextBox | None = None
-        self._fmax_box: TextBox | None = None
-        self._ui_axes: set[object] = set()
+        files = ttk.LabelFrame(parent, text="Project and export", padding=8)
+        files.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        files.columnconfigure(0, weight=1)
+        files.columnconfigure(1, weight=1)
+        self.save_project_button = ttk.Button(
+            files, text="Save project", command=self.save_project
+        )
+        self.save_project_button.grid(row=0, column=0, padx=(0, 4), pady=3, sticky="ew")
+        self.load_project_button = ttk.Button(
+            files, text="Load project", command=self.load_project
+        )
+        self.load_project_button.grid(row=0, column=1, padx=(4, 0), pady=3, sticky="ew")
+        self.export_fits_button = ttk.Button(
+            files, text="Export fit parameters", command=self.export_fits
+        )
+        self.export_fits_button.grid(
+            row=1, column=0, columnspan=2, pady=3, sticky="ew"
+        )
+        self.action_buttons = (
+            self.fit_button,
+            self.outlier_button,
+            self.outlier_all_button,
+            self.reset_button,
+            self.batch_fit_button,
+            self.save_button,
+            self.frequency_button,
+            self.frequency_all_button,
+            self.model_button,
+            self.save_project_button,
+            self.load_project_button,
+            self.export_fits_button,
+            self.previous_button,
+            self.next_button,
+        )
+        self._set_controls_enabled(False)
 
-        self._init_param_panel()
+    def _begin_loading(self) -> None:
+        self.status_var.set(f"Loading {self.path.name}…")
+        self._submit(
+            lambda: load_project(
+                self.path,
+                self.requested_cycle,
+                self.control,
+                self.circuit,
+            ),
+            self._finish_loading,
+            "Could not open the spectrum",
+        )
 
-        self.selection.update_included()
-        self._redraw_points()
+    def _finish_loading(self, loaded: LoadedProject) -> None:
+        self.loaded = loaded
+        self.state = loaded.state
+        self.model_var.set(self.state.circuit)
+        self.cycle_box.configure(values=[str(cycle) for cycle in self.state.available_cycles])
+        self.cycle_var.set(str(self.state.active_cycle))
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        self._set_controls_enabled(True)
         self._update_status()
 
-        self.fig.canvas.mpl_connect("pick_event", self._on_pick)
-        self.fig.canvas.mpl_connect("key_press_event", self._on_key_press)
-        self.fig.canvas.mpl_connect("key_release_event", self._on_key_release)
-
-    def _infer_init_value(self, name: str) -> float:
-        n = (name or "").lower()
-        if n.startswith("r"):
-            return 0.1
-        if n.startswith("l"):
-            return 1e-8
-        if n.startswith("cpe") and n.endswith("_0"):
-            return 1e-6
-        if n.startswith("cpe") and n.endswith("_1"):
-            return 0.9
-        if n.startswith("c"):
-            return 1e-6
-        return 0.1
-
-    def _infer_bounds(self, name: str) -> tuple[float, float]:
-        n = (name or "").lower()
-        if n.startswith("cpe") and n.endswith("_1"):
-            return 0.0, 1.0
-        if n.startswith("r"):
-            return 0.0, 1e6
-        if n.startswith("l"):
-            return 0.0, 1.0
-        if n.startswith("cpe") and n.endswith("_0"):
-            return 1e-12, 1e3
-        if n.startswith("c"):
-            return 1e-12, 1e3
-        return 0.0, 1e6
-
-    def _init_param_panel(self) -> None:
-        circuit_len = int(calculateCircuitLength(self.circuit))
-        circuit = CustomCircuit(self.circuit, initial_guess=[1.0] * circuit_len)
-        names, _units = circuit.get_param_names()
-        self._param_names = list(names)
-
-        x0 = 0.74
-        w = 0.24
-        y = 0.92
-        h = 0.035
-        dy = 0.05
-
-        self.fig.text(x0, y + 0.04, "Params / bounds", ha="left", va="bottom")
-        self.fig.text(x0 + 0.10, y + 0.04, "init", ha="left", va="bottom", fontsize=9)
-        self.fig.text(x0 + 0.165, y + 0.04, "lo", ha="left", va="bottom", fontsize=9)
-        self.fig.text(x0 + 0.215, y + 0.04, "hi", ha="left", va="bottom", fontsize=9)
-
-        for name in self._param_names:
-            if y - h < 0.06:
-                break
-            lo, hi = self._infer_bounds(name)
-            self.fig.text(x0, y + 0.005, name, ha="left", va="bottom", fontsize=9)
-            ax_init = self.fig.add_axes([x0 + 0.10, y, 0.055, h])
-            ax_lo = self.fig.add_axes([x0 + 0.160, y, 0.045, h])
-            ax_hi = self.fig.add_axes([x0 + 0.210, y, 0.045, h])
-            self._ui_axes.update({ax_init, ax_lo, ax_hi})
-            init_box = TextBox(ax_init, "", initial=f"{self._infer_init_value(name):g}")
-            lo_box = TextBox(ax_lo, "", initial=f"{lo:g}")
-            hi_box = TextBox(ax_hi, "", initial=f"{hi:g}")
-            self._param_init_boxes[name] = init_box
-            self._param_lo_boxes[name] = lo_box
-            self._param_hi_boxes[name] = hi_box
-            y -= dy
-
-        # Frequency window controls (points outside are always excluded).
-        y -= 0.01
-        self.fig.text(x0, y + 0.03, "Freq window (Hz)", ha="left", va="bottom")
-        self.fig.text(x0, y + 0.005, "min", ha="left", va="bottom", fontsize=9)
-        self.fig.text(x0 + 0.12, y + 0.005, "max", ha="left", va="bottom", fontsize=9)
-        ax_fmin = self.fig.add_axes([x0 + 0.03, y, 0.09, h])
-        ax_fmax = self.fig.add_axes([x0 + 0.15, y, 0.09, h])
-        self._ui_axes.update({ax_fmin, ax_fmax})
-        fmin0 = float(np.nanmin(self.selection.freq_hz)) if self.selection.freq_hz.size else 0.0
-        fmax0 = float(np.nanmax(self.selection.freq_hz)) if self.selection.freq_hz.size else 0.0
-        self._fmin_box = TextBox(ax_fmin, "", initial=f"{fmin0:g}")
-        self._fmax_box = TextBox(ax_fmax, "", initial=f"{fmax0:g}")
-
-        def _apply_freq_window(_txt: str) -> None:
-            if self._fmin_box is None or self._fmax_box is None:
-                return
-            try:
-                fmin = float((self._fmin_box.text or "").strip())
-                fmax = float((self._fmax_box.text or "").strip())
-            except Exception:
-                return
-            self.selection.freq_window = (fmin, fmax)
-            self.selection.update_included()
-            self.fit_line.set_data([], [])
-            self._last_fit_params = None
-            self._redraw_points()
-            self._update_status()
-
-        self._fmin_box.on_submit(_apply_freq_window)
-        self._fmax_box.on_submit(_apply_freq_window)
-
-        self.fig.text(
-            x0,
-            0.06,
-            "Keys: f=fit (uses init+lo+hi); enter=apply freq",
-            ha="left",
-            va="bottom",
-            fontsize=8,
-            alpha=0.8,
-        )
-
-    def _get_init_params_from_ui(self) -> list[float]:
-        init: list[float] = []
-        for name in self._param_names:
-            box = self._param_init_boxes.get(name)
-            if box is None:
-                continue
-            txt = (box.text or "").strip()
-            init.append(float(txt))
-        return init
-
-    def _get_bounds_from_ui(self) -> tuple[list[float], list[float]]:
-        lo_vals: list[float] = []
-        hi_vals: list[float] = []
-        for name in self._param_names:
-            lo_box = self._param_lo_boxes.get(name)
-            hi_box = self._param_hi_boxes.get(name)
-            if lo_box is None or hi_box is None:
-                continue
-            lo_txt = (lo_box.text or "").strip()
-            hi_txt = (hi_box.text or "").strip()
-            lo_vals.append(float(lo_txt))
-            hi_vals.append(float(hi_txt))
-        return lo_vals, hi_vals
-
-    def _set_init_params_in_ui(self, params: np.ndarray) -> None:
-        vals = _as_1d_array(params).tolist()
-        if len(vals) != len(self._param_names):
+    def _submit(
+        self,
+        work: Callable[[], object],
+        success: Callable[[object], None],
+        error_title: str,
+    ) -> None:
+        if self.busy:
             return
-        for name, val in zip(self._param_names, vals):
-            box = self._param_init_boxes.get(name)
-            if box is None:
-                continue
-            box.set_val(f"{float(val):g}")
+        self.busy = True
+        self._set_controls_enabled(False)
+        future = self.executor.submit(work)
+        self.root.after(40, lambda: self._poll_future(future, success, error_title))
 
-    def _update_status(self) -> None:
-        self.selection.update_included()
-        assert self.selection.included is not None
-        total = int(self.selection.freq_hz.size)
-        included = int(np.count_nonzero(self.selection.included))
-        excluded = total - included
-        auto = int(np.count_nonzero(self.selection.auto_outliers))
-        cycle_txt = (
-            f" | cycle: {self.selection.cycle}"
-            if self.selection.cycle is not None
-            else ""
-        )
-        freq_txt = ""
-        if self.selection.freq_window is not None:
-            fmin, fmax = self.selection.freq_window
-            freq_txt = f" | f=[{min(fmin,fmax):g},{max(fmin,fmax):g}] Hz"
-        self.status.set_text(
-            f"points: {total} | included: {included} | excluded: {excluded} "
-            f"(auto outliers: {auto}){cycle_txt}{freq_txt} | keys: "
-            f"[click=toggle, \u2190/\u2192=cycle, r=reset, f=fit, s=save mask]"
-        )
-
-    def _redraw_points(self) -> None:
-        self.selection.update_included()
-        assert self.selection.included is not None
-        Z = self.selection.Z
-        x = Z.real
-        y = -Z.imag
-
-        inc = self.selection.included
-        exc = ~inc
-
-        self.scatter_included.set_data(x[inc], y[inc])
-        self.scatter_excluded.set_data(x[exc], y[exc])
-        self.fig.canvas.draw_idle()
-
-    def _nearest_point_index(self, xdata: float, ydata: float) -> int | None:
-        if not np.isfinite(xdata) or not np.isfinite(ydata):
-            return None
-        Z = self.selection.Z
-        x = Z.real
-        y = -Z.imag
-        dx = x - xdata
-        dy = y - ydata
-        dist2 = dx * dx + dy * dy
-        if dist2.size == 0:
-            return None
-        i = int(np.argmin(dist2))
-        return i
-
-    def _toggle_index(self, i: int) -> None:
-        if i < 0 or i >= self.selection.manual_included.size:
+    def _poll_future(
+        self,
+        future: Future,
+        success: Callable[[object], None],
+        error_title: str,
+    ) -> None:
+        if not self.root.winfo_exists():
             return
-        # Points outside the freq window are always excluded (not toggleable in).
-        if self.selection.freq_window is not None:
-            f_min, f_max = self.selection.freq_window
-            lo = min(float(f_min), float(f_max))
-            hi = max(float(f_min), float(f_max))
-            fi = float(self.selection.freq_hz[i])
-            if not (lo <= fi <= hi):
-                return
-        self.selection.manual_included[i] = ~self.selection.manual_included[i]
-
-    def _reset_to_auto_outliers(self) -> None:
-        self.selection.manual_included = ~self.selection.auto_outliers.copy()
-        self.selection.update_included()
-        self.fit_line.set_data([], [])
-        self._last_fit_params = None
-        self._set_init_params_in_ui(np.array([self._infer_init_value(n) for n in self._param_names]))
-        self._refresh_title()
-
-    def _refresh_title(self) -> None:
-        cycle = self.selection.cycle
-        if cycle is None:
-            self.ax.set_title(self._base_title)
+        if not future.done():
+            self.root.after(40, lambda: self._poll_future(future, success, error_title))
             return
-        self.ax.set_title(f"{self._base_title}\ncycle={cycle}")
-
-    def _cycle_step(self, direction: int) -> None:
-        if not self.cycles or self.df is None:
+        self.busy = False
+        try:
+            result = future.result()
+        except Exception as error:
+            self._set_controls_enabled(self.state is not None)
+            self.status_var.set(f"Error: {error}")
+            messagebox.showerror(error_title, f"{type(error).__name__}: {error}", parent=self.root)
             return
-        if self.selection.cycle is None:
-            current = self.cycles[0]
+        success(result)
+        self._set_controls_enabled(self.state is not None)
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled and not self.busy else tk.DISABLED
+        for button in getattr(self, "action_buttons", ()):
+            button.configure(state=state)
+        if hasattr(self, "cycle_box"):
+            self.cycle_box.configure(state="readonly" if enabled and not self.busy else "disabled")
+        if hasattr(self, "model_box"):
+            self.model_box.configure(state="normal" if enabled and not self.busy else "disabled")
+
+    def _restore_controls(self) -> None:
+        if self.state is None:
+            return
+        cycle = self.state.active
+        self.parameter_table.set_parameters(self.state.parameters_for(cycle.cycle))
+        if cycle.frequency_window is not None:
+            self.minimum_frequency_var.set(f"{cycle.frequency_window[0]:g}")
+            self.maximum_frequency_var.set(f"{cycle.frequency_window[1]:g}")
+
+    def _capture_controls(self) -> bool:
+        if self.state is None:
+            return False
+        try:
+            parameters = self.parameter_table.values()
+            minimum = float(self.minimum_frequency_var.get())
+            maximum = float(self.maximum_frequency_var.get())
+            for parameter in parameters:
+                if parameter.lower > parameter.upper:
+                    raise ValueError(f"{parameter.name}: lower bound exceeds upper bound")
+                if not parameter.lower <= parameter.initial <= parameter.upper:
+                    raise ValueError(f"{parameter.name}: initial value is outside its bounds")
+        except ValueError as error:
+            messagebox.showerror("Invalid value", str(error), parent=self.root)
+            return False
+        self.state.remember_parameters(parameters)
+        self.state.active.frequency_window = (minimum, maximum)
+        return True
+
+    def _refresh_plot(self, rescale: bool = False) -> None:
+        if self.state is None:
+            return
+        cycle = self.state.active
+        included = cycle.included
+        real = cycle.impedance.real
+        negative_imaginary = -cycle.impedance.imag
+        self.included_artist.set_data(real[included], negative_imaginary[included])
+        self.excluded_artist.set_data(real[~included], negative_imaginary[~included])
+        if cycle.fit_impedance is None:
+            self.fit_artist.set_data([], [])
         else:
-            current = int(self.selection.cycle)
-
-        try:
-            idx = self.cycles.index(current)
-        except ValueError:
-            idx = 0
-
-        next_idx = idx + int(direction)
-        if next_idx < 0:
-            next_idx = 0
-        if next_idx >= len(self.cycles):
-            next_idx = len(self.cycles) - 1
-
-        next_cycle = self.cycles[next_idx]
-        if next_cycle == current:
-            return
-
-        f, Z, E, I = _load_cycle_spectrum(self.df, cycle=next_cycle, control=self.control)
-        f = _as_1d_array(f)
-        Z = _as_1d_array(Z)
-        f, Z = _sort_by_freq_desc(f, Z)
-
-        outlier_indices = find_outliers(f, Z, threshold=self.outlier_threshold)
-        auto_outliers = np.zeros(f.size, dtype=bool)
-        if outlier_indices is not None and len(outlier_indices) > 0:
-            auto_outliers[np.asarray(outlier_indices, dtype=int)] = True
-
-        self.selection.freq_hz = f
-        self.selection.Z = Z
-        self.selection.auto_outliers = auto_outliers
-        self.selection.manual_included = ~auto_outliers.copy()
-        if self._fmin_box is not None and self._fmax_box is not None:
-            self._fmin_box.set_val(f"{float(np.nanmin(f)):g}")
-            self._fmax_box.set_val(f"{float(np.nanmax(f)):g}")
-            self.selection.freq_window = (float(np.nanmin(f)), float(np.nanmax(f)))
-        self.selection.update_included()
-        self.selection.E_V = float(E)
-        self.selection.I_mA = float(I)
-        self.selection.cycle = int(next_cycle)
-        self.fit_line.set_data([], [])
-        self._last_fit_params = None
-        self._set_init_params_in_ui(np.array([self._infer_init_value(n) for n in self._param_names]))
-        self._refresh_title()
-
-    def _fit(self) -> None:
-        f = self.selection.included_freq()
-        Z = self.selection.included_Z()
-        if f.size < 3:
-            self.fit_line.set_data([], [])
-            self._last_fit_params = None
-            return
-
-        f, Z = _sort_by_freq_desc(_as_1d_array(f), _as_1d_array(Z))
-
-        try:
-            init = self._get_init_params_from_ui()
-            bounds = self._get_bounds_from_ui()
-            params, _errors = wepy_fit_spectrum(
-                f,
-                Z,
-                cir=self.circuit,
-                init=init,
-                bounds=bounds,
-                outliers=False,
-                E=float(self.selection.E_V),
-                I=float(self.selection.I_mA),
+            self.fit_artist.set_data(cycle.fit_impedance.real, -cycle.fit_impedance.imag)
+        if cycle.fit_at_data_impedance is None:
+            self.fit_points_artist.set_data([], [])
+            self.residual_artist.set_segments([])
+        else:
+            fitted = cycle.fit_at_data_impedance
+            self.fit_points_artist.set_data(fitted.real, -fitted.imag)
+            measured_points = np.column_stack((real, negative_imaginary))
+            fitted_points = np.column_stack((fitted.real, -fitted.imag))
+            self.residual_artist.set_segments(
+                np.stack((measured_points, fitted_points), axis=1)
             )
-            self._last_fit_params = _as_1d_array(params)
-        except Exception as e:
-            self.fit_line.set_data([], [])
-            self._last_fit_params = None
-            self.status.set_text(self.status.get_text() + f" | fit error: {type(e).__name__}: {e}")
-            self.fig.canvas.draw_idle()
+        self.axes.set_title(
+            f"{self.path.name}\nCycle {cycle.cycle} · {self.state.circuit}"
+        )
+        if rescale:
+            self.axes.relim()
+            self.axes.autoscale_view()
+        self.canvas.draw_idle()
+
+    def _update_status(self, suffix: str = "") -> None:
+        if self.state is None:
             return
+        cycle = self.state.active
+        total = cycle.frequency_hz.size
+        included = int(np.count_nonzero(cycle.included))
+        outliers = int(np.count_nonzero(cycle.outliers))
+        status = (
+            f"Cycle {cycle.cycle} · {included}/{total} points included · "
+            f"{outliers} detected outliers · click a point to toggle it"
+        )
+        self.status_var.set(f"{status} · {suffix}" if suffix else status)
 
-        # wepy.eis.fit_spectrum prepends [E, I] to the circuit parameters.
-        circuit_params = self._last_fit_params[2:]
-        f_fit, Z_fit = wepy_show_fit(f, self.circuit, circuit_params, points=200)
-        self.fit_line.set_data(Z_fit.real, -Z_fit.imag)
-        self._set_init_params_in_ui(circuit_params)
-
-    def _save_mask(self, out_path: Path | None = None) -> Path:
-        if out_path is None:
-            stem = "mask_included"
-            if self.selection.source_path is not None:
-                stem = self.selection.source_path.stem
-                if self.selection.cycle is not None:
-                    stem = f"{stem}_cycle{self.selection.cycle}"
-                stem = f"{stem}_mask_included"
-            out_path = Path(f"{stem}.npy")
-        self.selection.update_included()
-        assert self.selection.included is not None
-        np.save(out_path, self.selection.included.astype(bool))
-        return out_path
-
-    def _on_pick(self, event) -> None:
-        mouse = getattr(event, "mouseevent", None)
-        if mouse is None:
+    def _on_plot_click(self, event) -> None:
+        if self.busy or self.state is None or event.inaxes is not self.axes:
             return
-        if mouse.xdata is None or mouse.ydata is None:
+        if event.x is None or event.y is None:
             return
-
-        i = self._nearest_point_index(float(mouse.xdata), float(mouse.ydata))
-        if i is None:
+        cycle = self.state.active
+        display_points = self.axes.transData.transform(
+            np.column_stack((cycle.impedance.real, -cycle.impedance.imag))
+        )
+        distances = np.hypot(display_points[:, 0] - event.x, display_points[:, 1] - event.y)
+        if distances.size == 0:
             return
-
-        self._toggle_index(i)
-        self._redraw_points()
+        index = int(np.argmin(distances))
+        if distances[index] > 10:
+            return
+        cycle.toggle_point(index)
+        self._refresh_plot()
         self._update_status()
 
-    def _on_key_press(self, event) -> None:
-        if not getattr(event, "key", None):
+    def _select_cycle(self, _event=None) -> None:
+        if self.state is None:
             return
-        # While editing TextBoxes, ignore global hotkeys (arrows/f/r/s)
-        # so typing/navigation doesn't trigger expensive cycle reloads/fits.
-        if getattr(event, "inaxes", None) in self._ui_axes:
+        self._activate_cycle(int(self.cycle_var.get()))
+
+    def change_cycle(self, direction: int) -> None:
+        if self.busy or self.state is None:
             return
-        self._pressed_keys.add(event.key)
-        key = event.key.lower()
+        cycles = self.state.available_cycles
+        index = cycles.index(self.state.active_cycle)
+        next_index = max(0, min(len(cycles) - 1, index + direction))
+        self._activate_cycle(cycles[next_index])
 
-        if key in {"left", "a"}:
-            self._cycle_step(-1)
-            self._redraw_points()
-            self._update_status()
+    def _activate_cycle(self, cycle_number: int) -> None:
+        if self.state is None or cycle_number == self.state.active_cycle:
             return
-
-        if key in {"right", "d"}:
-            self._cycle_step(+1)
-            self._redraw_points()
-            self._update_status()
+        if not self._capture_controls():
+            self.cycle_var.set(str(self.state.active_cycle))
             return
+        if cycle_number not in self.state.cycles:
+            assert self.loaded is not None
+            new_cycle = load_cycle(self.loaded.dataframe, cycle_number, self.state.control)
+            if self.state.all_frequency_window is not None:
+                new_cycle.frequency_window = self.state.all_frequency_window
+            new_cycle.parameters = self.state.parameters_for(cycle_number)
+            self.state.cycles[cycle_number] = new_cycle
+        self.state.active_cycle = cycle_number
+        self.cycle_var.set(str(cycle_number))
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        self._update_status()
 
-        if key == "r":
-            self._reset_to_auto_outliers()
-            self._redraw_points()
-            self._update_status()
+    def apply_frequency_window(self) -> None:
+        if self._capture_controls():
+            self.state.active.clear_fit()
+            self._refresh_plot(rescale=True)
+            self._update_status("frequency range applied")
+
+    def apply_frequency_window_to_all(self) -> None:
+        if self.state is None or not self._capture_controls():
             return
+        window = self.state.active.frequency_window
+        assert window is not None
+        self.state.apply_frequency_window_to_all(window)
+        self._refresh_plot(rescale=True)
+        self._update_status("frequency range applied to all cycles")
 
-        if key == "f":
-            self._fit()
-            self._redraw_points()
-            self._update_status()
+    def apply_model(self) -> None:
+        if self.state is None or self.busy:
             return
-
-        if key == "s":
-            out = self._save_mask()
-            self.status.set_text(self.status.get_text() + f" | saved: {out}")
-            self.fig.canvas.draw_idle()
+        circuit = self.model_var.get().strip()
+        if not circuit:
+            messagebox.showerror("Invalid model", "Enter a circuit model", parent=self.root)
             return
-
-    def _on_key_release(self, event) -> None:
-        if not getattr(event, "key", None):
-            return
-        self._pressed_keys.discard(event.key)
-
-    def show(self) -> None:
-        plt.show()
-
-
-def _safe_unique_ints(values: Iterable[object]) -> list[int]:
-    out: list[int] = []
-    seen: set[int] = set()
-    for v in values:
         try:
-            i = int(v)
-        except Exception:
-            continue
-        if i in seen:
-            continue
-        out.append(i)
-        seen.add(i)
-    return sorted(out)
+            parameters = circuit_parameters(circuit)
+        except Exception as error:
+            messagebox.showerror(
+                "Invalid model",
+                f"{type(error).__name__}: {error}",
+                parent=self.root,
+            )
+            self.model_var.set(self.state.circuit)
+            return
+        self.state.replace_circuit(circuit, parameters)
+        self.circuit = circuit
+        self.parameter_table.set_parameters(self.state.parameters_for(self.state.active_cycle))
+        self._refresh_plot(rescale=True)
+        self._update_status("fitting model changed")
+
+    def find_outliers(self) -> None:
+        if self.state is None or not self._capture_controls():
+            return
+        try:
+            threshold = float(self.threshold_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid threshold", "Enter a numeric threshold", parent=self.root)
+            return
+        cycle_number = self.state.active_cycle
+        cycle = self.state.active
+        self.status_var.set(f"Cycle {cycle_number} · finding outliers…")
+        self._submit(
+            lambda: find_outlier_indices(cycle, threshold),
+            lambda indices: self._finish_outliers(cycle_number, indices),
+            "Outlier search failed",
+        )
+
+    def _finish_outliers(self, cycle_number: int, indices: np.ndarray) -> None:
+        if self.state is None:
+            return
+        self.state.cycles[cycle_number].apply_outliers(indices)
+        if self.state.active_cycle == cycle_number:
+            self._refresh_plot()
+            self._update_status("outlier search complete")
+
+    def find_outliers_for_all(self) -> None:
+        if self.state is None or self.loaded is None or not self._capture_controls():
+            return
+        try:
+            threshold = float(self.threshold_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid threshold", "Enter a numeric threshold", parent=self.root)
+            return
+        cycle_count = len(self.state.available_cycles)
+        self.status_var.set(f"Finding outliers in all {cycle_count} cycles…")
+        self._submit(
+            lambda: find_outliers_for_all_cycles(
+                self.loaded.dataframe,
+                self.state.available_cycles,
+                self.state.control,
+                threshold,
+            ),
+            self._finish_all_outliers,
+            "File-wide outlier search failed",
+        )
+
+    def _finish_all_outliers(self, results) -> None:
+        if self.state is None:
+            return
+        for cycle_number, (loaded_cycle, indices) in results.items():
+            if cycle_number in self.state.cycles:
+                cycle = self.state.cycles[cycle_number]
+            else:
+                cycle = loaded_cycle
+                cycle.parameters = self.state.parameters_for(cycle_number)
+                self.state.cycles[cycle_number] = cycle
+            if self.state.all_frequency_window is not None:
+                cycle.frequency_window = self.state.all_frequency_window
+            cycle.apply_outliers(indices)
+        self._restore_controls()
+        self._refresh_plot()
+        self._update_status(f"outliers calculated for {len(results)} cycles")
+
+    def fit(self) -> None:
+        if self.state is None or not self._capture_controls():
+            return
+        cycle_number = self.state.active_cycle
+        cycle = self.state.active
+        parameters = self.state.parameters_for(cycle_number)
+        self.status_var.set(f"Cycle {cycle_number} · fitting…")
+        self._submit(
+            lambda: fit_cycle(cycle, self.state.circuit, parameters),
+            lambda result: self._finish_fit(cycle_number, parameters, result),
+            "Fit failed",
+        )
+
+    def _finish_fit(self, cycle_number, parameters, result) -> None:
+        if self.state is None:
+            return
+        fitted_parameters, fit_frequency, fit_impedance, fit_at_data = result
+        cycle = self.state.cycles[cycle_number]
+        cycle.fit_parameters = fitted_parameters
+        cycle.fit_frequency_hz = fit_frequency
+        cycle.fit_impedance = fit_impedance
+        cycle.fit_at_data_impedance = fit_at_data
+        for parameter, fitted in zip(parameters, fitted_parameters):
+            parameter.initial = float(fitted)
+        cycle.parameters = parameters
+        if self.state.active_cycle == cycle_number:
+            self.parameter_table.set_parameters(parameters)
+            self._refresh_plot(rescale=True)
+            self._update_status("fit complete")
+
+    def batch_fit(self) -> None:
+        if self.state is None or self.loaded is None or not self._capture_controls():
+            return
+        start_cycle = self.state.active_cycle
+        parameters = self.state.parameters_for(start_cycle)
+        cycle_count = len(
+            self.state.available_cycles[
+                self.state.available_cycles.index(start_cycle):
+            ]
+        )
+        self.status_var.set(
+            f"Batch fitting {cycle_count} cycles from cycle {start_cycle}…"
+        )
+        self._submit(
+            lambda: batch_fit_from_cycle(
+                self.loaded.dataframe,
+                self.state,
+                start_cycle,
+                parameters,
+            ),
+            self._finish_batch_fit,
+            "Batch fit failed",
+        )
+
+    def _finish_batch_fit(self, report: BatchFitReport) -> None:
+        if self.state is None:
+            return
+        for result in report.fits:
+            cycle = result.cycle
+            cycle.parameters = result.parameters
+            cycle.fit_parameters = result.fitted_parameters
+            cycle.fit_frequency_hz = result.fit_frequency_hz
+            cycle.fit_impedance = result.fit_impedance
+            cycle.fit_at_data_impedance = result.fit_at_data_impedance
+            self.state.cycles[cycle.cycle] = cycle
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        if report.failed_cycle is None:
+            self._update_status(f"batch fit completed for {len(report.fits)} cycles")
+            return
+        self._update_status(
+            f"batch fit stopped at cycle {report.failed_cycle}; "
+            f"{len(report.fits)} cycles completed"
+        )
+        messagebox.showwarning(
+            "Batch fit stopped",
+            f"Cycle {report.failed_cycle}: {report.error}\n\n"
+            f"The {len(report.fits)} successful fits were retained.",
+            parent=self.root,
+        )
+
+    def copy_neighbor_fit(self, direction: int) -> None:
+        if self.state is None or self.busy or not self._capture_controls():
+            return
+        cycles = self.state.available_cycles
+        current_index = cycles.index(self.state.active_cycle)
+        source_index = current_index + direction
+        if not 0 <= source_index < len(cycles):
+            self._update_status("no neighboring cycle in that direction")
+            return
+        source_cycle_number = cycles[source_index]
+        source = self.state.cycles.get(source_cycle_number)
+        if source is None or source.fit_parameters is None:
+            self._update_status(f"cycle {source_cycle_number} has no fit to copy")
+            return
+        current_parameters = self.state.parameters_for(self.state.active_cycle)
+        fitted = np.asarray(source.fit_parameters).reshape(-1)
+        if fitted.size != len(current_parameters):
+            self._update_status("neighboring fit uses incompatible parameters")
+            return
+        for parameter, value in zip(current_parameters, fitted):
+            parameter.initial = float(value)
+        self.state.active.parameters = current_parameters
+        self.state.active.clear_fit()
+        self.parameter_table.set_parameters(current_parameters)
+        self._refresh_plot()
+        self._update_status(
+            f"initial parameters copied from cycle {source_cycle_number}"
+        )
+
+    def reset_points(self) -> None:
+        if self.state is None:
+            return
+        self.state.active.reset_selection()
+        self._refresh_plot()
+        self._update_status("selection reset")
+
+    def save_mask(self) -> None:
+        if self.state is None:
+            return
+        default_name = f"{self.path.stem}_cycle{self.state.active_cycle}_mask_included.npy"
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save included-point mask",
+            initialdir=str(self.path.parent),
+            initialfile=default_name,
+            defaultextension=".npy",
+            filetypes=[("NumPy mask", "*.npy")],
+        )
+        if not selected:
+            return
+        np.save(Path(selected), self.state.active.included.astype(bool))
+        self._update_status(f"saved {Path(selected).name}")
+
+    def save_project(self) -> None:
+        if self.state is None or not self._capture_controls():
+            return
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save EIS fitting project",
+            initialdir=str(self.path.parent),
+            initialfile=f"{self.path.stem}.eisfit.json",
+            defaultextension=".eisfit.json",
+            filetypes=[("EIS fitting project", "*.eisfit.json"), ("JSON", "*.json")],
+        )
+        if not selected:
+            return
+        try:
+            save_project_file(self.state, Path(selected))
+        except Exception as error:
+            messagebox.showerror(
+                "Project save failed",
+                f"{type(error).__name__}: {error}",
+                parent=self.root,
+            )
+            return
+        self._update_status(f"project saved as {Path(selected).name}")
+
+    def load_project(self) -> None:
+        if self.state is None or self.loaded is None:
+            return
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load EIS fitting project",
+            initialdir=str(self.path.parent),
+            filetypes=[("EIS fitting project", "*.eisfit.json"), ("JSON", "*.json")],
+        )
+        if not selected:
+            return
+        current = self.state
+        dataframe = self.loaded.dataframe
+        project_path = Path(selected)
+        self.status_var.set(f"Loading project {project_path.name}…")
+        self._submit(
+            lambda: load_project_file(current, dataframe, project_path),
+            lambda restored: self._finish_project_load(restored, project_path),
+            "Project load failed",
+        )
+
+    def _finish_project_load(self, restored: ProjectState, path: Path) -> None:
+        self.state = restored
+        assert self.loaded is not None
+        self.loaded.state = restored
+        self.control = restored.control
+        self.circuit = restored.circuit
+        self.model_var.set(restored.circuit)
+        self.cycle_var.set(str(restored.active_cycle))
+        self.cycle_box.configure(values=[str(cycle) for cycle in restored.available_cycles])
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        self._update_status(f"project loaded from {path.name}")
+
+    def export_fits(self) -> None:
+        if self.state is None or not self._capture_controls():
+            return
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export fitted parameters",
+            initialdir=str(self.path.parent),
+            initialfile=f"{self.path.stem}_fit_parameters.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not selected:
+            return
+        try:
+            count = export_fit_parameters(self.state, Path(selected))
+        except Exception as error:
+            messagebox.showerror(
+                "Fit export failed",
+                f"{type(error).__name__}: {error}",
+                parent=self.root,
+            )
+            return
+        self._update_status(f"exported fit parameters for {count} cycles")
+
+    def close(self) -> None:
+        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.root.destroy()
 
 
 def launch_nyquist_editor(
@@ -594,53 +838,11 @@ def launch_nyquist_editor(
     outlier_threshold: float = 1.0,
     circuit: str = "R0-L0-p(R1,CPE1)",
 ) -> None:
-    df, meta, technique = read_mpt_dataframe(mpt_path)
-
-    if "cycle_number" in df.columns:
-        cycles = _safe_unique_ints(df["cycle_number"].values)
-    else:
-        cycles = []
-
-    f, Z, E, I = _load_cycle_spectrum(df, cycle=cycle, control=control)
-
-    f = _as_1d_array(f)
-    Z = _as_1d_array(Z)
-    f, Z = _sort_by_freq_desc(f, Z)
-
-    outlier_indices = find_outliers(f, Z, threshold=outlier_threshold)
-    auto_outliers = np.zeros(f.size, dtype=bool)
-    if outlier_indices is not None and len(outlier_indices) > 0:
-        auto_outliers[np.asarray(outlier_indices, dtype=int)] = True
-
-    manual_included = ~auto_outliers.copy()
-    freq_window = (float(np.nanmin(f)), float(np.nanmax(f))) if f.size else None
-    selection = SpectrumSelection(
-        freq_hz=f,
-        Z=Z,
-        manual_included=manual_included,
-        auto_outliers=auto_outliers,
-        freq_window=freq_window,
-        E_V=E,
-        I_mA=I,
-        source_path=mpt_path,
-        cycle=cycle if "cycle_number" in df.columns else None,
-    )
-    selection.update_included()
-
-    tech = technique or "Unknown"
-    base_title = (
-        f"{mpt_path.name} | technique={tech}"
-        + (f" | cycles={len(cycles)}" if cycles else "")
-        + f"\nAuto-outlier threshold={outlier_threshold:g} | circuit={circuit}"
-    )
-
-    editor = NyquistEditor(
-        selection,
-        circuit=circuit,
-        title=base_title,
-        df=df if cycles else None,
-        cycles=cycles,
-        control=control,
-        outlier_threshold=outlier_threshold,
-    )
-    editor.show()
+    root = tk.Tk()
+    root.withdraw()
+    root.title("EIS Fitting")
+    root.geometry("1220x760")
+    root.deiconify()
+    root.update()
+    EISApplication(root, mpt_path, cycle, control, outlier_threshold, circuit)
+    root.mainloop()
