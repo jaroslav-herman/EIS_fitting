@@ -25,6 +25,7 @@ class ParameterValue:
     initial: float
     lower: float
     upper: float
+    error_percent: float | None = None
 
 
 @dataclass
@@ -101,6 +102,8 @@ class CycleState:
         self.fit_frequency_hz = None
         self.fit_impedance = None
         self.fit_at_data_impedance = None
+        for parameter in self.parameters:
+            parameter.error_percent = None
 
 
 @dataclass
@@ -120,7 +123,9 @@ class ProjectState:
 
     def remember_parameters(self, parameters: list[ParameterValue]) -> None:
         self.active.parameters = [
-            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
+            ParameterValue(
+                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+            )
             for p in parameters
         ]
 
@@ -128,7 +133,9 @@ class ProjectState:
         state = self.cycles.get(cycle)
         source = state.parameters if state and state.parameters else self.default_parameters
         return [
-            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
+            ParameterValue(
+                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+            )
             for p in source
         ]
 
@@ -145,12 +152,16 @@ class ProjectState:
     ) -> None:
         self.circuit = circuit
         self.default_parameters = [
-            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
+            ParameterValue(
+                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+            )
             for p in parameters
         ]
         for cycle in self.cycles.values():
             cycle.parameters = [
-                ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
+                ParameterValue(
+                    p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+                )
                 for p in parameters
             ]
             cycle.clear_fit()

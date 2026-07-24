@@ -10,11 +10,28 @@ import numpy as np
 from eis_model import CycleState, ParameterValue, ProjectState, as_1d_array, sort_spectrum
 
 
+@dataclass(frozen=True)
+class SpectrumMetadata:
+    cycle: int
+    potential_v: float
+    current_ma: float
+    point_count: int
+    minimum_frequency_hz: float
+    maximum_frequency_hz: float
+
+
 @dataclass
 class LoadedProject:
     dataframe: object
     state: ProjectState
     technique: str
+    spectra: list[SpectrumMetadata]
+
+
+@dataclass
+class ProjectImportReport:
+    loaded: list[tuple[Path, LoadedProject]]
+    errors: list[tuple[Path, str]]
 
 
 @dataclass
@@ -22,6 +39,7 @@ class BatchCycleFit:
     cycle: CycleState
     parameters: list[ParameterValue]
     fitted_parameters: np.ndarray
+    fitted_errors_percent: np.ndarray
     fit_frequency_hz: np.ndarray
     fit_impedance: np.ndarray
     fit_at_data_impedance: np.ndarray
@@ -31,6 +49,26 @@ class BatchCycleFit:
 class BatchFitReport:
     fits: list[BatchCycleFit]
     failed_cycle: int | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class SpectrumFitTarget:
+    loaded: LoadedProject
+    cycle: int
+    label: str
+
+
+@dataclass
+class SpectrumBatchFit:
+    loaded: LoadedProject
+    fit: BatchCycleFit
+
+
+@dataclass
+class SpectrumBatchReport:
+    fits: list[SpectrumBatchFit]
+    failed_label: str | None = None
     error: str | None = None
 
 
@@ -142,6 +180,27 @@ def load_cycle(dataframe, cycle: int, control: str) -> CycleState:
     return CycleState(cycle, frequency, impedance, potential, current)
 
 
+def catalog_spectra(
+    dataframe,
+    cycles: list[int],
+    control: str,
+) -> list[SpectrumMetadata]:
+    spectra = []
+    for cycle_number in cycles:
+        cycle = load_cycle(dataframe, cycle_number, control)
+        spectra.append(
+            SpectrumMetadata(
+                cycle=cycle_number,
+                potential_v=cycle.potential_v,
+                current_ma=cycle.current_ma,
+                point_count=int(cycle.frequency_hz.size),
+                minimum_frequency_hz=float(np.nanmin(cycle.frequency_hz)),
+                maximum_frequency_hz=float(np.nanmax(cycle.frequency_hz)),
+            )
+        )
+    return spectra
+
+
 def load_project(
     path: Path,
     cycle: int,
@@ -174,7 +233,25 @@ def load_project(
         default_parameters=parameters,
         cycles={active_cycle: active},
     )
-    return LoadedProject(dataframe, state, technique or "Unknown")
+    spectra = catalog_spectra(dataframe, cycles, control)
+    return LoadedProject(dataframe, state, technique or "Unknown", spectra)
+
+
+def load_projects(
+    paths: list[Path],
+    control: str,
+    circuit: str,
+) -> ProjectImportReport:
+    loaded: list[tuple[Path, LoadedProject]] = []
+    errors: list[tuple[Path, str]] = []
+    for path in paths:
+        try:
+            project = load_project(path, 1, control, circuit)
+        except Exception as error:
+            errors.append((path, f"{type(error).__name__}: {error}"))
+        else:
+            loaded.append((path, project))
+    return ProjectImportReport(loaded, errors)
 
 
 def find_outlier_indices(state: CycleState, threshold: float) -> np.ndarray:
@@ -211,7 +288,7 @@ def fit_cycle(
     state: CycleState,
     circuit: str,
     parameters: list[ParameterValue],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     from impedance.models.circuits import CustomCircuit
     from wepy.eis import fit_spectrum, show_fit
 
@@ -226,7 +303,7 @@ def fit_cycle(
         [parameter.lower for parameter in parameters],
         [parameter.upper for parameter in parameters],
     )
-    fitted, _errors = fit_spectrum(
+    fitted, errors = fit_spectrum(
         frequency,
         impedance,
         cir=circuit,
@@ -237,6 +314,12 @@ def fit_cycle(
         I=state.current_ma,
     )
     circuit_parameters_only = as_1d_array(fitted)[2:]
+    absolute_errors = np.abs(as_1d_array(errors)[2:])
+    magnitudes = np.abs(circuit_parameters_only)
+    errors_percent = np.full(circuit_parameters_only.size, np.inf, dtype=float)
+    nonzero = magnitudes > np.finfo(float).eps
+    errors_percent[nonzero] = absolute_errors[nonzero] / magnitudes[nonzero] * 100.0
+    errors_percent[(~nonzero) & (absolute_errors <= np.finfo(float).eps)] = 0.0
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -254,6 +337,7 @@ def fit_cycle(
     fit_at_data = fitted_model.predict(state.frequency_hz)
     return (
         circuit_parameters_only,
+        errors_percent,
         as_1d_array(fit_frequency),
         as_1d_array(fit_impedance),
         as_1d_array(fit_at_data),
@@ -269,7 +353,9 @@ def batch_fit_from_cycle(
     start_index = project.available_cycles.index(start_cycle)
     cycle_numbers = project.available_cycles[start_index:]
     next_parameters = [
-        ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
+        ParameterValue(
+            p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+        )
         for p in initial_parameters
     ]
     completed: list[BatchCycleFit] = []
@@ -280,7 +366,7 @@ def batch_fit_from_cycle(
             if project.all_frequency_window is not None:
                 cycle.frequency_window = project.all_frequency_window
         try:
-            fitted, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
+            fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
                 cycle,
                 project.circuit,
                 next_parameters,
@@ -298,14 +384,18 @@ def batch_fit_from_cycle(
                 float(value),
                 parameter.lower,
                 parameter.upper,
+                float(error_percent),
             )
-            for parameter, value in zip(next_parameters, fitted)
+            for parameter, value, error_percent in zip(
+                next_parameters, fitted, errors_percent
+            )
         ]
         completed.append(
             BatchCycleFit(
                 cycle=cycle,
                 parameters=fitted_parameters,
                 fitted_parameters=fitted,
+                fitted_errors_percent=errors_percent,
                 fit_frequency_hz=fit_frequency,
                 fit_impedance=fit_impedance,
                 fit_at_data_impedance=fit_at_data,
@@ -313,3 +403,80 @@ def batch_fit_from_cycle(
         )
         next_parameters = fitted_parameters
     return BatchFitReport(fits=completed)
+
+
+def batch_fit_spectra(
+    targets: list[SpectrumFitTarget],
+    initial_parameters: list[ParameterValue],
+) -> SpectrumBatchReport:
+    if not targets:
+        return SpectrumBatchReport([])
+    expected_circuit = targets[0].loaded.state.circuit
+    expected_names = [parameter.name for parameter in initial_parameters]
+    next_parameters = [
+        ParameterValue(
+            p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+        )
+        for p in initial_parameters
+    ]
+    completed: list[SpectrumBatchFit] = []
+    for target in targets:
+        project = target.loaded.state
+        if project.circuit != expected_circuit:
+            return SpectrumBatchReport(
+                completed,
+                target.label,
+                "The spectrum uses a different fitting model",
+            )
+        if [parameter.name for parameter in project.default_parameters] != expected_names:
+            return SpectrumBatchReport(
+                completed,
+                target.label,
+                "The spectrum has incompatible fitting parameters",
+            )
+        cycle = project.cycles.get(target.cycle)
+        if cycle is None:
+            cycle = load_cycle(target.loaded.dataframe, target.cycle, project.control)
+            if project.all_frequency_window is not None:
+                cycle.frequency_window = project.all_frequency_window
+        try:
+            fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
+                cycle,
+                expected_circuit,
+                next_parameters,
+            )
+        except Exception as error:
+            return SpectrumBatchReport(
+                completed,
+                target.label,
+                f"{type(error).__name__}: {error}",
+            )
+        fitted_parameters = [
+            ParameterValue(
+                parameter.name,
+                parameter.unit,
+                float(value),
+                parameter.lower,
+                parameter.upper,
+                float(error_percent),
+            )
+            for parameter, value, error_percent in zip(
+                next_parameters, fitted, errors_percent
+            )
+        ]
+        completed.append(
+            SpectrumBatchFit(
+                loaded=target.loaded,
+                fit=BatchCycleFit(
+                    cycle=cycle,
+                    parameters=fitted_parameters,
+                    fitted_parameters=fitted,
+                    fitted_errors_percent=errors_percent,
+                    fit_frequency_hz=fit_frequency,
+                    fit_impedance=fit_impedance,
+                    fit_at_data_impedance=fit_at_data,
+                ),
+            )
+        )
+        next_parameters = fitted_parameters
+    return SpectrumBatchReport(completed)

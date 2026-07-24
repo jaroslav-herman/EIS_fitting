@@ -20,6 +20,7 @@ def _parameter_to_dict(parameter: ParameterValue) -> dict[str, object]:
         "initial": parameter.initial,
         "lower": parameter.lower,
         "upper": parameter.upper,
+        "error_percent": parameter.error_percent,
     }
 
 
@@ -30,6 +31,11 @@ def _parameter_from_dict(data: dict[str, object]) -> ParameterValue:
         initial=float(data["initial"]),
         lower=float(data["lower"]),
         upper=float(data["upper"]),
+        error_percent=(
+            float(data["error_percent"])
+            if data.get("error_percent") is not None
+            else None
+        ),
     )
 
 
@@ -143,7 +149,9 @@ def load_project_file(
         cycle.parameters = [
             _parameter_from_dict(value) for value in saved.get("parameters", [])
         ] or [
-            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
+            ParameterValue(
+                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+            )
             for p in defaults
         ]
         cycle.fit_parameters = _optional_array(saved.get("fit_parameters"))
@@ -175,7 +183,9 @@ def load_project_file(
     if active_cycle not in restored_cycles:
         active = load_cycle(dataframe, active_cycle, control)
         active.parameters = [
-            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
+            ParameterValue(
+                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+            )
             for p in defaults
         ]
         restored_cycles[active_cycle] = active
@@ -205,6 +215,9 @@ def export_fit_parameters(state: ProjectState, path: Path) -> int:
     if not fitted_cycles:
         raise ValueError("No cycles have fitted parameters to export")
     parameter_names = [parameter.name for parameter in state.default_parameters]
+    parameter_columns = []
+    for name in parameter_names:
+        parameter_columns.extend((name, f"{name}_error_percent"))
     fieldnames = [
         "source_file",
         "cycle",
@@ -212,7 +225,7 @@ def export_fit_parameters(state: ProjectState, path: Path) -> int:
         "potential_V",
         "current_mA",
         "included_points",
-        *parameter_names,
+        *parameter_columns,
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
@@ -230,5 +243,15 @@ def export_fit_parameters(state: ProjectState, path: Path) -> int:
                 "included_points": int(np.count_nonzero(cycle.included)),
             }
             row.update(dict(zip(parameter_names, values.tolist())))
+            errors_by_name = {
+                parameter.name: parameter.error_percent
+                for parameter in cycle.parameters
+            }
+            row.update(
+                {
+                    f"{name}_error_percent": errors_by_name.get(name)
+                    for name in parameter_names
+                }
+            )
             writer.writerow(row)
     return len(fitted_cycles)

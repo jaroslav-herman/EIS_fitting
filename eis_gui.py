@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
 
 import numpy as np
@@ -13,15 +13,21 @@ from eis_project import export_fit_parameters, load_project_file, save_project_f
 from eis_services import (
     BatchFitReport,
     LoadedProject,
+    ProjectImportReport,
+    SpectrumBatchReport,
+    SpectrumFitTarget,
+    SpectrumMetadata,
     batch_fit_from_cycle,
+    batch_fit_spectra,
+    catalog_spectra,
     circuit_parameters,
     find_outlier_indices,
     find_outliers_for_all_cycles,
     fit_cycle,
     load_cycle,
     load_project,
+    load_projects,
 )
-
 
 MODEL_PRESETS = (
     "R0-L0-p(R1,CPE1)",
@@ -35,8 +41,17 @@ MODEL_PRESETS = (
 class ParameterTable(ttk.Frame):
     def __init__(self, parent: tk.Misc) -> None:
         super().__init__(parent)
-        self._rows: list[tuple[str, str, tk.StringVar, tk.StringVar, tk.StringVar]] = []
-        headers = ("Parameter", "Unit", "Initial", "Lower", "Upper")
+        self._rows: list[
+            tuple[
+                str,
+                str,
+                float | None,
+                tk.StringVar,
+                tk.StringVar,
+                tk.StringVar,
+            ]
+        ] = []
+        headers = ("Parameter", "Error (%)", "Initial", "Lower", "Upper")
         for column, text in enumerate(headers):
             ttk.Label(self, text=text, style="Heading.TLabel").grid(
                 row=0, column=column, padx=3, pady=(0, 4), sticky="ew"
@@ -54,16 +69,47 @@ class ParameterTable(ttk.Frame):
             lower = tk.StringVar(value=f"{parameter.lower:g}")
             upper = tk.StringVar(value=f"{parameter.upper:g}")
             ttk.Label(self, text=parameter.name).grid(row=row, column=0, padx=3, pady=2)
-            ttk.Label(self, text=parameter.unit).grid(row=row, column=1, padx=3, pady=2)
+            error_text, error_color = self._format_error(parameter.error_percent)
+            tk.Label(
+                self,
+                text=error_text,
+                background=error_color,
+                relief=tk.SOLID,
+                borderwidth=1,
+                width=10,
+            ).grid(row=row, column=1, padx=3, pady=2, sticky="ew")
             for column, variable in enumerate((initial, lower, upper), start=2):
                 ttk.Entry(self, textvariable=variable, width=10).grid(
                     row=row, column=column, padx=3, pady=2, sticky="ew"
                 )
-            self._rows.append((parameter.name, parameter.unit, initial, lower, upper))
+            self._rows.append(
+                (
+                    parameter.name,
+                    parameter.unit,
+                    parameter.error_percent,
+                    initial,
+                    lower,
+                    upper,
+                )
+            )
+
+    @staticmethod
+    def _format_error(error_percent: float | None) -> tuple[str, str]:
+        if error_percent is None or np.isnan(error_percent):
+            return "—", "#eeeeee"
+        if np.isinf(error_percent):
+            return "∞", "#f8d7da"
+        if error_percent <= 5.0:
+            color = "#d4edda"
+        elif error_percent <= 20.0:
+            color = "#fff3cd"
+        else:
+            color = "#f8d7da"
+        return f"{error_percent:.3g}", color
 
     def values(self) -> list[ParameterValue]:
         parameters = []
-        for name, unit, initial, lower, upper in self._rows:
+        for name, unit, error_percent, initial, lower, upper in self._rows:
             parameters.append(
                 ParameterValue(
                     name,
@@ -71,6 +117,7 @@ class ParameterTable(ttk.Frame):
                     float(initial.get()),
                     float(lower.get()),
                     float(upper.get()),
+                    error_percent,
                 )
             )
         return parameters
@@ -87,13 +134,21 @@ class EISApplication:
         circuit: str,
     ) -> None:
         self.root = root
-        self.path = path
+        self.path = path.resolve()
         self.requested_cycle = cycle
         self.control = control
         self.circuit = circuit
         self.loaded: LoadedProject | None = None
         self.state: ProjectState | None = None
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eis-worker")
+        self.loaded_projects: dict[Path, LoadedProject] = {}
+        self._dataset_order: list[Path] = []
+        self._explorer_rows: dict[str, tuple[Path, LoadedProject, SpectrumMetadata]] = (
+            {}
+        )
+        self._explorer_lookup: dict[tuple[Path, int], str] = {}
+        self.executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="eis-worker"
+        )
         self.busy = False
         self._plot_imports = None
 
@@ -105,13 +160,17 @@ class EISApplication:
         self.status_var = tk.StringVar(value="Opening application…")
 
         self._configure_window()
+        self._build_menu()
         self._build_interface()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Left>", lambda _event: self.change_cycle(-1))
         self.root.bind("<Right>", lambda _event: self.change_cycle(1))
-        self.root.bind("<Control-s>", lambda _event: self.save_mask())
+        self.root.bind("<Control-s>", lambda _event: self.save_project())
+        self.root.bind("<Control-Shift-O>", lambda _event: self.load_project())
+        self.root.bind("<Control-o>", lambda _event: self.import_data())
         self.root.bind("<Alt-a>", lambda _event: self.copy_neighbor_fit(-1))
         self.root.bind("<Alt-d>", lambda _event: self.copy_neighbor_fit(1))
+        self.root.bind("<Alt-s>", lambda _event: self.fit())
         self.root.after(30, self._begin_loading)
 
     def _configure_window(self) -> None:
@@ -123,17 +182,90 @@ class EISApplication:
             style.theme_use("vista")
         style.configure("Heading.TLabel", font=("Segoe UI", 9, "bold"))
 
+    def _build_menu(self) -> None:
+        menu_bar = tk.Menu(self.root)
+        self.file_menu = tk.Menu(menu_bar, tearoff=False)
+        self.file_menu.add_command(
+            label="Import data…",
+            accelerator="Ctrl+O",
+            command=self.import_data,
+        )
+        self.file_menu.add_separator()
+        self.file_menu.add_command(
+            label="Load project…",
+            accelerator="Ctrl+Shift+O",
+            command=self.load_project,
+        )
+        self.file_menu.add_command(
+            label="Save project…",
+            accelerator="Ctrl+S",
+            command=self.save_project,
+        )
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Save current mask…", command=self.save_mask)
+        self.file_menu.add_command(
+            label="Export fit parameters…",
+            command=self.export_fits,
+        )
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="Exit", command=self.close)
+        menu_bar.add_cascade(label="File", menu=self.file_menu)
+        self._project_menu_actions = (
+            "Load project…",
+            "Save project…",
+            "Save current mask…",
+            "Export fit parameters…",
+        )
+        self.fit_menu = tk.Menu(menu_bar, tearoff=False)
+        self.fit_menu.add_command(
+            label="Fit selected spectrum",
+            accelerator="Alt+S",
+            command=self.fit,
+        )
+        self.fit_menu.add_separator()
+        self.fit_menu.add_command(
+            label="Batch down",
+            command=lambda: self.batch_fit_explorer(1),
+        )
+        self.fit_menu.add_command(
+            label="Batch up",
+            command=lambda: self.batch_fit_explorer(-1),
+        )
+        self.fit_menu.add_separator()
+        self.fit_menu.add_command(
+            label="Batch down to metadata value…",
+            command=lambda: self.batch_fit_explorer(1, to_metadata_value=True),
+        )
+        self.fit_menu.add_command(
+            label="Batch up to metadata value…",
+            command=lambda: self.batch_fit_explorer(-1, to_metadata_value=True),
+        )
+        menu_bar.add_cascade(label="Fit", menu=self.fit_menu)
+        self.root.configure(menu=menu_bar)
+        self._fit_menu_actions = (
+            "Fit selected spectrum",
+            "Batch down",
+            "Batch up",
+            "Batch down to metadata value…",
+            "Batch up to metadata value…",
+        )
+
     def _build_interface(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
         body = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         body.grid(row=0, column=0, sticky="nsew")
 
-        self.plot_frame = ttk.Frame(body, padding=8)
+        left_panel = ttk.Panedwindow(body, orient=tk.VERTICAL)
+        self.plot_frame = ttk.Frame(left_panel, padding=8)
+        explorer_frame = ttk.Frame(left_panel, padding=(8, 0, 8, 8))
         controls = ttk.Frame(body, padding=(8, 10, 12, 8), width=390)
-        body.add(self.plot_frame, weight=4)
+        left_panel.add(self.plot_frame, weight=4)
+        left_panel.add(explorer_frame, weight=1)
+        body.add(left_panel, weight=4)
         body.add(controls, weight=0)
         self._build_plot()
+        self._build_explorer(explorer_frame)
         self._build_controls(controls)
 
         ttk.Separator(self.root).grid(row=1, column=0, sticky="ew")
@@ -142,7 +274,10 @@ class EISApplication:
         )
 
     def _build_plot(self) -> None:
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        from matplotlib.backends.backend_tkagg import (
+            FigureCanvasTkAgg,
+            NavigationToolbar2Tk,
+        )
         from matplotlib.collections import LineCollection
         from matplotlib.figure import Figure
 
@@ -150,35 +285,55 @@ class EISApplication:
         self.axes = figure.add_subplot(111)
         self.axes.set_xlabel("Re(Z) / Ω")
         self.axes.set_ylabel("−Im(Z) / Ω")
-        self.axes.set_aspect("equal", adjustable="datalim")
+        self.axes.set_aspect("equal", adjustable="box")
         self.axes.grid(True, alpha=0.25)
-        self.included_artist, = self.axes.plot(
+        (self.included_artist,) = self.axes.plot(
             [], [], "o", color="#1769aa", markersize=5, label="Included"
         )
-        self.excluded_artist, = self.axes.plot(
+        (self.excluded_artist,) = self.axes.plot(
             [], [], "x", color="#c62828", markersize=6, label="Excluded"
         )
-        self.fit_artist, = self.axes.plot(
+        (self.fit_artist,) = self.axes.plot(
             [], [], "-", color="#202020", linewidth=2, alpha=0.8, label="Fit"
         )
-        self.fit_points_artist, = self.axes.plot(
+        (self.fit_points_included_artist,) = self.axes.plot(
             [],
             [],
             "o",
             color="#f57c00",
-            markersize=4,
+            markersize=3,
+            alpha=0.6,
             label="Fit at measured frequencies",
+        )
+        (self.fit_points_excluded_artist,) = self.axes.plot(
+            [],
+            [],
+            "o",
+            color="#f57c00",
+            markersize=2.5,
+            alpha=0.2,
+            label="_nolegend_",
         )
         self.residual_artist = LineCollection(
             [],
             colors="#777777",
             linewidths=0.9,
             linestyles="dashed",
-            alpha=0.35,
+            alpha=0.3,
             zorder=1,
             label="Measured-to-fit difference",
         )
+        self.excluded_residual_artist = LineCollection(
+            [],
+            colors="#777777",
+            linewidths=0.8,
+            linestyles="dashed",
+            alpha=0.1,
+            zorder=1,
+            label="_nolegend_",
+        )
         self.axes.add_collection(self.residual_artist)
+        self.axes.add_collection(self.excluded_residual_artist)
         self.axes.legend(loc="best")
         self.canvas = FigureCanvasTkAgg(figure, master=self.plot_frame)
         self.canvas.draw()
@@ -187,6 +342,141 @@ class EISApplication:
         toolbar.pack(side=tk.BOTTOM, fill=tk.X)
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.canvas.mpl_connect("button_press_event", self._on_plot_click)
+
+    def _build_explorer(self, parent: ttk.Frame) -> None:
+        group = ttk.LabelFrame(parent, text="Spectra explorer", padding=6)
+        group.pack(fill=tk.BOTH, expand=True)
+        group.columnconfigure(0, weight=1)
+        group.rowconfigure(0, weight=1)
+        columns = (
+            "source",
+            "cycle",
+            "potential",
+            "current",
+            "points",
+            "f_min",
+            "f_max",
+        )
+        self.explorer = ttk.Treeview(
+            group,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            height=7,
+        )
+        self._explorer_headings = {
+            "source": "Source file",
+            "cycle": "Cycle",
+            "potential": "Voltage (V)",
+            "current": "Current (mA)",
+            "points": "Points",
+            "f_min": "Min frequency (Hz)",
+            "f_max": "Max frequency (Hz)",
+        }
+        self._explorer_attributes = {
+            "source": None,
+            "cycle": "cycle",
+            "potential": "potential_v",
+            "current": "current_ma",
+            "points": "point_count",
+            "f_min": "minimum_frequency_hz",
+            "f_max": "maximum_frequency_hz",
+        }
+        self._explorer_sort_reverse: dict[str, bool] = {}
+        self._explorer_selected_column = "cycle"
+        widths = {
+            "source": 190,
+            "cycle": 65,
+            "potential": 105,
+            "current": 110,
+            "points": 65,
+            "f_min": 125,
+            "f_max": 125,
+        }
+        for column in columns:
+            self.explorer.heading(
+                column,
+                text=self._explorer_headings[column],
+                command=lambda selected=column: self._sort_explorer(selected),
+            )
+            anchor = tk.W if column == "source" else tk.E
+            self.explorer.column(
+                column, width=widths[column], minwidth=55, anchor=anchor
+            )
+        scrollbar = ttk.Scrollbar(
+            group, orient=tk.VERTICAL, command=self.explorer.yview
+        )
+        self.explorer.configure(yscrollcommand=scrollbar.set)
+        self.explorer.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.explorer.bind("<<TreeviewSelect>>", self._select_explorer_spectrum)
+
+    def _populate_explorer(self) -> None:
+        self.explorer.delete(*self.explorer.get_children())
+        self._explorer_rows.clear()
+        self._explorer_lookup.clear()
+        for dataset_index, path in enumerate(self._dataset_order):
+            loaded = self.loaded_projects[path]
+            for spectrum in loaded.spectra:
+                item = f"dataset_{dataset_index}_cycle_{spectrum.cycle}"
+                self._explorer_rows[item] = (path, loaded, spectrum)
+                self._explorer_lookup[(path, spectrum.cycle)] = item
+                self.explorer.insert(
+                    "",
+                    tk.END,
+                    iid=item,
+                    values=(
+                        path.name,
+                        spectrum.cycle,
+                        f"{spectrum.potential_v:.8g}",
+                        f"{spectrum.current_ma:.8g}",
+                        spectrum.point_count,
+                        f"{spectrum.minimum_frequency_hz:.8g}",
+                        f"{spectrum.maximum_frequency_hz:.8g}",
+                    ),
+                )
+
+    def _sort_explorer(self, column: str) -> None:
+        if not self._explorer_rows:
+            return
+        reverse = self._explorer_sort_reverse.get(column, False)
+        self._explorer_selected_column = column
+        attribute = self._explorer_attributes[column]
+        ordered = sorted(
+            self._explorer_rows.items(),
+            key=(
+                (lambda item: item[1][0].name.casefold())
+                if attribute is None
+                else (lambda item: getattr(item[1][2], attribute))
+            ),
+            reverse=reverse,
+        )
+        for index, (item, _row) in enumerate(ordered):
+            self.explorer.move(item, "", index)
+        for name, label in self._explorer_headings.items():
+            marker = ""
+            if name == column:
+                marker = " ▼" if reverse else " ▲"
+            self.explorer.heading(name, text=f"{label}{marker}")
+        self._explorer_sort_reverse[column] = not reverse
+
+    def _select_explorer_spectrum(self, _event=None) -> None:
+        if self.busy or self.state is None:
+            return
+        selected = self.explorer.selection()
+        if selected:
+            path, loaded, spectrum = self._explorer_rows[selected[0]]
+            if loaded is self.loaded:
+                self._activate_cycle(spectrum.cycle)
+            else:
+                self._switch_dataset(path, loaded, spectrum.cycle)
+
+    def _highlight_explorer_cycle(self, cycle_number: int) -> None:
+        item = self._explorer_lookup.get((self.path.resolve(), cycle_number))
+        if item is not None and self.explorer.exists(item):
+            self.explorer.selection_set(item)
+            self.explorer.focus(item)
+            self.explorer.see(item)
 
     def _build_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -218,7 +508,9 @@ class EISApplication:
         )
         self.model_box.grid(row=0, column=0, padx=(0, 5), sticky="ew")
         self.model_box.bind("<Return>", lambda _event: self.apply_model())
-        self.model_button = ttk.Button(model_group, text="Set model", command=self.apply_model)
+        self.model_button = ttk.Button(
+            model_group, text="Set model", command=self.apply_model
+        )
         self.model_button.grid(row=0, column=1)
 
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
@@ -230,11 +522,15 @@ class EISApplication:
         options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
         options_group.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         options_group.columnconfigure(1, weight=1)
-        ttk.Label(options_group, text="Min frequency (Hz)").grid(row=0, column=0, sticky="w")
+        ttk.Label(options_group, text="Min frequency (Hz)").grid(
+            row=0, column=0, sticky="w"
+        )
         ttk.Entry(options_group, textvariable=self.minimum_frequency_var).grid(
             row=0, column=1, padx=(8, 0), pady=2, sticky="ew"
         )
-        ttk.Label(options_group, text="Max frequency (Hz)").grid(row=1, column=0, sticky="w")
+        ttk.Label(options_group, text="Max frequency (Hz)").grid(
+            row=1, column=0, sticky="w"
+        )
         ttk.Entry(options_group, textvariable=self.maximum_frequency_var).grid(
             row=1, column=1, padx=(8, 0), pady=2, sticky="ew"
         )
@@ -243,14 +539,20 @@ class EISApplication:
             text="Apply to current cycle",
             command=self.apply_frequency_window,
         )
-        self.frequency_button.grid(row=2, column=0, padx=(0, 4), pady=(6, 0), sticky="ew")
+        self.frequency_button.grid(
+            row=2, column=0, padx=(0, 4), pady=(6, 0), sticky="ew"
+        )
         self.frequency_all_button = ttk.Button(
             options_group,
             text="Apply to all cycles",
             command=self.apply_frequency_window_to_all,
         )
-        self.frequency_all_button.grid(row=2, column=1, padx=(4, 0), pady=(6, 0), sticky="ew")
-        ttk.Label(options_group, text="Outlier threshold").grid(row=3, column=0, pady=(8, 2), sticky="w")
+        self.frequency_all_button.grid(
+            row=2, column=1, padx=(4, 0), pady=(6, 0), sticky="ew"
+        )
+        ttk.Label(options_group, text="Outlier threshold").grid(
+            row=3, column=0, pady=(8, 2), sticky="w"
+        )
         ttk.Entry(options_group, textvariable=self.threshold_var).grid(
             row=3, column=1, padx=(8, 0), pady=(8, 2), sticky="ew"
         )
@@ -261,7 +563,9 @@ class EISApplication:
         actions.columnconfigure(1, weight=1)
         self.fit_button = ttk.Button(actions, text="Fit spectrum", command=self.fit)
         self.fit_button.grid(row=0, column=0, padx=(0, 4), pady=3, sticky="ew")
-        self.outlier_button = ttk.Button(actions, text="Outliers: current", command=self.find_outliers)
+        self.outlier_button = ttk.Button(
+            actions, text="Outliers: current", command=self.find_outliers
+        )
         self.outlier_button.grid(row=0, column=1, padx=(4, 0), pady=3, sticky="ew")
         self.outlier_all_button = ttk.Button(
             actions,
@@ -269,7 +573,9 @@ class EISApplication:
             command=self.find_outliers_for_all,
         )
         self.outlier_all_button.grid(row=1, column=0, padx=(0, 4), pady=3, sticky="ew")
-        self.reset_button = ttk.Button(actions, text="Reset points", command=self.reset_points)
+        self.reset_button = ttk.Button(
+            actions, text="Reset points", command=self.reset_points
+        )
         self.reset_button.grid(row=1, column=1, padx=(4, 0), pady=3, sticky="ew")
         self.batch_fit_button = ttk.Button(
             actions,
@@ -277,40 +583,15 @@ class EISApplication:
             command=self.batch_fit,
         )
         self.batch_fit_button.grid(row=2, column=0, columnspan=2, pady=3, sticky="ew")
-        self.save_button = ttk.Button(actions, text="Save mask", command=self.save_mask)
-        self.save_button.grid(row=3, column=0, columnspan=2, pady=3, sticky="ew")
-
-        files = ttk.LabelFrame(parent, text="Project and export", padding=8)
-        files.grid(row=5, column=0, sticky="ew", pady=(8, 0))
-        files.columnconfigure(0, weight=1)
-        files.columnconfigure(1, weight=1)
-        self.save_project_button = ttk.Button(
-            files, text="Save project", command=self.save_project
-        )
-        self.save_project_button.grid(row=0, column=0, padx=(0, 4), pady=3, sticky="ew")
-        self.load_project_button = ttk.Button(
-            files, text="Load project", command=self.load_project
-        )
-        self.load_project_button.grid(row=0, column=1, padx=(4, 0), pady=3, sticky="ew")
-        self.export_fits_button = ttk.Button(
-            files, text="Export fit parameters", command=self.export_fits
-        )
-        self.export_fits_button.grid(
-            row=1, column=0, columnspan=2, pady=3, sticky="ew"
-        )
         self.action_buttons = (
             self.fit_button,
             self.outlier_button,
             self.outlier_all_button,
             self.reset_button,
             self.batch_fit_button,
-            self.save_button,
             self.frequency_button,
             self.frequency_all_button,
             self.model_button,
-            self.save_project_button,
-            self.load_project_button,
-            self.export_fits_button,
             self.previous_button,
             self.next_button,
         )
@@ -330,15 +611,59 @@ class EISApplication:
         )
 
     def _finish_loading(self, loaded: LoadedProject) -> None:
-        self.loaded = loaded
-        self.state = loaded.state
-        self.model_var.set(self.state.circuit)
-        self.cycle_box.configure(values=[str(cycle) for cycle in self.state.available_cycles])
-        self.cycle_var.set(str(self.state.active_cycle))
-        self._restore_controls()
-        self._refresh_plot(rescale=True)
+        self._register_dataset(self.path, loaded)
+        self._populate_explorer()
+        self._switch_dataset(
+            self.path,
+            loaded,
+            loaded.state.active_cycle,
+            capture_current=False,
+        )
         self._set_controls_enabled(True)
         self._update_status()
+
+    def _register_dataset(self, path: Path, loaded: LoadedProject) -> None:
+        path = path.resolve()
+        loaded.state.source_path = path
+        if path not in self.loaded_projects:
+            self._dataset_order.append(path)
+        self.loaded_projects[path] = loaded
+
+    def _switch_dataset(
+        self,
+        path: Path,
+        loaded: LoadedProject,
+        cycle_number: int,
+        *,
+        capture_current: bool = True,
+    ) -> None:
+        if capture_current and self.state is not None and not self._capture_controls():
+            self._highlight_explorer_cycle(self.state.active_cycle)
+            return
+        path = path.resolve()
+        state = loaded.state
+        if cycle_number not in state.cycles:
+            cycle = load_cycle(loaded.dataframe, cycle_number, state.control)
+            if state.all_frequency_window is not None:
+                cycle.frequency_window = state.all_frequency_window
+            cycle.parameters = state.parameters_for(cycle_number)
+            state.cycles[cycle_number] = cycle
+        state.active_cycle = cycle_number
+        self.path = path
+        self.loaded = loaded
+        self.state = state
+        self.control = state.control
+        self.circuit = state.circuit
+        self.model_var.set(self.state.circuit)
+        self.root.title(f"EIS Fitting — {self.path.name}")
+        self.cycle_box.configure(
+            values=[str(cycle) for cycle in self.state.available_cycles]
+        )
+        self.cycle_var.set(str(self.state.active_cycle))
+        self._highlight_explorer_cycle(self.state.active_cycle)
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        self._update_status(f"source: {self.path.name}")
 
     def _submit(
         self,
@@ -370,7 +695,9 @@ class EISApplication:
         except Exception as error:
             self._set_controls_enabled(self.state is not None)
             self.status_var.set(f"Error: {error}")
-            messagebox.showerror(error_title, f"{type(error).__name__}: {error}", parent=self.root)
+            messagebox.showerror(
+                error_title, f"{type(error).__name__}: {error}", parent=self.root
+            )
             return
         success(result)
         self._set_controls_enabled(self.state is not None)
@@ -380,9 +707,28 @@ class EISApplication:
         for button in getattr(self, "action_buttons", ()):
             button.configure(state=state)
         if hasattr(self, "cycle_box"):
-            self.cycle_box.configure(state="readonly" if enabled and not self.busy else "disabled")
+            self.cycle_box.configure(
+                state="readonly" if enabled and not self.busy else "disabled"
+            )
         if hasattr(self, "model_box"):
-            self.model_box.configure(state="normal" if enabled and not self.busy else "disabled")
+            self.model_box.configure(
+                state="normal" if enabled and not self.busy else "disabled"
+            )
+        if hasattr(self, "explorer"):
+            self.explorer.state(
+                ("!disabled",) if enabled and not self.busy else ("disabled",)
+            )
+        menu_state = tk.NORMAL if enabled and not self.busy else tk.DISABLED
+        if hasattr(self, "file_menu"):
+            self.file_menu.entryconfigure(
+                "Import data…",
+                state=tk.DISABLED if self.busy else tk.NORMAL,
+            )
+            for label in self._project_menu_actions:
+                self.file_menu.entryconfigure(label, state=menu_state)
+        if hasattr(self, "fit_menu"):
+            for label in self._fit_menu_actions:
+                self.fit_menu.entryconfigure(label, state=menu_state)
 
     def _restore_controls(self) -> None:
         if self.state is None:
@@ -402,9 +748,13 @@ class EISApplication:
             maximum = float(self.maximum_frequency_var.get())
             for parameter in parameters:
                 if parameter.lower > parameter.upper:
-                    raise ValueError(f"{parameter.name}: lower bound exceeds upper bound")
+                    raise ValueError(
+                        f"{parameter.name}: lower bound exceeds upper bound"
+                    )
                 if not parameter.lower <= parameter.initial <= parameter.upper:
-                    raise ValueError(f"{parameter.name}: initial value is outside its bounds")
+                    raise ValueError(
+                        f"{parameter.name}: initial value is outside its bounds"
+                    )
         except ValueError as error:
             messagebox.showerror("Invalid value", str(error), parent=self.root)
             return False
@@ -424,25 +774,53 @@ class EISApplication:
         if cycle.fit_impedance is None:
             self.fit_artist.set_data([], [])
         else:
-            self.fit_artist.set_data(cycle.fit_impedance.real, -cycle.fit_impedance.imag)
+            self.fit_artist.set_data(
+                cycle.fit_impedance.real, -cycle.fit_impedance.imag
+            )
         if cycle.fit_at_data_impedance is None:
-            self.fit_points_artist.set_data([], [])
+            self.fit_points_included_artist.set_data([], [])
+            self.fit_points_excluded_artist.set_data([], [])
             self.residual_artist.set_segments([])
+            self.excluded_residual_artist.set_segments([])
         else:
             fitted = cycle.fit_at_data_impedance
-            self.fit_points_artist.set_data(fitted.real, -fitted.imag)
+            self.fit_points_included_artist.set_data(
+                fitted.real[included], -fitted.imag[included]
+            )
+            self.fit_points_excluded_artist.set_data(
+                fitted.real[~included], -fitted.imag[~included]
+            )
             measured_points = np.column_stack((real, negative_imaginary))
             fitted_points = np.column_stack((fitted.real, -fitted.imag))
-            self.residual_artist.set_segments(
-                np.stack((measured_points, fitted_points), axis=1)
-            )
+            residuals = np.stack((measured_points, fitted_points), axis=1)
+            self.residual_artist.set_segments(residuals[included])
+            self.excluded_residual_artist.set_segments(residuals[~included])
         self.axes.set_title(
             f"{self.path.name}\nCycle {cycle.cycle} · {self.state.circuit}"
         )
         if rescale:
-            self.axes.relim()
-            self.axes.autoscale_view()
+            self._autoscale_to_included(cycle)
         self.canvas.draw_idle()
+
+    def _autoscale_to_included(self, cycle) -> None:
+        included = cycle.included
+        if not np.any(included):
+            included = np.ones(cycle.frequency_hz.size, dtype=bool)
+        x_values = cycle.impedance.real[included]
+        y_values = -cycle.impedance.imag[included]
+        finite = np.isfinite(x_values) & np.isfinite(y_values)
+        if not np.any(finite):
+            return
+        x_values = x_values[finite]
+        y_values = y_values[finite]
+        x_min, x_max = float(np.min(x_values)), float(np.max(x_values))
+        y_min, y_max = float(np.min(y_values)), float(np.max(y_values))
+        x_span = x_max - x_min
+        y_span = y_max - y_min
+        x_padding = 0.06 * (x_span if x_span > 0 else max(abs(x_min), 1.0))
+        y_padding = 0.06 * (y_span if y_span > 0 else max(abs(y_min), 1.0))
+        self.axes.set_xlim(x_min - x_padding, x_max + x_padding)
+        self.axes.set_ylim(y_min - y_padding, y_max + y_padding)
 
     def _update_status(self, suffix: str = "") -> None:
         if self.state is None:
@@ -466,14 +844,16 @@ class EISApplication:
         display_points = self.axes.transData.transform(
             np.column_stack((cycle.impedance.real, -cycle.impedance.imag))
         )
-        distances = np.hypot(display_points[:, 0] - event.x, display_points[:, 1] - event.y)
+        distances = np.hypot(
+            display_points[:, 0] - event.x, display_points[:, 1] - event.y
+        )
         if distances.size == 0:
             return
         index = int(np.argmin(distances))
         if distances[index] > 10:
             return
         cycle.toggle_point(index)
-        self._refresh_plot()
+        self._refresh_plot(rescale=True)
         self._update_status()
 
     def _select_cycle(self, _event=None) -> None:
@@ -494,16 +874,20 @@ class EISApplication:
             return
         if not self._capture_controls():
             self.cycle_var.set(str(self.state.active_cycle))
+            self._highlight_explorer_cycle(self.state.active_cycle)
             return
         if cycle_number not in self.state.cycles:
             assert self.loaded is not None
-            new_cycle = load_cycle(self.loaded.dataframe, cycle_number, self.state.control)
+            new_cycle = load_cycle(
+                self.loaded.dataframe, cycle_number, self.state.control
+            )
             if self.state.all_frequency_window is not None:
                 new_cycle.frequency_window = self.state.all_frequency_window
             new_cycle.parameters = self.state.parameters_for(cycle_number)
             self.state.cycles[cycle_number] = new_cycle
         self.state.active_cycle = cycle_number
         self.cycle_var.set(str(cycle_number))
+        self._highlight_explorer_cycle(cycle_number)
         self._restore_controls()
         self._refresh_plot(rescale=True)
         self._update_status()
@@ -528,7 +912,9 @@ class EISApplication:
             return
         circuit = self.model_var.get().strip()
         if not circuit:
-            messagebox.showerror("Invalid model", "Enter a circuit model", parent=self.root)
+            messagebox.showerror(
+                "Invalid model", "Enter a circuit model", parent=self.root
+            )
             return
         try:
             parameters = circuit_parameters(circuit)
@@ -542,7 +928,9 @@ class EISApplication:
             return
         self.state.replace_circuit(circuit, parameters)
         self.circuit = circuit
-        self.parameter_table.set_parameters(self.state.parameters_for(self.state.active_cycle))
+        self.parameter_table.set_parameters(
+            self.state.parameters_for(self.state.active_cycle)
+        )
         self._refresh_plot(rescale=True)
         self._update_status("fitting model changed")
 
@@ -552,7 +940,9 @@ class EISApplication:
         try:
             threshold = float(self.threshold_var.get())
         except ValueError:
-            messagebox.showerror("Invalid threshold", "Enter a numeric threshold", parent=self.root)
+            messagebox.showerror(
+                "Invalid threshold", "Enter a numeric threshold", parent=self.root
+            )
             return
         cycle_number = self.state.active_cycle
         cycle = self.state.active
@@ -568,7 +958,7 @@ class EISApplication:
             return
         self.state.cycles[cycle_number].apply_outliers(indices)
         if self.state.active_cycle == cycle_number:
-            self._refresh_plot()
+            self._refresh_plot(rescale=True)
             self._update_status("outlier search complete")
 
     def find_outliers_for_all(self) -> None:
@@ -577,7 +967,9 @@ class EISApplication:
         try:
             threshold = float(self.threshold_var.get())
         except ValueError:
-            messagebox.showerror("Invalid threshold", "Enter a numeric threshold", parent=self.root)
+            messagebox.showerror(
+                "Invalid threshold", "Enter a numeric threshold", parent=self.root
+            )
             return
         cycle_count = len(self.state.available_cycles)
         self.status_var.set(f"Finding outliers in all {cycle_count} cycles…")
@@ -606,11 +998,11 @@ class EISApplication:
                 cycle.frequency_window = self.state.all_frequency_window
             cycle.apply_outliers(indices)
         self._restore_controls()
-        self._refresh_plot()
+        self._refresh_plot(rescale=True)
         self._update_status(f"outliers calculated for {len(results)} cycles")
 
     def fit(self) -> None:
-        if self.state is None or not self._capture_controls():
+        if self.busy or self.state is None or not self._capture_controls():
             return
         cycle_number = self.state.active_cycle
         cycle = self.state.active
@@ -625,14 +1017,23 @@ class EISApplication:
     def _finish_fit(self, cycle_number, parameters, result) -> None:
         if self.state is None:
             return
-        fitted_parameters, fit_frequency, fit_impedance, fit_at_data = result
+        (
+            fitted_parameters,
+            errors_percent,
+            fit_frequency,
+            fit_impedance,
+            fit_at_data,
+        ) = result
         cycle = self.state.cycles[cycle_number]
         cycle.fit_parameters = fitted_parameters
         cycle.fit_frequency_hz = fit_frequency
         cycle.fit_impedance = fit_impedance
         cycle.fit_at_data_impedance = fit_at_data
-        for parameter, fitted in zip(parameters, fitted_parameters):
+        for parameter, fitted, error_percent in zip(
+            parameters, fitted_parameters, errors_percent
+        ):
             parameter.initial = float(fitted)
+            parameter.error_percent = float(error_percent)
         cycle.parameters = parameters
         if self.state.active_cycle == cycle_number:
             self.parameter_table.set_parameters(parameters)
@@ -646,7 +1047,7 @@ class EISApplication:
         parameters = self.state.parameters_for(start_cycle)
         cycle_count = len(
             self.state.available_cycles[
-                self.state.available_cycles.index(start_cycle):
+                self.state.available_cycles.index(start_cycle) :
             ]
         )
         self.status_var.set(
@@ -690,6 +1091,111 @@ class EISApplication:
             parent=self.root,
         )
 
+    def batch_fit_explorer(
+        self,
+        direction: int,
+        *,
+        to_metadata_value: bool = False,
+    ) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        selected = self.explorer.selection()
+        if not selected:
+            self._update_status("select a spectrum in the explorer first")
+            return
+        visible_items = list(self.explorer.get_children(""))
+        selected_index = visible_items.index(selected[0])
+        if direction > 0:
+            batch_items = visible_items[selected_index:]
+            direction_name = "down"
+        else:
+            batch_items = list(reversed(visible_items[: selected_index + 1]))
+            direction_name = "up"
+
+        target_description = ""
+        if to_metadata_value:
+            column = self._explorer_selected_column
+            attribute = self._explorer_attributes[column]
+            if attribute is None:
+                messagebox.showerror(
+                    "Select numeric metadata",
+                    "Choose a numeric explorer column such as voltage or current first.",
+                    parent=self.root,
+                )
+                return
+            label = self._explorer_headings[column]
+            target_value = simpledialog.askfloat(
+                "Batch fit limit",
+                f"Stop near which {label} value?",
+                parent=self.root,
+            )
+            if target_value is None:
+                return
+            nearest_index = min(
+                range(len(batch_items)),
+                key=lambda index: abs(
+                    float(
+                        getattr(
+                            self._explorer_rows[batch_items[index]][2],
+                            attribute,
+                        )
+                    )
+                    - target_value
+                ),
+            )
+            batch_items = batch_items[: nearest_index + 1]
+            target_description = f" toward {label}={target_value:g}"
+
+        targets = []
+        for item in batch_items:
+            path, loaded, spectrum = self._explorer_rows[item]
+            targets.append(
+                SpectrumFitTarget(
+                    loaded=loaded,
+                    cycle=spectrum.cycle,
+                    label=f"{path.name}, cycle {spectrum.cycle}",
+                )
+            )
+        parameters = self.state.parameters_for(self.state.active_cycle)
+        self.status_var.set(
+            f"Batch fitting {len(targets)} spectra {direction_name}"
+            f"{target_description}…"
+        )
+        self._submit(
+            lambda: batch_fit_spectra(targets, parameters),
+            self._finish_explorer_batch_fit,
+            "Explorer batch fit failed",
+        )
+
+    def _finish_explorer_batch_fit(self, report: SpectrumBatchReport) -> None:
+        if self.state is None:
+            return
+        for result in report.fits:
+            cycle = result.fit.cycle
+            cycle.parameters = result.fit.parameters
+            cycle.fit_parameters = result.fit.fitted_parameters
+            cycle.fit_frequency_hz = result.fit.fit_frequency_hz
+            cycle.fit_impedance = result.fit.fit_impedance
+            cycle.fit_at_data_impedance = result.fit.fit_at_data_impedance
+            result.loaded.state.cycles[cycle.cycle] = cycle
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        if report.failed_label is None:
+            self._update_status(
+                f"explorer batch fit completed for {len(report.fits)} spectra"
+            )
+            return
+        self._update_status(
+            f"explorer batch stopped at {report.failed_label}; "
+            f"{len(report.fits)} spectra completed"
+        )
+        messagebox.showwarning(
+            "Explorer batch fit stopped",
+            f"{report.failed_label}: {report.error}\n\n"
+            f"The {len(report.fits)} successful fits were retained.",
+            parent=self.root,
+        )
+
     def copy_neighbor_fit(self, direction: int) -> None:
         if self.state is None or self.busy or not self._capture_controls():
             return
@@ -723,13 +1229,15 @@ class EISApplication:
         if self.state is None:
             return
         self.state.active.reset_selection()
-        self._refresh_plot()
+        self._refresh_plot(rescale=True)
         self._update_status("selection reset")
 
     def save_mask(self) -> None:
-        if self.state is None:
+        if self.busy or self.state is None:
             return
-        default_name = f"{self.path.stem}_cycle{self.state.active_cycle}_mask_included.npy"
+        default_name = (
+            f"{self.path.stem}_cycle{self.state.active_cycle}_mask_included.npy"
+        )
         selected = filedialog.asksaveasfilename(
             parent=self.root,
             title="Save included-point mask",
@@ -743,8 +1251,65 @@ class EISApplication:
         np.save(Path(selected), self.state.active.included.astype(bool))
         self._update_status(f"saved {Path(selected).name}")
 
+    def import_data(self) -> None:
+        if self.busy:
+            return
+        selected = filedialog.askopenfilenames(
+            parent=self.root,
+            title="Add BioLogic impedance data",
+            initialdir=str(self.path.parent),
+            filetypes=[("BioLogic MPT", "*.mpt"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        selected_paths = list(
+            dict.fromkeys(Path(value).resolve() for value in selected)
+        )
+        new_paths = [
+            path for path in selected_paths if path not in self.loaded_projects
+        ]
+        if not new_paths:
+            self._update_status("all selected files are already imported")
+            return
+        if self.state is not None and not self._capture_controls():
+            return
+        circuit = self.state.circuit if self.state is not None else self.circuit
+        control = self.state.control if self.state is not None else self.control
+        self.status_var.set(f"Importing {len(new_paths)} data files…")
+        self._submit(
+            lambda: load_projects(new_paths, control, circuit),
+            self._finish_imports,
+            "Data import failed",
+        )
+
+    def _finish_imports(self, report: ProjectImportReport) -> None:
+        for path, loaded in report.loaded:
+            self._register_dataset(path, loaded)
+        self._populate_explorer()
+        if report.loaded:
+            path, loaded = report.loaded[0]
+            self._switch_dataset(
+                path,
+                loaded,
+                loaded.state.active_cycle,
+                capture_current=False,
+            )
+        if report.errors:
+            details = "\n".join(
+                f"{path.name}: {error}" for path, error in report.errors
+            )
+            messagebox.showwarning(
+                "Some files were not imported",
+                details,
+                parent=self.root,
+            )
+        self._update_status(
+            f"added {len(report.loaded)} files; "
+            f"{len(self._explorer_rows)} spectra loaded"
+        )
+
     def save_project(self) -> None:
-        if self.state is None or not self._capture_controls():
+        if self.busy or self.state is None or not self._capture_controls():
             return
         selected = filedialog.asksaveasfilename(
             parent=self.root,
@@ -768,7 +1333,7 @@ class EISApplication:
         self._update_status(f"project saved as {Path(selected).name}")
 
     def load_project(self) -> None:
-        if self.state is None or self.loaded is None:
+        if self.busy or self.state is None or self.loaded is None:
             return
         selected = filedialog.askopenfilename(
             parent=self.root,
@@ -792,17 +1357,27 @@ class EISApplication:
         self.state = restored
         assert self.loaded is not None
         self.loaded.state = restored
+        self.loaded.spectra = catalog_spectra(
+            self.loaded.dataframe,
+            restored.available_cycles,
+            restored.control,
+        )
+        self.loaded_projects[self.path.resolve()] = self.loaded
         self.control = restored.control
         self.circuit = restored.circuit
         self.model_var.set(restored.circuit)
         self.cycle_var.set(str(restored.active_cycle))
-        self.cycle_box.configure(values=[str(cycle) for cycle in restored.available_cycles])
+        self.cycle_box.configure(
+            values=[str(cycle) for cycle in restored.available_cycles]
+        )
+        self._populate_explorer()
+        self._highlight_explorer_cycle(restored.active_cycle)
         self._restore_controls()
         self._refresh_plot(rescale=True)
         self._update_status(f"project loaded from {path.name}")
 
     def export_fits(self) -> None:
-        if self.state is None or not self._capture_controls():
+        if self.busy or self.state is None or not self._capture_controls():
             return
         selected = filedialog.asksaveasfilename(
             parent=self.root,
