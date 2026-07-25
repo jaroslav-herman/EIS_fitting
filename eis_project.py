@@ -8,7 +8,6 @@ import numpy as np
 
 from eis_model import CycleState, ParameterValue, ProjectState, as_1d_array
 
-
 PROJECT_FORMAT = "eis-fitting-project"
 PROJECT_VERSION = 1
 
@@ -119,9 +118,7 @@ def load_project_file(
 
     circuit = str(payload["circuit"])
     control = str(payload.get("control", current.control))
-    defaults = [
-        _parameter_from_dict(value) for value in payload["default_parameters"]
-    ]
+    defaults = [_parameter_from_dict(value) for value in payload["default_parameters"]]
     restored_cycles: dict[int, CycleState] = {}
     available = set(current.available_cycles)
     for cycle_text, saved in payload.get("cycles", {}).items():
@@ -149,9 +146,7 @@ def load_project_file(
         cycle.parameters = [
             _parameter_from_dict(value) for value in saved.get("parameters", [])
         ] or [
-            ParameterValue(
-                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
-            )
+            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent)
             for p in defaults
         ]
         cycle.fit_parameters = _optional_array(saved.get("fit_parameters"))
@@ -183,9 +178,7 @@ def load_project_file(
     if active_cycle not in restored_cycles:
         active = load_cycle(dataframe, active_cycle, control)
         active.parameters = [
-            ParameterValue(
-                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
-            )
+            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent)
             for p in defaults
         ]
         restored_cycles[active_cycle] = active
@@ -272,9 +265,7 @@ def export_python_workspace(
 
     parameter_names = list(
         dict.fromkeys(
-            parameter.name
-            for _state, cycle in fitted
-            for parameter in cycle.parameters
+            parameter.name for _state, cycle in fitted for parameter in cycle.parameters
         )
     )
     metadata_columns = [
@@ -292,9 +283,7 @@ def export_python_workspace(
         "active_maximum_frequency_Hz",
     ]
     parameter_columns = [
-        column
-        for name in parameter_names
-        for column in (name, f"{name}_error_percent")
+        column for name in parameter_names for column in (name, f"{name}_error_percent")
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(
@@ -340,11 +329,14 @@ def export_python_workspace(
             writer.writerow(row)
 
     script_path = path.with_suffix(".py")
-    script = f'''from pathlib import Path
-
+    script = f"""
+# %%
+from pathlib import Path
+import matplotlib.pyplot as plt
 import pandas as pd
+improt numpy as np
 
-
+# %%
 DATA_FILE = Path(__file__).with_name({path.name!r})
 
 # Complete export: one spectrum per row.
@@ -371,6 +363,8 @@ parameter_errors_percent = indexed_fit_data.loc[:, [
 
 print(f"Loaded {{len(fit_data)}} fitted spectra from {{DATA_FILE.name}}")
 print(fit_data.head())
-'''
+# %%
+
+"""
     script_path.write_text(script, encoding="utf-8")
     return len(fitted), script_path
