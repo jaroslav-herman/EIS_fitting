@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
@@ -9,11 +12,17 @@ from typing import Callable
 import numpy as np
 
 from eis_model import ParameterValue, ProjectState
-from eis_project import export_fit_parameters, load_project_file, save_project_file
+from eis_project import (
+    export_fit_parameters,
+    export_python_workspace as write_python_workspace,
+    load_project_file,
+    save_project_file,
+)
 from eis_services import (
     BatchFitReport,
     LoadedProject,
     ProjectImportReport,
+    RidgeInitialization,
     SpectrumBatchReport,
     SpectrumFitTarget,
     SpectrumMetadata,
@@ -21,7 +30,7 @@ from eis_services import (
     batch_fit_spectra,
     catalog_spectra,
     circuit_parameters,
-    find_outlier_indices,
+    analyze_outliers,
     find_outliers_for_all_cycles,
     fit_cycle,
     load_cycle,
@@ -207,6 +216,10 @@ class EISApplication:
             label="Export fit parameters…",
             command=self.export_fits,
         )
+        self.file_menu.add_command(
+            label="Export Python workspace…",
+            command=self.export_python_workspace,
+        )
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Exit", command=self.close)
         menu_bar.add_cascade(label="File", menu=self.file_menu)
@@ -215,6 +228,7 @@ class EISApplication:
             "Save project…",
             "Save current mask…",
             "Export fit parameters…",
+            "Export Python workspace…",
         )
         self.fit_menu = tk.Menu(menu_bar, tearoff=False)
         self.fit_menu.add_command(
@@ -583,12 +597,21 @@ class EISApplication:
             command=self.batch_fit,
         )
         self.batch_fit_button.grid(row=2, column=0, columnspan=2, pady=3, sticky="ew")
+        self.python_export_button = ttk.Button(
+            actions,
+            text="Export to Python",
+            command=self.export_python_workspace,
+        )
+        self.python_export_button.grid(
+            row=3, column=0, columnspan=2, pady=3, sticky="ew"
+        )
         self.action_buttons = (
             self.fit_button,
             self.outlier_button,
             self.outlier_all_button,
             self.reset_button,
             self.batch_fit_button,
+            self.python_export_button,
             self.frequency_button,
             self.frequency_all_button,
             self.model_button,
@@ -946,20 +969,33 @@ class EISApplication:
             return
         cycle_number = self.state.active_cycle
         cycle = self.state.active
+        parameters = self.state.parameters_for(cycle_number)
         self.status_var.set(f"Cycle {cycle_number} · finding outliers…")
         self._submit(
-            lambda: find_outlier_indices(cycle, threshold),
-            lambda indices: self._finish_outliers(cycle_number, indices),
+            lambda: analyze_outliers(cycle, threshold, parameters),
+            lambda analysis: self._finish_outliers(cycle_number, analysis),
             "Outlier search failed",
         )
 
-    def _finish_outliers(self, cycle_number: int, indices: np.ndarray) -> None:
+    def _finish_outliers(
+        self,
+        cycle_number: int,
+        analysis: RidgeInitialization,
+    ) -> None:
         if self.state is None:
             return
-        self.state.cycles[cycle_number].apply_outliers(indices)
+        cycle = self.state.cycles[cycle_number]
+        cycle.apply_outliers(analysis.outlier_indices)
+        cycle.parameters = analysis.parameters
         if self.state.active_cycle == cycle_number:
+            self.parameter_table.set_parameters(analysis.parameters)
             self._refresh_plot(rescale=True)
-            self._update_status("outlier search complete")
+            self._update_status(
+                f"outlier search complete; ridge initialized "
+                f"R∞={analysis.ohmic_resistance:.3g} Ω, "
+                f"L={analysis.inductance:.3g} H, "
+                f"{analysis.peak_count} peaks"
+            )
 
     def find_outliers_for_all(self) -> None:
         if self.state is None or self.loaded is None or not self._capture_controls():
@@ -976,8 +1012,7 @@ class EISApplication:
         self._submit(
             lambda: find_outliers_for_all_cycles(
                 self.loaded.dataframe,
-                self.state.available_cycles,
-                self.state.control,
+                self.state,
                 threshold,
             ),
             self._finish_all_outliers,
@@ -987,7 +1022,8 @@ class EISApplication:
     def _finish_all_outliers(self, results) -> None:
         if self.state is None:
             return
-        for cycle_number, (loaded_cycle, indices) in results.items():
+        peak_count = 0
+        for cycle_number, (loaded_cycle, analysis) in results.items():
             if cycle_number in self.state.cycles:
                 cycle = self.state.cycles[cycle_number]
             else:
@@ -996,10 +1032,15 @@ class EISApplication:
                 self.state.cycles[cycle_number] = cycle
             if self.state.all_frequency_window is not None:
                 cycle.frequency_window = self.state.all_frequency_window
-            cycle.apply_outliers(indices)
+            cycle.apply_outliers(analysis.outlier_indices)
+            cycle.parameters = analysis.parameters
+            peak_count += analysis.peak_count
         self._restore_controls()
         self._refresh_plot(rescale=True)
-        self._update_status(f"outliers calculated for {len(results)} cycles")
+        self._update_status(
+            f"outliers and ridge initial values calculated for {len(results)} cycles "
+            f"({peak_count} peaks)"
+        )
 
     def fit(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
@@ -1399,6 +1440,76 @@ class EISApplication:
             )
             return
         self._update_status(f"exported fit parameters for {count} cycles")
+
+    def export_python_workspace(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export parameters and metadata for Python",
+            initialdir=str(self.path.parent),
+            initialfile=f"{self.path.stem}_analysis.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not selected:
+            return
+        export_path = Path(selected)
+        script_path = export_path.with_suffix(".py")
+        if script_path.exists() and not messagebox.askyesno(
+            "Replace Python script?",
+            f"{script_path.name} already exists. Replace it?",
+            parent=self.root,
+        ):
+            return
+        states = [
+            self.loaded_projects[path].state for path in self._dataset_order
+        ]
+        try:
+            count, script_path = write_python_workspace(states, export_path)
+            editor = self._open_python_script(script_path)
+        except Exception as error:
+            messagebox.showerror(
+                "Python export failed",
+                f"{type(error).__name__}: {error}",
+                parent=self.root,
+            )
+            return
+        self._update_status(
+            f"exported {count} fitted spectra and opened "
+            f"{script_path.name} in {editor}"
+        )
+
+    @staticmethod
+    def _open_python_script(path: Path) -> str:
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
+        program_files = Path(os.environ.get("ProgramFiles", ""))
+        code_executables = (
+            local_app_data / "Programs" / "Microsoft VS Code" / "Code.exe",
+            program_files / "Microsoft VS Code" / "Code.exe",
+        )
+        for executable in code_executables:
+            if executable.is_file():
+                subprocess.Popen([str(executable), str(path)], cwd=path.parent)
+                return "VS Code"
+        for command, label in (
+            ("code", "VS Code"),
+            ("codium", "VSCodium"),
+            ("pycharm64", "PyCharm"),
+            ("spyder", "Spyder"),
+        ):
+            executable = shutil.which(command)
+            if executable:
+                subprocess.Popen([executable, str(path)], cwd=path.parent)
+                return label
+        if os.name == "nt":
+            try:
+                os.startfile(str(path), "edit")
+                return "the configured editor"
+            except OSError:
+                subprocess.Popen(["notepad.exe", str(path)], cwd=path.parent)
+                return "Notepad"
+        raise RuntimeError("No Python editor was found")
 
     def close(self) -> None:
         self.executor.shutdown(wait=False, cancel_futures=True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Iterable
 import warnings
 
@@ -32,6 +33,15 @@ class LoadedProject:
 class ProjectImportReport:
     loaded: list[tuple[Path, LoadedProject]]
     errors: list[tuple[Path, str]]
+
+
+@dataclass
+class RidgeInitialization:
+    outlier_indices: np.ndarray
+    parameters: list[ParameterValue]
+    peak_count: int
+    ohmic_resistance: float
+    inductance: float
 
 
 @dataclass
@@ -254,33 +264,182 @@ def load_projects(
     return ProjectImportReport(loaded, errors)
 
 
-def find_outlier_indices(state: CycleState, threshold: float) -> np.ndarray:
-    from wepy.eis import find_outliers
+def _clamp_initial(value: float, parameter: ParameterValue) -> float:
+    if not np.isfinite(value):
+        return parameter.initial
+    return float(np.clip(value, parameter.lower, parameter.upper))
 
-    return as_1d_array(
-        find_outliers(state.frequency_hz.copy(), state.impedance.copy(), threshold)
-    ).astype(int)
+
+def _map_ridge_to_parameters(
+    parameters: list[ParameterValue],
+    ohmic_resistance: float,
+    inductance: float,
+    peak_resistance: np.ndarray,
+    peak_tau: np.ndarray,
+    peak_alpha: np.ndarray,
+    peak_beta: np.ndarray,
+) -> list[ParameterValue]:
+    mapped = [
+        ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
+        for p in parameters
+    ]
+    by_name = {parameter.name: parameter for parameter in mapped}
+    if "R0" in by_name:
+        parameter = by_name["R0"]
+        parameter.initial = _clamp_initial(max(ohmic_resistance, 0.0), parameter)
+    for parameter in mapped:
+        if re.fullmatch(r"L\d+", parameter.name):
+            parameter.initial = _clamp_initial(max(inductance, 0.0), parameter)
+
+    branch_ids = sorted(
+        int(match.group(1))
+        for parameter in mapped
+        if (match := re.fullmatch(r"R(\d+)", parameter.name))
+        and int(match.group(1)) != 0
+    )
+    branch_count = min(len(branch_ids), peak_resistance.size)
+    if branch_count == 0:
+        return mapped
+    strongest = np.argsort(peak_resistance)[-branch_count:]
+    strongest = strongest[np.argsort(peak_tau[strongest])]
+    for branch_id, peak_index in zip(branch_ids, strongest):
+        resistance = max(float(peak_resistance[peak_index]), np.finfo(float).eps)
+        tau = max(float(peak_tau[peak_index]), np.finfo(float).eps)
+        exponent = float(
+            np.clip(peak_alpha[peak_index] * peak_beta[peak_index], 0.05, 1.0)
+        )
+        resistance_parameter = by_name.get(f"R{branch_id}")
+        if resistance_parameter is not None:
+            resistance_parameter.initial = _clamp_initial(
+                resistance, resistance_parameter
+            )
+        q_parameter = by_name.get(f"CPE{branch_id}_0")
+        exponent_parameter = by_name.get(f"CPE{branch_id}_1")
+        capacitance_parameter = by_name.get(f"C{branch_id}")
+        if q_parameter is not None:
+            q_parameter.initial = _clamp_initial(
+                tau**exponent / resistance,
+                q_parameter,
+            )
+        if exponent_parameter is not None:
+            exponent_parameter.initial = _clamp_initial(
+                exponent,
+                exponent_parameter,
+            )
+        if capacitance_parameter is not None:
+            capacitance_parameter.initial = _clamp_initial(
+                tau / resistance,
+                capacitance_parameter,
+            )
+    return mapped
+
+
+def analyze_outliers(
+    state: CycleState,
+    threshold: float,
+    parameters: list[ParameterValue],
+) -> RidgeInitialization:
+    from bayes_drt2 import peak_fit
+    from bayes_drt2.inversion import Inverter
+
+    active_mask = state.included
+    active_indices = np.flatnonzero(active_mask)
+    if active_indices.size < 3:
+        raise ValueError("At least three active points are required for outlier search")
+
+    inverter = Inverter()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Hyperparametric solution did not converge.*",
+            category=UserWarning,
+        )
+        outliers = inverter.check_outliers(
+            state.frequency_hz[active_mask].copy(),
+            state.impedance[active_mask].copy(),
+            threshold=threshold,
+            use_existing_fit=False,
+        )
+
+    peak_resistance = np.array([], dtype=float)
+    peak_tau = np.array([], dtype=float)
+    peak_alpha = np.array([], dtype=float)
+    peak_beta = np.array([], dtype=float)
+    try:
+        distribution = next(iter(inverter.distributions))
+        basis_tau = inverter.distributions[distribution]["tau"]
+        minimum_log_tau = np.log10(np.min(basis_tau)) - 1
+        maximum_log_tau = np.log10(np.max(basis_tau)) + 1
+        evaluation_tau = np.logspace(
+            minimum_log_tau,
+            maximum_log_tau,
+            int(10 * (maximum_log_tau - minimum_log_tau) + 1),
+        )
+        distribution_values = inverter.predict_distribution(
+            name=distribution,
+            tau=evaluation_tau,
+        )
+        trapz_missing = not hasattr(np, "trapz")
+        if trapz_missing:
+            np.trapz = np.trapezoid
+        try:
+            peak_parameters = peak_fit.fit_peaks(
+                evaluation_tau,
+                distribution_values,
+                inverter.predict_Rp(),
+                nonneg=bool(np.min(distribution_values) >= 0),
+                check_shoulders=False,
+                prom_rthresh=0.001,
+                R_rthresh=0.005,
+                l1_penalty=0,
+                l2_penalty=0.01,
+            )
+        finally:
+            if trapz_missing:
+                delattr(np, "trapz")
+        peak_resistance = as_1d_array(peak_parameters[::4]).astype(float)
+        peak_tau = np.exp(as_1d_array(peak_parameters[1::4]).astype(float))
+        peak_alpha = as_1d_array(peak_parameters[2::4]).astype(float)
+        peak_beta = as_1d_array(peak_parameters[3::4]).astype(float)
+    except Exception:
+        pass
+
+    mapped_parameters = _map_ridge_to_parameters(
+        parameters,
+        float(inverter.R_inf),
+        float(inverter.inductance),
+        peak_resistance,
+        peak_tau,
+        peak_alpha,
+        peak_beta,
+    )
+    return RidgeInitialization(
+        outlier_indices=active_indices[as_1d_array(outliers).astype(int)],
+        parameters=mapped_parameters,
+        peak_count=int(peak_resistance.size),
+        ohmic_resistance=float(inverter.R_inf),
+        inductance=float(inverter.inductance),
+    )
 
 
 def find_outliers_for_all_cycles(
     dataframe,
-    cycles: list[int],
-    control: str,
+    project: ProjectState,
     threshold: float,
-) -> dict[int, tuple[CycleState, np.ndarray]]:
-    from wepy.eis import find_outliers
-
-    results: dict[int, tuple[CycleState, np.ndarray]] = {}
-    for cycle_number in cycles:
-        cycle = load_cycle(dataframe, cycle_number, control)
-        indices = as_1d_array(
-            find_outliers(
-                cycle.frequency_hz.copy(),
-                cycle.impedance.copy(),
-                threshold,
-            )
-        ).astype(int)
-        results[cycle_number] = (cycle, indices)
+) -> dict[int, tuple[CycleState, RidgeInitialization]]:
+    results: dict[int, tuple[CycleState, RidgeInitialization]] = {}
+    for cycle_number in project.available_cycles:
+        cycle = project.cycles.get(cycle_number)
+        if cycle is None:
+            cycle = load_cycle(dataframe, cycle_number, project.control)
+            if project.all_frequency_window is not None:
+                cycle.frequency_window = project.all_frequency_window
+        analysis = analyze_outliers(
+            cycle,
+            threshold,
+            project.parameters_for(cycle_number),
+        )
+        results[cycle_number] = (cycle, analysis)
     return results
 
 

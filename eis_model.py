@@ -84,12 +84,10 @@ class CycleState:
         self.clear_fit()
 
     def apply_outliers(self, indices: np.ndarray) -> None:
-        outliers = np.zeros(self.frequency_hz.size, dtype=bool)
         valid = as_1d_array(indices).astype(int)
         valid = valid[(valid >= 0) & (valid < self.frequency_hz.size)]
-        outliers[valid] = True
-        self.outliers = outliers
-        self.manually_included = ~outliers
+        self.outliers[valid] = True
+        self.manually_included[valid] = False
         self.clear_fit()
 
     def reset_selection(self) -> None:
