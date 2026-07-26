@@ -266,6 +266,7 @@ class EISApplication:
         )
         self.busy = False
         self._plot_imports = None
+        self.plot_mode = "nyquist"
 
         self.threshold_var = tk.StringVar(value=f"{threshold:g}")
         self.model_var = tk.StringVar(value=circuit)
@@ -427,6 +428,12 @@ class EISApplication:
             command=self.reset_plot_view,
         )
         self.reset_view_button.pack(side=tk.LEFT, padx=(6, 0))
+        self.toggle_plot_mode_button = ttk.Button(
+            self.plot_controls,
+            text="Show Bode",
+            command=self.toggle_plot_mode,
+        )
+        self.toggle_plot_mode_button.pack(side=tk.LEFT, padx=(6, 0))
         self.figure = Figure(figsize=(7.5, 6.5), dpi=100, constrained_layout=True)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
         self.canvas.draw()
@@ -471,18 +478,26 @@ class EISApplication:
             home_callback=home_callback,
         )
 
-    def _configure_plot_layout(self) -> None:
-        self.figure.clear()
-        if self.show_drt_var.get():
-            axes = self.figure.subplots(
-                1,
-                2,
-                gridspec_kw={"width_ratios": [1.55, 1.0]},
-            )
-            self.axes, self.drt_axes = axes
-        else:
-            self.axes = self.figure.add_subplot(111)
-            self.drt_axes = None
+    @staticmethod
+    def _phase_degrees(values: np.ndarray) -> np.ndarray:
+        return -np.degrees(np.angle(values))
+
+    def _update_plot_mode_button(self) -> None:
+        if not hasattr(self, "toggle_plot_mode_button"):
+            return
+        self.toggle_plot_mode_button.configure(
+            text="Show Bode" if self.plot_mode == "nyquist" else "Show Nyquist"
+        )
+
+    def _active_plot_axes(self) -> set:
+        return {
+            axis
+            for axis in (self.axes, getattr(self, "phase_axes", None), self.drt_axes)
+            if axis is not None
+        }
+
+    def _configure_nyquist_plot(self) -> None:
+        self.phase_axes = None
         self.axes.set_xlabel("Re(Z) / Ω")
         self.axes.set_ylabel("−Im(Z) / Ω")
         self.axes.set_aspect("equal", adjustable="box")
@@ -534,7 +549,141 @@ class EISApplication:
         )
         self.axes.add_collection(self.residual_artist)
         self.axes.add_collection(self.excluded_residual_artist)
+        self.phase_included_artist = None
+        self.phase_excluded_artist = None
+        self.phase_fit_artist = None
+        self.phase_fit_points_included_artist = None
+        self.phase_fit_points_excluded_artist = None
+        self.phase_residual_artist = None
+        self.phase_excluded_residual_artist = None
         self.axes.legend(loc="best")
+
+    def _configure_bode_plot(self) -> None:
+        self.axes.set_xscale("log")
+        self.axes.set_xlabel("Frequency / Hz")
+        self.axes.set_ylabel("|Z| / Ω")
+        self.axes.grid(True, alpha=0.25)
+        self.phase_axes = self.axes.twinx()
+        self.phase_axes.set_ylabel("−Phase / °")
+        self.phase_axes.grid(False)
+        (self.included_artist,) = self.axes.plot(
+            [], [], "o", color="#1769aa", markersize=5, label="|Z| included"
+        )
+        (self.excluded_artist,) = self.axes.plot(
+            [], [], "x", color="#c62828", markersize=6, label="|Z| excluded"
+        )
+        (self.fit_artist,) = self.axes.plot(
+            [], [], "-", color="#202020", linewidth=2, alpha=0.8, label="|Z| fit"
+        )
+        (self.fit_points_included_artist,) = self.axes.plot(
+            [],
+            [],
+            "o",
+            color="#f57c00",
+            markersize=3,
+            alpha=0.6,
+            label="|Z| fit at measured frequencies",
+        )
+        (self.fit_points_excluded_artist,) = self.axes.plot(
+            [],
+            [],
+            "o",
+            color="#f57c00",
+            markersize=2.5,
+            alpha=0.2,
+            label="_nolegend_",
+        )
+        (self.phase_included_artist,) = self.phase_axes.plot(
+            [], [], "s", color="#6a1b9a", markersize=4, alpha=0.85, label="−Phase included"
+        )
+        (self.phase_excluded_artist,) = self.phase_axes.plot(
+            [], [], "x", color="#ab47bc", markersize=4.5, alpha=0.45, label="−Phase excluded"
+        )
+        (self.phase_fit_artist,) = self.phase_axes.plot(
+            [], [], "-", color="#4a148c", linewidth=1.8, alpha=0.8, label="−Phase fit"
+        )
+        (self.phase_fit_points_included_artist,) = self.phase_axes.plot(
+            [],
+            [],
+            "o",
+            color="#8e24aa",
+            markersize=2.5,
+            alpha=0.55,
+            label="−Phase fit at measured frequencies",
+        )
+        (self.phase_fit_points_excluded_artist,) = self.phase_axes.plot(
+            [],
+            [],
+            "o",
+            color="#8e24aa",
+            markersize=2,
+            alpha=0.18,
+            label="_nolegend_",
+        )
+        self.residual_artist = self._line_collection_class(
+            [],
+            colors="#777777",
+            linewidths=0.9,
+            linestyles="dashed",
+            alpha=0.3,
+            zorder=1,
+            label="|Z| measured-to-fit difference",
+        )
+        self.excluded_residual_artist = self._line_collection_class(
+            [],
+            colors="#777777",
+            linewidths=0.8,
+            linestyles="dashed",
+            alpha=0.1,
+            zorder=1,
+            label="_nolegend_",
+        )
+        self.phase_residual_artist = self._line_collection_class(
+            [],
+            colors="#8d6e63",
+            linewidths=0.8,
+            linestyles="dashed",
+            alpha=0.26,
+            zorder=1,
+            label="−Phase measured-to-fit difference",
+        )
+        self.phase_excluded_residual_artist = self._line_collection_class(
+            [],
+            colors="#8d6e63",
+            linewidths=0.7,
+            linestyles="dashed",
+            alpha=0.1,
+            zorder=1,
+            label="_nolegend_",
+        )
+        self.axes.add_collection(self.residual_artist)
+        self.axes.add_collection(self.excluded_residual_artist)
+        self.phase_axes.add_collection(self.phase_residual_artist)
+        self.phase_axes.add_collection(self.phase_excluded_residual_artist)
+        magnitude_handles, magnitude_labels = self.axes.get_legend_handles_labels()
+        phase_handles, phase_labels = self.phase_axes.get_legend_handles_labels()
+        self.axes.legend(
+            magnitude_handles + phase_handles,
+            magnitude_labels + phase_labels,
+            loc="best",
+            fontsize=8,
+        )
+
+    def _configure_plot_layout(self) -> None:
+        self.figure.clear()
+        self.phase_axes = None
+        self._update_plot_mode_button()
+        if self.show_drt_var.get():
+            grid = self.figure.add_gridspec(1, 2, width_ratios=[1.55, 1.0])
+            self.axes = self.figure.add_subplot(grid[0, 0])
+            self.drt_axes = self.figure.add_subplot(grid[0, 1])
+        else:
+            self.axes = self.figure.add_subplot(111)
+            self.drt_axes = None
+        if self.plot_mode == "bode":
+            self._configure_bode_plot()
+        else:
+            self._configure_nyquist_plot()
         if self.drt_axes is not None:
             self.drt_axes.set_xscale("log")
             self.drt_axes.set_xlabel("Tau / s")
@@ -638,6 +787,11 @@ class EISApplication:
         )
         self.explorer.configure(yscrollcommand=scrollbar.set)
         self.explorer.grid(row=0, column=0, sticky="nsew")
+        self.explorer.tag_configure(
+            "focus_row",
+            background="#dff3df",
+            font=("Segoe UI", 9, "bold"),
+        )
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.explorer.bind("<Button-1>", self._on_explorer_click, add="+")
         self.explorer.bind("<<TreeviewSelect>>", self._select_explorer_spectrum)
@@ -806,6 +960,7 @@ class EISApplication:
                     iid=item,
                     values=values,
                 )
+        self._refresh_explorer_focus_tag()
         self._update_explorer_selection_status()
 
     def _sort_explorer(self, column: str) -> None:
@@ -892,6 +1047,7 @@ class EISApplication:
             )
         self._explorer_primary_item = primary
         self._explorer_anchor_item = primary
+        self._refresh_explorer_focus_tag()
         self._activate_explorer_item(primary)
 
     def _on_explorer_arrow(self, event, direction: int):
@@ -963,6 +1119,7 @@ class EISApplication:
         self.explorer.see(primary)
         self._explorer_anchor_item = primary
         self._explorer_primary_item = primary
+        self._refresh_explorer_focus_tag()
         self._update_explorer_selection_status()
 
     def _update_explorer_selection_status(self) -> None:
@@ -971,6 +1128,16 @@ class EISApplication:
         count = len(self.explorer.selection()) if hasattr(self, "explorer") else 0
         label = "spectrum" if count == 1 else "spectra"
         self.explorer_selection_var.set(f"{count} {label} selected")
+
+    def _refresh_explorer_focus_tag(self) -> None:
+        if not hasattr(self, "explorer"):
+            return
+        for item in self._explorer_rows:
+            if self.explorer.exists(item):
+                self.explorer.item(item, tags=())
+        primary = self._explorer_primary_item
+        if primary is not None and self.explorer.exists(primary):
+            self.explorer.item(primary, tags=("focus_row",))
 
     def _activate_explorer_item(self, item: str) -> None:
         row = self._explorer_rows.get(item)
@@ -1001,6 +1168,7 @@ class EISApplication:
                 self.explorer.see(item)
                 self._explorer_primary_item = item
                 self._explorer_anchor_item = item
+                self._refresh_explorer_focus_tag()
                 self._update_explorer_selection_status()
             elif preserve_existing:
                 selection = list(self.explorer.selection())
@@ -1143,6 +1311,8 @@ class EISApplication:
             self.batch_fit_button,
             self.python_export_button,
             self.toggle_points_button,
+            self.reset_view_button,
+            self.toggle_plot_mode_button,
             self.delete_spectrum_button,
             self.plot_selected_button,
             self.plot_three_electrode_button,
@@ -1326,34 +1496,105 @@ class EISApplication:
             return
         cycle = self.state.active
         included = cycle.included
-        real = cycle.impedance.real
-        negative_imaginary = -cycle.impedance.imag
-        self.included_artist.set_data(real[included], negative_imaginary[included])
-        self.excluded_artist.set_data(real[~included], negative_imaginary[~included])
-        if cycle.fit_impedance is None:
-            self.fit_artist.set_data([], [])
+        if self.plot_mode == "bode":
+            frequency = cycle.frequency_hz
+            magnitude = np.abs(cycle.impedance)
+            phase = self._phase_degrees(cycle.impedance)
+            self.included_artist.set_data(frequency[included], magnitude[included])
+            self.excluded_artist.set_data(frequency[~included], magnitude[~included])
+            assert self.phase_included_artist is not None
+            assert self.phase_excluded_artist is not None
+            assert self.phase_fit_artist is not None
+            assert self.phase_fit_points_included_artist is not None
+            assert self.phase_fit_points_excluded_artist is not None
+            assert self.phase_residual_artist is not None
+            assert self.phase_excluded_residual_artist is not None
+            self.phase_included_artist.set_data(frequency[included], phase[included])
+            self.phase_excluded_artist.set_data(frequency[~included], phase[~included])
+            if cycle.fit_impedance is None or cycle.fit_frequency_hz is None:
+                self.fit_artist.set_data([], [])
+                self.phase_fit_artist.set_data([], [])
+            else:
+                self.fit_artist.set_data(
+                    cycle.fit_frequency_hz,
+                    np.abs(cycle.fit_impedance),
+                )
+                self.phase_fit_artist.set_data(
+                    cycle.fit_frequency_hz,
+                    self._phase_degrees(cycle.fit_impedance),
+                )
+            if cycle.fit_at_data_impedance is None:
+                self.fit_points_included_artist.set_data([], [])
+                self.fit_points_excluded_artist.set_data([], [])
+                self.phase_fit_points_included_artist.set_data([], [])
+                self.phase_fit_points_excluded_artist.set_data([], [])
+                self.residual_artist.set_segments([])
+                self.excluded_residual_artist.set_segments([])
+                self.phase_residual_artist.set_segments([])
+                self.phase_excluded_residual_artist.set_segments([])
+            else:
+                fitted = cycle.fit_at_data_impedance
+                fitted_magnitude = np.abs(fitted)
+                fitted_phase = self._phase_degrees(fitted)
+                self.fit_points_included_artist.set_data(
+                    frequency[included], fitted_magnitude[included]
+                )
+                self.fit_points_excluded_artist.set_data(
+                    frequency[~included], fitted_magnitude[~included]
+                )
+                self.phase_fit_points_included_artist.set_data(
+                    frequency[included], fitted_phase[included]
+                )
+                self.phase_fit_points_excluded_artist.set_data(
+                    frequency[~included], fitted_phase[~included]
+                )
+                measured_magnitude_points = np.column_stack((frequency, magnitude))
+                fitted_magnitude_points = np.column_stack((frequency, fitted_magnitude))
+                magnitude_residuals = np.stack(
+                    (measured_magnitude_points, fitted_magnitude_points), axis=1
+                )
+                self.residual_artist.set_segments(magnitude_residuals[included])
+                self.excluded_residual_artist.set_segments(
+                    magnitude_residuals[~included]
+                )
+                measured_phase_points = np.column_stack((frequency, phase))
+                fitted_phase_points = np.column_stack((frequency, fitted_phase))
+                phase_residuals = np.stack(
+                    (measured_phase_points, fitted_phase_points), axis=1
+                )
+                self.phase_residual_artist.set_segments(phase_residuals[included])
+                self.phase_excluded_residual_artist.set_segments(
+                    phase_residuals[~included]
+                )
         else:
-            self.fit_artist.set_data(
-                cycle.fit_impedance.real, -cycle.fit_impedance.imag
-            )
-        if cycle.fit_at_data_impedance is None:
-            self.fit_points_included_artist.set_data([], [])
-            self.fit_points_excluded_artist.set_data([], [])
-            self.residual_artist.set_segments([])
-            self.excluded_residual_artist.set_segments([])
-        else:
-            fitted = cycle.fit_at_data_impedance
-            self.fit_points_included_artist.set_data(
-                fitted.real[included], -fitted.imag[included]
-            )
-            self.fit_points_excluded_artist.set_data(
-                fitted.real[~included], -fitted.imag[~included]
-            )
-            measured_points = np.column_stack((real, negative_imaginary))
-            fitted_points = np.column_stack((fitted.real, -fitted.imag))
-            residuals = np.stack((measured_points, fitted_points), axis=1)
-            self.residual_artist.set_segments(residuals[included])
-            self.excluded_residual_artist.set_segments(residuals[~included])
+            real = cycle.impedance.real
+            negative_imaginary = -cycle.impedance.imag
+            self.included_artist.set_data(real[included], negative_imaginary[included])
+            self.excluded_artist.set_data(real[~included], negative_imaginary[~included])
+            if cycle.fit_impedance is None:
+                self.fit_artist.set_data([], [])
+            else:
+                self.fit_artist.set_data(
+                    cycle.fit_impedance.real, -cycle.fit_impedance.imag
+                )
+            if cycle.fit_at_data_impedance is None:
+                self.fit_points_included_artist.set_data([], [])
+                self.fit_points_excluded_artist.set_data([], [])
+                self.residual_artist.set_segments([])
+                self.excluded_residual_artist.set_segments([])
+            else:
+                fitted = cycle.fit_at_data_impedance
+                self.fit_points_included_artist.set_data(
+                    fitted.real[included], -fitted.imag[included]
+                )
+                self.fit_points_excluded_artist.set_data(
+                    fitted.real[~included], -fitted.imag[~included]
+                )
+                measured_points = np.column_stack((real, negative_imaginary))
+                fitted_points = np.column_stack((fitted.real, -fitted.imag))
+                residuals = np.stack((measured_points, fitted_points), axis=1)
+                self.residual_artist.set_segments(residuals[included])
+                self.excluded_residual_artist.set_segments(residuals[~included])
         self.axes.set_title(
             (
                 f"{self.loaded.dataset_label if self.loaded is not None else self.path.name}\n"
@@ -1377,6 +1618,52 @@ class EISApplication:
         included = cycle.included
         if not np.any(included):
             included = np.ones(cycle.frequency_hz.size, dtype=bool)
+        if self.plot_mode == "bode":
+            frequency = cycle.frequency_hz[included]
+            magnitude = np.abs(cycle.impedance[included])
+            phase = self._phase_degrees(cycle.impedance[included])
+            finite_frequency = np.isfinite(frequency) & (frequency > 0)
+            finite_magnitude = np.isfinite(magnitude)
+            finite_phase = np.isfinite(phase)
+            finite = finite_frequency & finite_magnitude & finite_phase
+            if not np.any(finite):
+                return
+            frequency = frequency[finite]
+            magnitude = magnitude[finite]
+            phase = phase[finite]
+            x_min = float(np.min(frequency))
+            x_max = float(np.max(frequency))
+            if x_min == x_max:
+                x_min /= 1.3
+                x_max *= 1.3
+            else:
+                span_decades = np.log10(x_max) - np.log10(x_min)
+                x_padding_factor = 10 ** (0.04 * span_decades)
+                x_min /= x_padding_factor
+                x_max *= x_padding_factor
+            magnitude_min = float(np.min(magnitude))
+            magnitude_max = float(np.max(magnitude))
+            magnitude_span = magnitude_max - magnitude_min
+            magnitude_padding = 0.06 * (
+                magnitude_span if magnitude_span > 0 else max(abs(magnitude_min), 1.0)
+            )
+            phase_min = float(np.min(phase))
+            phase_max = float(np.max(phase))
+            phase_span = phase_max - phase_min
+            phase_padding = 0.08 * (
+                phase_span if phase_span > 0 else max(abs(phase_min), 1.0)
+            )
+            self.axes.set_xlim(x_min, x_max)
+            self.axes.set_ylim(
+                magnitude_min - magnitude_padding,
+                magnitude_max + magnitude_padding,
+            )
+            if self.phase_axes is not None:
+                self.phase_axes.set_ylim(
+                    phase_min - phase_padding,
+                    phase_max + phase_padding,
+                )
+            return
         x_values = cycle.impedance.real[included]
         y_values = -cycle.impedance.imag[included]
         finite = np.isfinite(x_values) & np.isfinite(y_values)
@@ -1422,6 +1709,18 @@ class EISApplication:
             return
         self._refresh_plot(rescale=True)
         self._update_status("zoom reset to active points")
+
+    def toggle_plot_mode(self) -> None:
+        self.plot_mode = "bode" if self.plot_mode == "nyquist" else "nyquist"
+        self._configure_plot_layout()
+        if self.state is None:
+            self.axes.set_title("No spectrum loaded")
+            if self.drt_axes is not None:
+                self.drt_axes.set_title("Ridge DRT")
+            self.canvas.draw_idle()
+            return
+        self._refresh_plot(rescale=True)
+        self._update_status(f"{self.plot_mode.title()} view")
 
     def toggle_drt_view(self) -> None:
         self._configure_plot_layout()
@@ -1474,6 +1773,73 @@ class EISApplication:
             y_max + y_padding,
         )
 
+    def _popup_bode_limits(
+        self, cycles
+    ) -> tuple[float, float, float, float, float, float] | None:
+        frequency_segments = []
+        magnitude_segments = []
+        phase_segments = []
+        fallback_frequency_segments = []
+        fallback_magnitude_segments = []
+        fallback_phase_segments = []
+        for _loaded, cycle in cycles:
+            included = cycle.included
+            frequency = cycle.frequency_hz
+            magnitude = np.abs(cycle.impedance)
+            phase = self._phase_degrees(cycle.impedance)
+            valid_frequency = np.isfinite(frequency) & (frequency > 0)
+            valid_magnitude = np.isfinite(magnitude)
+            valid_phase = np.isfinite(phase)
+            valid = valid_frequency & valid_magnitude & valid_phase
+            if np.any(valid):
+                fallback_frequency_segments.append(frequency[valid])
+                fallback_magnitude_segments.append(magnitude[valid])
+                fallback_phase_segments.append(phase[valid])
+            active = valid & included
+            if np.any(active):
+                frequency_segments.append(frequency[active])
+                magnitude_segments.append(magnitude[active])
+                phase_segments.append(phase[active])
+        if not frequency_segments:
+            frequency_segments = fallback_frequency_segments
+            magnitude_segments = fallback_magnitude_segments
+            phase_segments = fallback_phase_segments
+        if not frequency_segments:
+            return None
+        frequency = np.concatenate(frequency_segments)
+        magnitude = np.concatenate(magnitude_segments)
+        phase = np.concatenate(phase_segments)
+        x_min = float(np.min(frequency))
+        x_max = float(np.max(frequency))
+        if x_min == x_max:
+            x_min /= 1.3
+            x_max *= 1.3
+        else:
+            span_decades = np.log10(x_max) - np.log10(x_min)
+            x_padding_factor = 10 ** (0.04 * span_decades)
+            x_min /= x_padding_factor
+            x_max *= x_padding_factor
+        magnitude_min = float(np.min(magnitude))
+        magnitude_max = float(np.max(magnitude))
+        magnitude_span = magnitude_max - magnitude_min
+        magnitude_padding = 0.06 * (
+            magnitude_span if magnitude_span > 0 else max(abs(magnitude_min), 1.0)
+        )
+        phase_min = float(np.min(phase))
+        phase_max = float(np.max(phase))
+        phase_span = phase_max - phase_min
+        phase_padding = 0.08 * (
+            phase_span if phase_span > 0 else max(abs(phase_min), 1.0)
+        )
+        return (
+            x_min,
+            x_max,
+            magnitude_min - magnitude_padding,
+            magnitude_max + magnitude_padding,
+            phase_min - phase_padding,
+            phase_max + phase_padding,
+        )
+
     def _update_status(self, suffix: str = "") -> None:
         if self.state is None:
             return
@@ -1508,6 +1874,20 @@ class EISApplication:
         self.fit_points_excluded_artist.set_data([], [])
         self.residual_artist.set_segments([])
         self.excluded_residual_artist.set_segments([])
+        if self.phase_included_artist is not None:
+            self.phase_included_artist.set_data([], [])
+        if self.phase_excluded_artist is not None:
+            self.phase_excluded_artist.set_data([], [])
+        if self.phase_fit_artist is not None:
+            self.phase_fit_artist.set_data([], [])
+        if self.phase_fit_points_included_artist is not None:
+            self.phase_fit_points_included_artist.set_data([], [])
+        if self.phase_fit_points_excluded_artist is not None:
+            self.phase_fit_points_excluded_artist.set_data([], [])
+        if self.phase_residual_artist is not None:
+            self.phase_residual_artist.set_segments([])
+        if self.phase_excluded_residual_artist is not None:
+            self.phase_excluded_residual_artist.set_segments([])
         if self.drt_artist is not None:
             self.drt_artist.set_data([], [])
         if self.drt_axes is not None:
@@ -1523,16 +1903,28 @@ class EISApplication:
             self.busy
             or self.state is None
             or event.button != 1
-            or event.inaxes is not self.axes
+            or event.inaxes not in {self.axes, getattr(self, "phase_axes", None)}
             or not self.point_toggle_mode
         ):
             return
         if event.x is None or event.y is None:
             return
         cycle = self.state.active
-        display_points = self.axes.transData.transform(
-            np.column_stack((cycle.impedance.real, -cycle.impedance.imag))
-        )
+        if self.plot_mode == "bode" and self.phase_axes is not None:
+            if event.inaxes is self.phase_axes:
+                display_points = self.phase_axes.transData.transform(
+                    np.column_stack(
+                        (cycle.frequency_hz, self._phase_degrees(cycle.impedance))
+                    )
+                )
+            else:
+                display_points = self.axes.transData.transform(
+                    np.column_stack((cycle.frequency_hz, np.abs(cycle.impedance)))
+                )
+        else:
+            display_points = self.axes.transData.transform(
+                np.column_stack((cycle.impedance.real, -cycle.impedance.imag))
+            )
         distances = np.hypot(
             display_points[:, 0] - event.x, display_points[:, 1] - event.y
         )
@@ -1549,7 +1941,7 @@ class EISApplication:
         if self.busy or self.state is None or event.button != 2 or event.inaxes is None:
             return
         axes = event.inaxes
-        if axes not in {self.axes, self.drt_axes}:
+        if axes not in self._active_plot_axes():
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -1588,7 +1980,7 @@ class EISApplication:
         if self.busy or self.state is None or event.inaxes is None:
             return
         axes = event.inaxes
-        if axes not in {self.axes, self.drt_axes}:
+        if axes not in self._active_plot_axes():
             return
         if event.xdata is None or event.ydata is None:
             return
@@ -2569,10 +2961,7 @@ class EISApplication:
         status_message: str,
     ) -> None:
         from matplotlib import colormaps
-        from matplotlib.backends.backend_tkagg import (
-            FigureCanvasTkAgg,
-            NavigationToolbar2Tk,
-        )
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         from matplotlib.figure import Figure
 
         popup = tk.Toplevel(self.root)
@@ -2580,56 +2969,160 @@ class EISApplication:
         popup.geometry("920x700")
         popup.minsize(640, 480)
 
+        mode_state = {"value": self.plot_mode}
+        controls = ttk.Frame(popup, padding=(8, 8, 8, 0))
+        controls.pack(side=tk.TOP, fill=tk.X)
+        toggle_button = ttk.Button(controls)
+        toggle_button.pack(side=tk.LEFT)
+
         figure = Figure(figsize=(8.2, 6.2), dpi=100, constrained_layout=True)
-        axes = figure.add_subplot(111)
-        axes.set_xlabel("Re(Z) / Ohm")
-        axes.set_ylabel("-Im(Z) / Ohm")
-        axes.set_aspect("equal", adjustable="box")
-        axes.grid(True, alpha=0.25)
-
-        color_scale = colormaps["tab20"]
-        for index, (loaded, cycle) in enumerate(plotted_cycles):
-            color = color_scale(index % color_scale.N)
-            included = cycle.included
-            label = f"{loaded.dataset_label} - cycle {cycle.cycle}"
-            axes.plot(
-                cycle.impedance.real[included],
-                -cycle.impedance.imag[included],
-                "o-",
-                color=color,
-                markersize=3,
-                linewidth=1.1,
-                alpha=0.9,
-                label=label,
-            )
-            if np.any(~included):
-                axes.plot(
-                    cycle.impedance.real[~included],
-                    -cycle.impedance.imag[~included],
-                    "o--",
-                    color=color,
-                    markersize=2,
-                    linewidth=0.8,
-                    alpha=0.22,
-                )
-
-        limits = self._popup_active_limits(plotted_cycles)
-        if limits is not None:
-            x_min, x_max, y_min, y_max = limits
-            axes.set_xlim(x_min, x_max)
-            axes.set_ylim(y_min, y_max)
-        axes.legend(loc="best", fontsize=8)
         canvas = FigureCanvasTkAgg(figure, master=popup)
-        canvas.draw()
-        def _reset_popup_view() -> None:
-            popup_limits = self._popup_active_limits(plotted_cycles)
-            if popup_limits is None:
-                return
-            x_min, x_max, y_min, y_max = popup_limits
-            axes.set_xlim(x_min, x_max)
-            axes.set_ylim(y_min, y_max)
+        popup_axes: dict[str, object | None] = {"main": None, "phase": None}
+
+        def _render_popup() -> None:
+            figure.clear()
+            color_scale = colormaps["tab20"]
+            if mode_state["value"] == "bode":
+                axes = figure.add_subplot(111)
+                phase_axes = axes.twinx()
+                axes.set_xscale("log")
+                axes.set_xlabel("Frequency / Hz")
+                axes.set_ylabel("|Z| / Ω")
+                phase_axes.set_ylabel("−Phase / °")
+                axes.grid(True, alpha=0.25)
+                for index, (loaded, cycle) in enumerate(plotted_cycles):
+                    color = color_scale(index % color_scale.N)
+                    included = cycle.included
+                    frequency = cycle.frequency_hz
+                    magnitude = np.abs(cycle.impedance)
+                    phase = self._phase_degrees(cycle.impedance)
+                    label = f"{loaded.dataset_label} - cycle {cycle.cycle}"
+                    axes.plot(
+                        frequency[included],
+                        magnitude[included],
+                        "o-",
+                        color=color,
+                        markersize=3,
+                        linewidth=1.1,
+                        alpha=0.9,
+                        label=f"{label} |Z|",
+                    )
+                    phase_axes.plot(
+                        frequency[included],
+                        phase[included],
+                        "s-",
+                        color=color,
+                        markersize=2.6,
+                        linewidth=0.9,
+                        alpha=0.75,
+                        label=f"{label} phase",
+                    )
+                    if np.any(~included):
+                        axes.plot(
+                            frequency[~included],
+                            magnitude[~included],
+                            "o--",
+                            color=color,
+                            markersize=2,
+                            linewidth=0.8,
+                            alpha=0.22,
+                        )
+                        phase_axes.plot(
+                            frequency[~included],
+                            phase[~included],
+                            "s--",
+                            color=color,
+                            markersize=1.8,
+                            linewidth=0.7,
+                            alpha=0.16,
+                        )
+                limits = self._popup_bode_limits(plotted_cycles)
+                if limits is not None:
+                    x_min, x_max, y_min, y_max, phase_min, phase_max = limits
+                    axes.set_xlim(x_min, x_max)
+                    axes.set_ylim(y_min, y_max)
+                    phase_axes.set_ylim(phase_min, phase_max)
+                magnitude_handles, magnitude_labels = axes.get_legend_handles_labels()
+                phase_handles, phase_labels = phase_axes.get_legend_handles_labels()
+                axes.legend(
+                    magnitude_handles + phase_handles,
+                    magnitude_labels + phase_labels,
+                    loc="best",
+                    fontsize=8,
+                )
+            else:
+                axes = figure.add_subplot(111)
+                phase_axes = None
+                axes.set_xlabel("Re(Z) / Ohm")
+                axes.set_ylabel("-Im(Z) / Ohm")
+                axes.set_aspect("equal", adjustable="box")
+                axes.grid(True, alpha=0.25)
+                for index, (loaded, cycle) in enumerate(plotted_cycles):
+                    color = color_scale(index % color_scale.N)
+                    included = cycle.included
+                    label = f"{loaded.dataset_label} - cycle {cycle.cycle}"
+                    axes.plot(
+                        cycle.impedance.real[included],
+                        -cycle.impedance.imag[included],
+                        "o-",
+                        color=color,
+                        markersize=3,
+                        linewidth=1.1,
+                        alpha=0.9,
+                        label=label,
+                    )
+                    if np.any(~included):
+                        axes.plot(
+                            cycle.impedance.real[~included],
+                            -cycle.impedance.imag[~included],
+                            "o--",
+                            color=color,
+                            markersize=2,
+                            linewidth=0.8,
+                            alpha=0.22,
+                        )
+                limits = self._popup_active_limits(plotted_cycles)
+                if limits is not None:
+                    x_min, x_max, y_min, y_max = limits
+                    axes.set_xlim(x_min, x_max)
+                    axes.set_ylim(y_min, y_max)
+                axes.legend(loc="best", fontsize=8)
+            popup_axes["main"] = axes
+            popup_axes["phase"] = phase_axes
+            toggle_button.configure(
+                text="Show Nyquist" if mode_state["value"] == "bode" else "Show Bode"
+            )
             canvas.draw_idle()
 
+        def _reset_popup_view() -> None:
+            axes = popup_axes["main"]
+            if axes is None:
+                return
+            if mode_state["value"] == "bode":
+                popup_limits = self._popup_bode_limits(plotted_cycles)
+                if popup_limits is None:
+                    return
+                x_min, x_max, y_min, y_max, phase_min, phase_max = popup_limits
+                axes.set_xlim(x_min, x_max)
+                axes.set_ylim(y_min, y_max)
+                phase_axes = popup_axes["phase"]
+                if phase_axes is not None:
+                    phase_axes.set_ylim(phase_min, phase_max)
+            else:
+                popup_limits = self._popup_active_limits(plotted_cycles)
+                if popup_limits is None:
+                    return
+                x_min, x_max, y_min, y_max = popup_limits
+                axes.set_xlim(x_min, x_max)
+                axes.set_ylim(y_min, y_max)
+            canvas.draw_idle()
+
+        def _toggle_popup_mode() -> None:
+            mode_state["value"] = "nyquist" if mode_state["value"] == "bode" else "bode"
+            _render_popup()
+
+        toggle_button.configure(command=_toggle_popup_mode)
+        _render_popup()
         toolbar = self._create_toolbar(canvas, popup, _reset_popup_view)
         toolbar.update()
         toolbar.pack(side=tk.BOTTOM, fill=tk.X)
