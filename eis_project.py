@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 
 import numpy as np
 
 from eis_model import CycleState, ParameterValue, ProjectState, as_1d_array
+from wepy.eis import capacitance as cpe_capacitance
+from wepy.eis import tau as cpe_tau
 
 PROJECT_FORMAT = "eis-fitting-project"
 PROJECT_VERSION = 1
@@ -44,6 +47,69 @@ def _optional_array(values) -> np.ndarray | None:
     return as_1d_array(values)
 
 
+def _parallel_rcpe_block_ids(circuit: str) -> list[str]:
+    block_ids = re.findall(r"p\(\s*R(\d+)\s*,\s*CPE\1\s*\)", circuit)
+    return list(dict.fromkeys(block_ids))
+
+
+def _derived_block_columns(circuit: str, parameter_names: list[str]) -> list[str]:
+    columns: list[str] = []
+    for block_id in _parallel_rcpe_block_ids(circuit):
+        if f"R{block_id}" not in parameter_names:
+            continue
+        if f"CPE{block_id}_0" not in parameter_names:
+            continue
+        if f"CPE{block_id}_1" not in parameter_names:
+            continue
+        columns.extend(
+            (
+                f"p_R{block_id}_CPE{block_id}_capacitance_F",
+                f"p_R{block_id}_CPE{block_id}_tau_s",
+            )
+        )
+    return columns
+
+
+def _derived_block_values(
+    circuit: str,
+    parameter_names: list[str],
+    parameter_values: np.ndarray,
+) -> dict[str, float]:
+    values_by_name = dict(zip(parameter_names, parameter_values.tolist()))
+    derived: dict[str, float] = {}
+    for block_id in _parallel_rcpe_block_ids(circuit):
+        r_name = f"R{block_id}"
+        q_name = f"CPE{block_id}_0"
+        alpha_name = f"CPE{block_id}_1"
+        if (
+            r_name not in values_by_name
+            or q_name not in values_by_name
+            or alpha_name not in values_by_name
+        ):
+            continue
+        resistance = float(values_by_name[r_name])
+        q_value = float(values_by_name[q_name])
+        alpha_value = float(values_by_name[alpha_name])
+        derived[f"p_R{block_id}_CPE{block_id}_capacitance_F"] = float(
+            cpe_capacitance(resistance, q_value, alpha_value)
+        )
+        derived[f"p_R{block_id}_CPE{block_id}_tau_s"] = float(
+            cpe_tau(resistance, q_value, alpha_value)
+        )
+    return derived
+
+
+def _custom_metadata_columns(cycles: list[CycleState]) -> list[str]:
+    columns: list[str] = []
+    seen: set[str] = set()
+    for cycle in cycles:
+        for name in cycle.custom_metadata:
+            if name not in seen:
+                seen.add(name)
+                columns.append(name)
+    return columns
+
+
 def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
     fit_impedance = None
     if cycle.fit_impedance is not None:
@@ -74,6 +140,16 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
         ),
         "fit_impedance": fit_impedance,
         "fit_at_data_impedance": fit_at_data,
+        "ridge_tau_s": (
+            cycle.ridge_tau_s.tolist() if cycle.ridge_tau_s is not None else None
+        ),
+        "ridge_gamma_ohm": (
+            cycle.ridge_gamma_ohm.tolist()
+            if cycle.ridge_gamma_ohm is not None
+            else None
+        ),
+        "drt_label": cycle.drt_label,
+        "custom_metadata": dict(cycle.custom_metadata),
     }
 
 
@@ -167,6 +243,18 @@ def load_project_file(
                     f"Cycle {cycle_number} has invalid fitted data-point values"
                 )
             cycle.fit_at_data_impedance = real + 1j * imaginary
+        cycle.ridge_tau_s = _optional_array(saved.get("ridge_tau_s"))
+        cycle.ridge_gamma_ohm = _optional_array(saved.get("ridge_gamma_ohm"))
+        if (
+            cycle.ridge_tau_s is not None
+            and cycle.ridge_gamma_ohm is not None
+            and cycle.ridge_tau_s.size != cycle.ridge_gamma_ohm.size
+        ):
+            raise ValueError(f"Cycle {cycle_number} has invalid saved ridge DRT data")
+        cycle.drt_label = (
+            str(saved["drt_label"]) if saved.get("drt_label") is not None else None
+        )
+        cycle.custom_metadata = dict(saved.get("custom_metadata", {}))
         restored_cycles[cycle_number] = cycle
 
     requested_active = int(payload.get("active_cycle", current.active_cycle))
@@ -208,9 +296,11 @@ def export_fit_parameters(state: ProjectState, path: Path) -> int:
     if not fitted_cycles:
         raise ValueError("No cycles have fitted parameters to export")
     parameter_names = [parameter.name for parameter in state.default_parameters]
+    custom_metadata_columns = _custom_metadata_columns(fitted_cycles)
     parameter_columns = []
     for name in parameter_names:
         parameter_columns.extend((name, f"{name}_error_percent"))
+    derived_columns = _derived_block_columns(state.circuit, parameter_names)
     fieldnames = [
         "source_file",
         "cycle",
@@ -218,7 +308,9 @@ def export_fit_parameters(state: ProjectState, path: Path) -> int:
         "potential_V",
         "current_mA",
         "included_points",
+        *custom_metadata_columns,
         *parameter_columns,
+        *derived_columns,
     ]
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
@@ -235,6 +327,7 @@ def export_fit_parameters(state: ProjectState, path: Path) -> int:
                 "current_mA": cycle.current_ma,
                 "included_points": int(np.count_nonzero(cycle.included)),
             }
+            row.update({name: cycle.custom_metadata.get(name) for name in custom_metadata_columns})
             row.update(dict(zip(parameter_names, values.tolist())))
             errors_by_name = {
                 parameter.name: parameter.error_percent
@@ -246,6 +339,7 @@ def export_fit_parameters(state: ProjectState, path: Path) -> int:
                     for name in parameter_names
                 }
             )
+            row.update(_derived_block_values(state.circuit, parameter_names, values))
             writer.writerow(row)
     return len(fitted_cycles)
 
@@ -268,6 +362,20 @@ def export_python_workspace(
             parameter.name for _state, cycle in fitted for parameter in cycle.parameters
         )
     )
+    custom_metadata_columns = list(
+        dict.fromkeys(
+            name for _state, cycle in fitted for name in cycle.custom_metadata.keys()
+        )
+    )
+    derived_columns = list(
+        dict.fromkeys(
+            column
+            for state, cycle in fitted
+            for column in _derived_block_columns(
+                state.circuit, [parameter.name for parameter in cycle.parameters]
+            )
+        )
+    )
     metadata_columns = [
         "source_file",
         "source_path",
@@ -281,6 +389,7 @@ def export_python_workspace(
         "maximum_frequency_Hz",
         "active_minimum_frequency_Hz",
         "active_maximum_frequency_Hz",
+        *custom_metadata_columns,
     ]
     parameter_columns = [
         column for name in parameter_names for column in (name, f"{name}_error_percent")
@@ -288,7 +397,7 @@ def export_python_workspace(
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(
             stream,
-            fieldnames=[*metadata_columns, *parameter_columns],
+            fieldnames=[*metadata_columns, *parameter_columns, *derived_columns],
         )
         writer.writeheader()
         for state, cycle in fitted:
@@ -319,12 +428,20 @@ def export_python_workspace(
                     float(np.max(active_frequency)) if active_frequency.size else None
                 ),
             }
+            row.update({name: cycle.custom_metadata.get(name) for name in custom_metadata_columns})
             row.update(dict(zip(cycle_names, values.tolist())))
             row.update(
                 {
                     f"{parameter.name}_error_percent": parameter.error_percent
                     for parameter in cycle.parameters
                 }
+            )
+            row.update(
+                _derived_block_values(
+                    state.circuit,
+                    cycle_names,
+                    values,
+                )
             )
             writer.writerow(row)
 
@@ -334,7 +451,7 @@ def export_python_workspace(
 from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
-improt numpy as np
+import numpy as np
 
 # %%
 DATA_FILE = Path(__file__).with_name({path.name!r})
@@ -346,12 +463,23 @@ fit_data = pd.read_csv(DATA_FILE)
 metadata_columns = {metadata_columns!r}
 metadata = fit_data.loc[:, metadata_columns].copy()
 
+# Custom metadata imported from the clipboard.
+custom_metadata_columns = {custom_metadata_columns!r}
+custom_metadata = (
+    fit_data.loc[:, custom_metadata_columns].copy()
+    if custom_metadata_columns
+    else pd.DataFrame(index=fit_data.index)
+)
+
 # Fitted values and their percentage errors.
 parameter_columns = {parameter_columns!r}
 fit_parameters = fit_data.loc[:, parameter_columns].copy()
 
-# Convenient cycle-indexed tables for analysis and plotting.
-indexed_fit_data = fit_data.set_index(["source_path", "cycle"]).sort_index()
+# Convenient spectrum-indexed tables for analysis and plotting.
+index_columns = ["source_path", "cycle"]
+if "Spectrum" in fit_data.columns:
+    index_columns.append("Spectrum")
+indexed_fit_data = fit_data.set_index(index_columns).sort_index()
 parameter_values = indexed_fit_data.loc[:, [
     column for column in parameter_columns
     if not column.endswith("_error_percent")
@@ -360,6 +488,8 @@ parameter_errors_percent = indexed_fit_data.loc[:, [
     column for column in parameter_columns
     if column.endswith("_error_percent")
 ]]
+derived_columns = {derived_columns!r}
+derived_values = indexed_fit_data.loc[:, derived_columns].copy()
 
 print(f"Loaded {{len(fit_data)}} fitted spectra from {{DATA_FILE.name}}")
 print(fit_data.head())

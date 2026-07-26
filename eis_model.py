@@ -43,6 +43,10 @@ class CycleState:
     fit_frequency_hz: np.ndarray | None = None
     fit_impedance: np.ndarray | None = None
     fit_at_data_impedance: np.ndarray | None = None
+    ridge_tau_s: np.ndarray | None = None
+    ridge_gamma_ohm: np.ndarray | None = None
+    drt_label: str | None = None
+    custom_metadata: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.frequency_hz = as_1d_array(self.frequency_hz)
@@ -100,6 +104,9 @@ class CycleState:
         self.fit_frequency_hz = None
         self.fit_impedance = None
         self.fit_at_data_impedance = None
+        self.ridge_tau_s = None
+        self.ridge_gamma_ohm = None
+        self.drt_label = None
         for parameter in self.parameters:
             parameter.error_percent = None
 

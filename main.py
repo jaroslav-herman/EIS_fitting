@@ -12,9 +12,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cycle", type=int, default=1, help="Cycle number to load")
     parser.add_argument(
         "--control",
-        choices=["Ewe", "Ece"],
-        default="Ece",
-        help="Use Ewe or Ewe-Ece impedance columns (depends on file).",
+        choices=["working", "cell", "counter", "Ewe", "Ece"],
+        default="cell",
+        help="Initial spectrum to preview when the file contains multiple impedance traces.",
     )
     parser.add_argument(
         "--threshold",

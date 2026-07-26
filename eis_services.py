@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Iterable
@@ -9,6 +9,23 @@ import warnings
 import numpy as np
 
 from eis_model import CycleState, ParameterValue, ProjectState, as_1d_array, sort_spectrum
+
+SPECTRUM_KIND_COLUMN_MAP = {
+    "working": ("re_z_ohm", "minus_im_z_ohm", "ewe_v"),
+    "cell": ("re_zwe_ce_ohm", "minus_im_zwe_ce_ohm", "ewe_ece_v"),
+    "counter": ("re_zce_ohm", "minus_im_zce_ohm", "ece_v"),
+    "ewe": ("re_z_ohm", "minus_im_z_ohm", "ewe_v"),
+    "ece": ("re_zwe_ce_ohm", "minus_im_zwe_ce_ohm", "ewe_ece_v"),
+}
+SPECTRUM_KIND_LABELS = {
+    "working": "Working electrode",
+    "cell": "Cell",
+    "counter": "Counter electrode",
+}
+SPECTRUM_METADATA_COLUMN = "Spectrum"
+WORKING_POTENTIAL_COLUMN = "Working electrode potential (V)"
+COUNTER_POTENTIAL_COLUMN = "Counter electrode potential (V)"
+CELL_POTENTIAL_COLUMN = "Cell voltage (V)"
 
 
 @dataclass(frozen=True)
@@ -19,6 +36,7 @@ class SpectrumMetadata:
     point_count: int
     minimum_frequency_hz: float
     maximum_frequency_hz: float
+    custom_metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -27,11 +45,13 @@ class LoadedProject:
     state: ProjectState
     technique: str
     spectra: list[SpectrumMetadata]
+    dataset_id: str
+    dataset_label: str
 
 
 @dataclass
 class ProjectImportReport:
-    loaded: list[tuple[Path, LoadedProject]]
+    loaded: list[tuple[str, LoadedProject]]
     errors: list[tuple[Path, str]]
 
 
@@ -42,6 +62,15 @@ class RidgeInitialization:
     peak_count: int
     ohmic_resistance: float
     inductance: float
+    ridge_tau_s: np.ndarray
+    ridge_gamma_ohm: np.ndarray
+
+
+@dataclass
+class DRTComputation:
+    tau_s: np.ndarray
+    gamma_ohm: np.ndarray
+    ohmic_resistance: float | None = None
 
 
 @dataclass
@@ -126,6 +155,65 @@ def infer_bounds(name: str) -> tuple[float, float]:
     return 0.0, 1e6
 
 
+def _normalize_spectrum_kind(control: str) -> str:
+    normalized = control.strip().lower()
+    if normalized not in SPECTRUM_KIND_COLUMN_MAP:
+        raise ValueError(f"Unsupported spectrum kind '{control}'")
+    if normalized == "ewe":
+        return "working"
+    if normalized == "ece":
+        return "cell"
+    return normalized
+
+
+def _available_spectrum_kinds(dataframe, header_meta: dict[str, str]) -> list[str]:
+    potential_control = header_meta.get("Potential control", "").strip()
+    if potential_control == "Ewe-Ece":
+        roles = []
+        for kind in ("cell", "counter", "working"):
+            real_column, imaginary_column, _potential_column = SPECTRUM_KIND_COLUMN_MAP[kind]
+            if real_column in dataframe.columns and imaginary_column in dataframe.columns:
+                roles.append(kind)
+        if roles:
+            return roles
+    return ["working"]
+
+
+def _order_spectrum_kinds(
+    kinds: list[str],
+    requested_control: str,
+) -> list[str]:
+    preferred = _normalize_spectrum_kind(requested_control)
+    ordered = [kind for kind in kinds if kind == preferred]
+    ordered.extend(kind for kind in kinds if kind != preferred)
+    return ordered
+
+
+def _mean_if_present(dataframe, rows, column: str) -> float | None:
+    if column not in dataframe.columns:
+        return None
+    values = dataframe.loc[rows, column].to_numpy()
+    if values.size == 0:
+        return None
+    return float(np.nanmean(values))
+
+
+def _cycle_custom_metadata(dataframe, cycle: int, spectrum_kind: str) -> dict[str, object]:
+    rows = dataframe["freq_hz"] != 0
+    if "cycle_number" in dataframe.columns:
+        rows &= dataframe["cycle_number"] == cycle
+    return {
+        SPECTRUM_METADATA_COLUMN: SPECTRUM_KIND_LABELS.get(spectrum_kind, spectrum_kind.title()),
+        WORKING_POTENTIAL_COLUMN: _mean_if_present(dataframe, rows, "ewe_v"),
+        COUNTER_POTENTIAL_COLUMN: _mean_if_present(dataframe, rows, "ece_v"),
+        CELL_POTENTIAL_COLUMN: _mean_if_present(dataframe, rows, "ewe_ece_v"),
+    }
+
+
+def _dataset_id(path: Path, spectrum_kind: str) -> str:
+    return f"{path.resolve()}::{spectrum_kind}"
+
+
 def circuit_parameters(circuit: str) -> list[ParameterValue]:
     from impedance.models.circuits import CustomCircuit
     from impedance.models.circuits.circuits import calculateCircuitLength
@@ -149,18 +237,10 @@ def load_cycle(dataframe, cycle: int, control: str) -> CycleState:
     if "cycle_number" in dataframe.columns:
         rows &= dataframe["cycle_number"] == cycle
 
-    if control == "Ewe":
-        real_column, imaginary_column, potential_column = (
-            "re_z_ohm",
-            "minus_im_z_ohm",
-            "ewe_v",
-        )
-    else:
-        real_column, imaginary_column, potential_column = (
-            "re_zwe_ce_ohm",
-            "minus_im_zwe_ce_ohm",
-            "ewe_ece_v",
-        )
+    spectrum_kind = _normalize_spectrum_kind(control)
+    real_column, imaginary_column, potential_column = SPECTRUM_KIND_COLUMN_MAP[
+        spectrum_kind
+    ]
     missing = [
         column
         for column in (real_column, imaginary_column)
@@ -187,17 +267,29 @@ def load_cycle(dataframe, cycle: int, control: str) -> CycleState:
         if "i_ma" in dataframe.columns
         else 0.0
     )
-    return CycleState(cycle, frequency, impedance, potential, current)
+    return CycleState(
+        cycle,
+        frequency,
+        impedance,
+        potential,
+        current,
+        custom_metadata=_cycle_custom_metadata(dataframe, cycle, spectrum_kind),
+    )
 
 
 def catalog_spectra(
     dataframe,
     cycles: list[int],
     control: str,
+    cycle_metadata: dict[int, dict[str, object]] | None = None,
 ) -> list[SpectrumMetadata]:
     spectra = []
+    cycle_metadata = cycle_metadata or {}
+    spectrum_kind = _normalize_spectrum_kind(control)
     for cycle_number in cycles:
         cycle = load_cycle(dataframe, cycle_number, control)
+        metadata = _cycle_custom_metadata(dataframe, cycle_number, spectrum_kind)
+        metadata.update(dict(cycle_metadata.get(cycle_number, {})))
         spectra.append(
             SpectrumMetadata(
                 cycle=cycle_number,
@@ -206,6 +298,7 @@ def catalog_spectra(
                 point_count=int(cycle.frequency_hz.size),
                 minimum_frequency_hz=float(np.nanmin(cycle.frequency_hz)),
                 maximum_frequency_hz=float(np.nanmax(cycle.frequency_hz)),
+                custom_metadata=metadata,
             )
         )
     return spectra
@@ -219,7 +312,21 @@ def load_project(
 ) -> LoadedProject:
     from wepy import read_mpt_dataframe
 
-    dataframe, _metadata, technique = read_mpt_dataframe(path)
+    projects = load_projects_for_file(path, cycle, control, circuit)
+    if not projects:
+        raise ValueError(f"No impedance spectra could be loaded from {path.name}")
+    return projects[0]
+
+
+def load_projects_for_file(
+    path: Path,
+    cycle: int,
+    control: str,
+    circuit: str,
+) -> list[LoadedProject]:
+    from wepy import read_mpt_dataframe
+
+    dataframe, header_meta, technique = read_mpt_dataframe(path)
     cycles = (
         _safe_unique_ints(dataframe["cycle_number"].values)
         if "cycle_number" in dataframe.columns
@@ -229,38 +336,56 @@ def load_project(
         raise ValueError("No cycles were found in the file")
     active_cycle = cycle if cycle in cycles else cycles[0]
     parameters = circuit_parameters(circuit)
-    active = load_cycle(dataframe, active_cycle, control)
-    active.parameters = [
-        ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
-        for p in parameters
-    ]
-    state = ProjectState(
-        source_path=path,
-        circuit=circuit,
-        control=control,
-        available_cycles=cycles,
-        active_cycle=active_cycle,
-        default_parameters=parameters,
-        cycles={active_cycle: active},
+    projects: list[LoadedProject] = []
+    spectrum_kinds = _order_spectrum_kinds(
+        _available_spectrum_kinds(dataframe, header_meta),
+        control,
     )
-    spectra = catalog_spectra(dataframe, cycles, control)
-    return LoadedProject(dataframe, state, technique or "Unknown", spectra)
+    for spectrum_kind in spectrum_kinds:
+        active = load_cycle(dataframe, active_cycle, spectrum_kind)
+        active.parameters = [
+            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
+            for p in parameters
+        ]
+        state = ProjectState(
+            source_path=path,
+            circuit=circuit,
+            control=spectrum_kind,
+            available_cycles=cycles.copy(),
+            active_cycle=active_cycle,
+            default_parameters=parameters,
+            cycles={active_cycle: active},
+        )
+        spectra = catalog_spectra(dataframe, cycles, spectrum_kind)
+        label = f"{path.name} [{SPECTRUM_KIND_LABELS.get(spectrum_kind, spectrum_kind.title())}]"
+        projects.append(
+            LoadedProject(
+                dataframe=dataframe,
+                state=state,
+                technique=technique or "Unknown",
+                spectra=spectra,
+                dataset_id=_dataset_id(path, spectrum_kind),
+                dataset_label=label,
+            )
+        )
+    return projects
 
 
 def load_projects(
     paths: list[Path],
     control: str,
     circuit: str,
+    cycle: int = 1,
 ) -> ProjectImportReport:
-    loaded: list[tuple[Path, LoadedProject]] = []
+    loaded: list[tuple[str, LoadedProject]] = []
     errors: list[tuple[Path, str]] = []
     for path in paths:
         try:
-            project = load_project(path, 1, control, circuit)
+            projects = load_projects_for_file(path, cycle, control, circuit)
         except Exception as error:
             errors.append((path, f"{type(error).__name__}: {error}"))
         else:
-            loaded.append((path, project))
+            loaded.extend((project.dataset_id, project) for project in projects)
     return ProjectImportReport(loaded, errors)
 
 
@@ -365,6 +490,8 @@ def analyze_outliers(
     peak_tau = np.array([], dtype=float)
     peak_alpha = np.array([], dtype=float)
     peak_beta = np.array([], dtype=float)
+    ridge_tau = np.array([], dtype=float)
+    ridge_gamma = np.array([], dtype=float)
     try:
         distribution = next(iter(inverter.distributions))
         basis_tau = inverter.distributions[distribution]["tau"]
@@ -379,6 +506,8 @@ def analyze_outliers(
             name=distribution,
             tau=evaluation_tau,
         )
+        ridge_tau = as_1d_array(evaluation_tau).astype(float)
+        ridge_gamma = as_1d_array(distribution_values).astype(float)
         trapz_missing = not hasattr(np, "trapz")
         if trapz_missing:
             np.trapz = np.trapezoid
@@ -419,6 +548,8 @@ def analyze_outliers(
         peak_count=int(peak_resistance.size),
         ohmic_resistance=float(inverter.R_inf),
         inductance=float(inverter.inductance),
+        ridge_tau_s=ridge_tau,
+        ridge_gamma_ohm=ridge_gamma,
     )
 
 
@@ -441,6 +572,30 @@ def find_outliers_for_all_cycles(
         )
         results[cycle_number] = (cycle, analysis)
     return results
+
+
+def calculate_hybrid_drt(state: CycleState) -> DRTComputation:
+    from wepy.eis import get_drt
+
+    active_mask = state.included
+    if int(np.count_nonzero(active_mask)) < 3:
+        raise ValueError("At least three active points are required for DRT")
+    frequency = state.frequency_hz[active_mask]
+    impedance = state.impedance[active_mask]
+    frequency, impedance = sort_spectrum(
+        as_1d_array(frequency),
+        as_1d_array(impedance),
+    )
+    tau_s, gamma_ohm, ohmic_resistance = get_drt(
+        frequency,
+        impedance,
+        method="hybrid",
+    )
+    return DRTComputation(
+        tau_s=as_1d_array(tau_s).astype(float),
+        gamma_ohm=as_1d_array(gamma_ohm).astype(float),
+        ohmic_resistance=float(ohmic_resistance),
+    )
 
 
 def fit_cycle(
