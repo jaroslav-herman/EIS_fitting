@@ -23,6 +23,7 @@ def _parameter_to_dict(parameter: ParameterValue) -> dict[str, object]:
         "lower": parameter.lower,
         "upper": parameter.upper,
         "error_percent": parameter.error_percent,
+        "fixed": parameter.fixed,
     }
 
 
@@ -38,6 +39,7 @@ def _parameter_from_dict(data: dict[str, object]) -> ParameterValue:
             if data.get("error_percent") is not None
             else None
         ),
+        fixed=bool(data.get("fixed", False)),
     )
 
 
@@ -222,7 +224,15 @@ def load_project_file(
         cycle.parameters = [
             _parameter_from_dict(value) for value in saved.get("parameters", [])
         ] or [
-            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent)
+            ParameterValue(
+                p.name,
+                p.unit,
+                p.initial,
+                p.lower,
+                p.upper,
+                p.error_percent,
+                p.fixed,
+            )
             for p in defaults
         ]
         cycle.fit_parameters = _optional_array(saved.get("fit_parameters"))
@@ -266,7 +276,15 @@ def load_project_file(
     if active_cycle not in restored_cycles:
         active = load_cycle(dataframe, active_cycle, control)
         active.parameters = [
-            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent)
+            ParameterValue(
+                p.name,
+                p.unit,
+                p.initial,
+                p.lower,
+                p.upper,
+                p.error_percent,
+                p.fixed,
+            )
             for p in defaults
         ]
         restored_cycles[active_cycle] = active

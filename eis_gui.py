@@ -58,18 +58,19 @@ class ParameterTable(ttk.Frame):
                 str,
                 str,
                 float | None,
+                tk.BooleanVar,
                 tk.StringVar,
                 tk.StringVar,
                 tk.StringVar,
             ]
         ] = []
-        headers = ("Parameter", "Error (%)", "Initial", "Lower", "Upper")
+        headers = ("Parameter", "Error (%)", "Fix", "Initial", "Lower", "Upper")
         for column, text in enumerate(headers):
             ttk.Label(self, text=text, style="Heading.TLabel").grid(
                 row=0, column=column, padx=3, pady=(0, 4), sticky="ew"
             )
-        for column in range(5):
-            self.columnconfigure(column, weight=1 if column >= 2 else 0)
+        for column in range(6):
+            self.columnconfigure(column, weight=1 if column >= 3 else 0)
 
     def set_parameters(self, parameters: list[ParameterValue]) -> None:
         for child in self.grid_slaves():
@@ -77,6 +78,7 @@ class ParameterTable(ttk.Frame):
                 child.destroy()
         self._rows.clear()
         for row, parameter in enumerate(parameters, start=1):
+            fixed = tk.BooleanVar(value=parameter.fixed)
             initial = tk.StringVar(value=f"{parameter.initial:g}")
             lower = tk.StringVar(value=f"{parameter.lower:g}")
             upper = tk.StringVar(value=f"{parameter.upper:g}")
@@ -90,7 +92,10 @@ class ParameterTable(ttk.Frame):
                 borderwidth=1,
                 width=10,
             ).grid(row=row, column=1, padx=3, pady=2, sticky="ew")
-            for column, variable in enumerate((initial, lower, upper), start=2):
+            ttk.Checkbutton(self, variable=fixed).grid(
+                row=row, column=2, padx=3, pady=2
+            )
+            for column, variable in enumerate((initial, lower, upper), start=3):
                 ttk.Entry(self, textvariable=variable, width=10).grid(
                     row=row, column=column, padx=3, pady=2, sticky="ew"
                 )
@@ -99,6 +104,7 @@ class ParameterTable(ttk.Frame):
                     parameter.name,
                     parameter.unit,
                     parameter.error_percent,
+                    fixed,
                     initial,
                     lower,
                     upper,
@@ -121,7 +127,7 @@ class ParameterTable(ttk.Frame):
 
     def values(self) -> list[ParameterValue]:
         parameters = []
-        for name, unit, error_percent, initial, lower, upper in self._rows:
+        for name, unit, error_percent, fixed, initial, lower, upper in self._rows:
             parameters.append(
                 ParameterValue(
                     name,
@@ -130,6 +136,7 @@ class ParameterTable(ttk.Frame):
                     float(lower.get()),
                     float(upper.get()),
                     error_percent,
+                    bool(fixed.get()),
                 )
             )
         return parameters
@@ -272,8 +279,12 @@ class EISApplication:
         self._build_menu()
         self._build_interface()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.bind("<Left>", lambda _event: self.change_cycle(-1))
-        self.root.bind("<Right>", lambda _event: self.change_cycle(1))
+        self.root.bind("<Up>", lambda _event: self.change_cycle(-1))
+        self.root.bind("<Down>", lambda _event: self.change_cycle(1))
+        self.root.bind("<Shift-Up>", lambda _event: self.change_cycle(-1, True))
+        self.root.bind("<Shift-Down>", lambda _event: self.change_cycle(1, True))
+        self.root.bind("<Control-Up>", lambda _event: self.change_cycle(-1, focus_only=True))
+        self.root.bind("<Control-Down>", lambda _event: self.change_cycle(1, focus_only=True))
         self.root.bind("<Control-s>", lambda _event: self.save_project())
         self.root.bind("<Control-Shift-O>", lambda _event: self.load_project())
         self.root.bind("<Control-o>", lambda _event: self.import_data())
@@ -342,6 +353,10 @@ class EISApplication:
             command=lambda: self.batch_fit_explorer(1),
         )
         self.fit_menu.add_command(
+            label="Batch fit selected",
+            command=self.batch_fit_selected,
+        )
+        self.fit_menu.add_command(
             label="Batch up",
             command=lambda: self.batch_fit_explorer(-1),
         )
@@ -359,6 +374,7 @@ class EISApplication:
         self._fit_menu_actions = (
             "Fit selected spectrum",
             "Batch down",
+            "Batch fit selected",
             "Batch up",
             "Batch down to metadata value…",
             "Batch up to metadata value…",
@@ -388,25 +404,72 @@ class EISApplication:
         )
 
     def _build_plot(self) -> None:
-        from matplotlib.backends.backend_tkagg import (
-            FigureCanvasTkAgg,
-            NavigationToolbar2Tk,
-        )
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         from matplotlib.collections import LineCollection
         from matplotlib.figure import Figure
+        from matplotlib.widgets import RectangleSelector
 
         self._line_collection_class = LineCollection
+        self._rectangle_selector_class = RectangleSelector
+        self.point_toggle_mode = False
+        self._pan_state = None
+        self.plot_controls = ttk.Frame(self.plot_frame)
+        self.plot_controls.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        self.toggle_points_button = ttk.Button(
+            self.plot_controls,
+            text="Edit points: Off",
+            command=self.toggle_point_edit_mode,
+        )
+        self.toggle_points_button.pack(side=tk.LEFT)
+        self.reset_view_button = ttk.Button(
+            self.plot_controls,
+            text="Active zoom",
+            command=self.reset_plot_view,
+        )
+        self.reset_view_button.pack(side=tk.LEFT, padx=(6, 0))
         self.figure = Figure(figsize=(7.5, 6.5), dpi=100, constrained_layout=True)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
         self.canvas.draw()
-        self.toolbar = NavigationToolbar2Tk(
-            self.canvas, self.plot_frame, pack_toolbar=False
+        self.toolbar = self._create_toolbar(
+            self.canvas,
+            self.plot_frame,
+            self.reset_plot_view,
         )
         self.toolbar.update()
         self.toolbar.pack(side=tk.BOTTOM, fill=tk.X)
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas.mpl_connect("button_press_event", self._on_plot_button_press)
         self.canvas.mpl_connect("button_press_event", self._on_plot_click)
+        self.canvas.mpl_connect("button_release_event", self._on_plot_button_release)
+        self.canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
+        self.canvas.mpl_connect("scroll_event", self._on_plot_scroll)
         self._configure_plot_layout()
+
+    def _create_toolbar(
+        self,
+        canvas,
+        master: tk.Misc,
+        home_callback: Callable[[], None] | None = None,
+    ):
+        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+
+        class _ActiveZoomToolbar(NavigationToolbar2Tk):
+            def __init__(self, *args, home_callback=None, **kwargs):
+                self._home_callback = home_callback
+                super().__init__(*args, **kwargs)
+
+            def home(self, *args):
+                if self._home_callback is not None:
+                    self._home_callback()
+                    return
+                super().home(*args)
+
+        return _ActiveZoomToolbar(
+            canvas,
+            master,
+            pack_toolbar=False,
+            home_callback=home_callback,
+        )
 
     def _configure_plot_layout(self) -> None:
         self.figure.clear()
@@ -483,6 +546,17 @@ class EISApplication:
             self.drt_axes.legend(loc="best")
         else:
             self.drt_artist = None
+        self.zoom_selector = self._rectangle_selector_class(
+            self.axes,
+            self._on_zoom_select,
+            useblit=True,
+            button=[1],
+            minspanx=5,
+            minspany=5,
+            spancoords="pixels",
+            interactive=False,
+        )
+        self.zoom_selector.set_active(not self.point_toggle_mode)
         self.canvas.draw_idle()
 
     def _build_explorer(self, parent: ttk.Frame) -> None:
@@ -501,6 +575,7 @@ class EISApplication:
         group.columnconfigure(0, weight=1)
         group.rowconfigure(0, weight=1)
         columns = (
+            "fitted",
             "source",
             "cycle",
             "potential",
@@ -517,6 +592,7 @@ class EISApplication:
             height=7,
         )
         self._explorer_headings = {
+            "fitted": "Fitted",
             "source": "Source file",
             "cycle": "Cycle",
             "potential": "Voltage (V)",
@@ -526,6 +602,7 @@ class EISApplication:
             "f_max": "Max frequency (Hz)",
         }
         self._explorer_attributes = {
+            "fitted": None,
             "source": None,
             "cycle": "cycle",
             "potential": "potential_v",
@@ -537,6 +614,7 @@ class EISApplication:
         self._explorer_sort_reverse: dict[str, bool] = {}
         self._explorer_selected_column = "cycle"
         widths = {
+            "fitted": 62,
             "source": 190,
             "cycle": 65,
             "potential": 105,
@@ -564,6 +642,8 @@ class EISApplication:
         self.explorer.bind("<Button-1>", self._on_explorer_click, add="+")
         self.explorer.bind("<<TreeviewSelect>>", self._select_explorer_spectrum)
         self.explorer.bind("<Delete>", lambda _event: self.delete_selected_spectrum())
+        self.explorer.bind("<Up>", lambda event: self._on_explorer_arrow(event, -1))
+        self.explorer.bind("<Down>", lambda event: self._on_explorer_arrow(event, 1))
 
         explorer_actions = ttk.Frame(group)
         explorer_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
@@ -590,9 +670,24 @@ class EISApplication:
         self.plot_three_electrode_button.grid(
             row=0, column=2, padx=(6, 0), sticky="ew"
         )
+        self.explorer_selection_var = tk.StringVar(value="0 spectra selected")
+        ttk.Label(
+            group,
+            textvariable=self.explorer_selection_var,
+            anchor="w",
+        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
     def _explorer_base_columns(self) -> tuple[str, ...]:
-        return ("source", "cycle", "potential", "current", "points", "f_min", "f_max")
+        return (
+            "fitted",
+            "source",
+            "cycle",
+            "potential",
+            "current",
+            "points",
+            "f_min",
+            "f_max",
+        )
 
     def _explorer_columns(self) -> list[str]:
         return [*self._explorer_base_columns(), *self._custom_metadata_columns]
@@ -613,6 +708,7 @@ class EISApplication:
         columns = self._explorer_columns()
         self.explorer.configure(columns=columns)
         headings = {
+            "fitted": "Fitted",
             "source": "Source file",
             "cycle": "Cycle",
             "potential": "Voltage (V)",
@@ -622,6 +718,7 @@ class EISApplication:
             "f_max": "Max frequency (Hz)",
         }
         widths = {
+            "fitted": 62,
             "source": 190,
             "cycle": 65,
             "potential": 105,
@@ -646,6 +743,8 @@ class EISApplication:
                 if column == "source" or column in self._custom_metadata_columns
                 else tk.E
             )
+            if column == "fitted":
+                anchor = tk.CENTER
             self.explorer.column(column, width=widths[column], minwidth=55, anchor=anchor)
 
     @staticmethod
@@ -662,6 +761,9 @@ class EISApplication:
         spectrum: SpectrumMetadata,
         column: str,
     ):
+        if column == "fitted":
+            cycle = loaded.state.cycles.get(spectrum.cycle)
+            return "Yes" if cycle is not None and cycle.fit_parameters is not None else "No"
         if column == "source":
             return loaded.state.source_path.name
         if column == "cycle":
@@ -704,6 +806,7 @@ class EISApplication:
                     iid=item,
                     values=values,
                 )
+        self._update_explorer_selection_status()
 
     def _sort_explorer(self, column: str) -> None:
         if not self._explorer_rows:
@@ -726,7 +829,10 @@ class EISApplication:
 
     @staticmethod
     def _explorer_sort_key(loaded: LoadedProject, spectrum: SpectrumMetadata, column: str):
-        if column == "source":
+        if column == "fitted":
+            cycle = loaded.state.cycles.get(spectrum.cycle)
+            return (0, 1 if cycle is not None and cycle.fit_parameters is not None else 0)
+        elif column == "source":
             value = loaded.state.source_path.name
         elif column == "cycle":
             value = spectrum.cycle
@@ -757,6 +863,20 @@ class EISApplication:
             return (0, number)
         return (2, "")
 
+    def _refresh_explorer_values(self) -> None:
+        if not hasattr(self, "explorer"):
+            return
+        for item, (_dataset_id, loaded, spectrum) in self._explorer_rows.items():
+            if not self.explorer.exists(item):
+                continue
+            values = [
+                self._format_explorer_value(
+                    self._explorer_value(loaded, spectrum, column)
+                )
+                for column in self._explorer_columns()
+            ]
+            self.explorer.item(item, values=values)
+
     def _select_explorer_spectrum(self, _event=None) -> None:
         if self._suspend_explorer_select or self.busy or self.state is None:
             return
@@ -773,6 +893,16 @@ class EISApplication:
         self._explorer_primary_item = primary
         self._explorer_anchor_item = primary
         self._activate_explorer_item(primary)
+
+    def _on_explorer_arrow(self, event, direction: int):
+        shift_pressed = bool(event.state & 0x0001)
+        control_pressed = bool(event.state & 0x0004)
+        self.change_cycle(
+            direction,
+            preserve_selection=shift_pressed,
+            focus_only=control_pressed and not shift_pressed,
+        )
+        return "break"
 
     def _on_explorer_click(self, event):
         if self.busy or self.state is None:
@@ -833,6 +963,14 @@ class EISApplication:
         self.explorer.see(primary)
         self._explorer_anchor_item = primary
         self._explorer_primary_item = primary
+        self._update_explorer_selection_status()
+
+    def _update_explorer_selection_status(self) -> None:
+        if not hasattr(self, "explorer_selection_var"):
+            return
+        count = len(self.explorer.selection()) if hasattr(self, "explorer") else 0
+        label = "spectrum" if count == 1 else "spectra"
+        self.explorer_selection_var.set(f"{count} {label} selected")
 
     def _activate_explorer_item(self, item: str) -> None:
         row = self._explorer_rows.get(item)
@@ -840,7 +978,10 @@ class EISApplication:
             return
         dataset_id, loaded, spectrum = row
         if loaded is self.loaded and dataset_id == self.current_dataset_id:
-            self._activate_cycle(spectrum.cycle)
+            self._activate_cycle(
+                spectrum.cycle,
+                preserve_existing_selection=True,
+            )
             return
         self._switch_dataset(dataset_id, loaded, spectrum.cycle)
 
@@ -849,12 +990,19 @@ class EISApplication:
         cycle_number: int,
         *,
         preserve_existing: bool = False,
+        focus_only: bool = False,
     ) -> None:
         if self.current_dataset_id is None:
             return
         item = self._explorer_lookup.get((self.current_dataset_id, cycle_number))
         if item is not None and self.explorer.exists(item):
-            if preserve_existing:
+            if focus_only:
+                self.explorer.focus(item)
+                self.explorer.see(item)
+                self._explorer_primary_item = item
+                self._explorer_anchor_item = item
+                self._update_explorer_selection_status()
+            elif preserve_existing:
                 selection = list(self.explorer.selection())
                 if item not in selection:
                     selection.append(item)
@@ -864,25 +1012,8 @@ class EISApplication:
 
     def _build_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        cycle_group = ttk.LabelFrame(parent, text="Cycle", padding=8)
-        cycle_group.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        cycle_group.columnconfigure(1, weight=1)
-        self.previous_button = ttk.Button(
-            cycle_group, text="◀", width=4, command=lambda: self.change_cycle(-1)
-        )
-        self.previous_button.grid(row=0, column=0, padx=(0, 5))
-        self.cycle_box = ttk.Combobox(
-            cycle_group, textvariable=self.cycle_var, state="readonly", width=12
-        )
-        self.cycle_box.grid(row=0, column=1, sticky="ew")
-        self.cycle_box.bind("<<ComboboxSelected>>", self._select_cycle)
-        self.next_button = ttk.Button(
-            cycle_group, text="▶", width=4, command=lambda: self.change_cycle(1)
-        )
-        self.next_button.grid(row=0, column=2, padx=(5, 0))
-
         model_group = ttk.LabelFrame(parent, text="Fitting model", padding=8)
-        model_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        model_group.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         model_group.columnconfigure(0, weight=1)
         self.model_box = ttk.Combobox(
             model_group,
@@ -898,13 +1029,13 @@ class EISApplication:
         self.model_button.grid(row=0, column=1)
 
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
-        parameters_group.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
-        parent.rowconfigure(2, weight=1)
+        parameters_group.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        parent.rowconfigure(1, weight=1)
         self.parameter_table = ParameterTable(parameters_group)
         self.parameter_table.pack(fill=tk.BOTH, expand=True)
 
         options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
-        options_group.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        options_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         options_group.columnconfigure(1, weight=1)
         ttk.Label(options_group, text="Min frequency (Hz)").grid(
             row=0, column=0, sticky="w"
@@ -968,7 +1099,7 @@ class EISApplication:
         )
 
         actions = ttk.LabelFrame(parent, text="Actions", padding=8)
-        actions.grid(row=4, column=0, sticky="ew")
+        actions.grid(row=3, column=0, sticky="ew")
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         self.fit_button = ttk.Button(actions, text="Fit spectrum", command=self.fit)
@@ -1011,6 +1142,7 @@ class EISApplication:
             self.reset_button,
             self.batch_fit_button,
             self.python_export_button,
+            self.toggle_points_button,
             self.delete_spectrum_button,
             self.plot_selected_button,
             self.plot_three_electrode_button,
@@ -1018,8 +1150,6 @@ class EISApplication:
             self.frequency_button,
             self.frequency_all_button,
             self.model_button,
-            self.previous_button,
-            self.next_button,
         )
         self._set_controls_enabled(False)
 
@@ -1089,9 +1219,6 @@ class EISApplication:
         self.circuit = state.circuit
         self.model_var.set(self.state.circuit)
         self.root.title(f"EIS Fitting — {loaded.dataset_label}")
-        self.cycle_box.configure(
-            values=[str(cycle) for cycle in self.state.available_cycles]
-        )
         self.cycle_var.set(str(self.state.active_cycle))
         self._highlight_explorer_cycle(
             self.state.active_cycle,
@@ -1142,10 +1269,6 @@ class EISApplication:
         state = tk.NORMAL if enabled and not self.busy else tk.DISABLED
         for button in getattr(self, "action_buttons", ()):
             button.configure(state=state)
-        if hasattr(self, "cycle_box"):
-            self.cycle_box.configure(
-                state="readonly" if enabled and not self.busy else "disabled"
-            )
         if hasattr(self, "model_box"):
             self.model_box.configure(
                 state="normal" if enabled and not self.busy else "disabled"
@@ -1247,6 +1370,7 @@ class EISApplication:
             self._autoscale_to_included(cycle)
             if self.drt_artist is not None and self.drt_axes is not None:
                 self._autoscale_drt(cycle)
+        self._refresh_explorer_values()
         self.canvas.draw_idle()
 
     def _autoscale_to_included(self, cycle) -> None:
@@ -1292,6 +1416,12 @@ class EISApplication:
             x_max *= 1.3
         self.drt_axes.set_xlim(x_min, x_max)
         self.drt_axes.set_ylim(y_min - y_padding, y_max + y_padding)
+
+    def reset_plot_view(self) -> None:
+        if self.state is None:
+            return
+        self._refresh_plot(rescale=True)
+        self._update_status("zoom reset to active points")
 
     def toggle_drt_view(self) -> None:
         self._configure_plot_layout()
@@ -1369,7 +1499,6 @@ class EISApplication:
         self._explorer_anchor_item = None
         self._explorer_primary_item = None
         self.explorer.delete(*self.explorer.get_children())
-        self.cycle_box.configure(values=[])
         self.cycle_var.set("")
         self.parameter_table.set_parameters([])
         self.included_artist.set_data([], [])
@@ -1390,7 +1519,13 @@ class EISApplication:
         self._set_controls_enabled(False)
 
     def _on_plot_click(self, event) -> None:
-        if self.busy or self.state is None or event.inaxes is not self.axes:
+        if (
+            self.busy
+            or self.state is None
+            or event.button != 1
+            or event.inaxes is not self.axes
+            or not self.point_toggle_mode
+        ):
             return
         if event.x is None or event.y is None:
             return
@@ -1410,20 +1545,137 @@ class EISApplication:
         self._refresh_plot(rescale=True)
         self._update_status()
 
-    def _select_cycle(self, _event=None) -> None:
+    def _on_plot_button_press(self, event) -> None:
+        if self.busy or self.state is None or event.button != 2 or event.inaxes is None:
+            return
+        axes = event.inaxes
+        if axes not in {self.axes, self.drt_axes}:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self._pan_state = {
+            "axes": axes,
+            "xdata": event.xdata,
+            "ydata": event.ydata,
+            "xlim": axes.get_xlim(),
+            "ylim": axes.get_ylim(),
+        }
+        if hasattr(self, "zoom_selector"):
+            self.zoom_selector.set_active(False)
+
+    def _on_plot_button_release(self, event) -> None:
+        if event.button != 2 or self._pan_state is None:
+            return
+        self._pan_state = None
+        if hasattr(self, "zoom_selector"):
+            self.zoom_selector.set_active(not self.point_toggle_mode)
+
+    def _on_plot_motion(self, event) -> None:
+        if self._pan_state is None:
+            return
+        axes = self._pan_state["axes"]
+        if event.inaxes is not axes or event.xdata is None or event.ydata is None:
+            return
+        delta_x = event.xdata - self._pan_state["xdata"]
+        delta_y = event.ydata - self._pan_state["ydata"]
+        x_min, x_max = self._pan_state["xlim"]
+        y_min, y_max = self._pan_state["ylim"]
+        axes.set_xlim(x_min - delta_x, x_max - delta_x)
+        axes.set_ylim(y_min - delta_y, y_max - delta_y)
+        self.canvas.draw_idle()
+
+    def _on_plot_scroll(self, event) -> None:
+        if self.busy or self.state is None or event.inaxes is None:
+            return
+        axes = event.inaxes
+        if axes not in {self.axes, self.drt_axes}:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        scale = 1 / 1.2 if event.button == "up" else 1.2
+        x_min, x_max = axes.get_xlim()
+        y_min, y_max = axes.get_ylim()
+        new_x_min = event.xdata - (event.xdata - x_min) * scale
+        new_x_max = event.xdata + (x_max - event.xdata) * scale
+        new_y_min = event.ydata - (event.ydata - y_min) * scale
+        new_y_max = event.ydata + (y_max - event.ydata) * scale
+        axes.set_xlim(new_x_min, new_x_max)
+        axes.set_ylim(new_y_min, new_y_max)
+        self.canvas.draw_idle()
+
+    def _on_zoom_select(self, press_event, release_event) -> None:
+        if (
+            self.point_toggle_mode
+            or self._pan_state is not None
+            or press_event.inaxes is not self.axes
+        ):
+            return
+        if (
+            press_event.xdata is None
+            or press_event.ydata is None
+            or release_event.xdata is None
+            or release_event.ydata is None
+        ):
+            return
+        x0, x1 = sorted((press_event.xdata, release_event.xdata))
+        y0, y1 = sorted((press_event.ydata, release_event.ydata))
+        if abs(x1 - x0) <= np.finfo(float).eps or abs(y1 - y0) <= np.finfo(float).eps:
+            return
+        self.axes.set_xlim(x0, x1)
+        self.axes.set_ylim(y0, y1)
+        self.canvas.draw_idle()
+
+    def toggle_point_edit_mode(self) -> None:
+        self.point_toggle_mode = not self.point_toggle_mode
+        self.toggle_points_button.configure(
+            text=f"Edit points: {'On' if self.point_toggle_mode else 'Off'}"
+        )
+        if hasattr(self, "zoom_selector"):
+            self.zoom_selector.set_active(not self.point_toggle_mode)
+        self._update_status()
+
+    def _update_status(self, suffix: str = "") -> None:
         if self.state is None:
             return
-        self._activate_cycle(int(self.cycle_var.get()))
+        cycle = self.state.active
+        total = cycle.frequency_hz.size
+        included = int(np.count_nonzero(cycle.included))
+        outliers = int(np.count_nonzero(cycle.outliers))
+        mode_text = (
+            "point edit mode on"
+            if self.point_toggle_mode
+            else "wheel/drag zoom active"
+        )
+        status = (
+            f"Cycle {cycle.cycle} · {included}/{total} points included · "
+            f"{outliers} detected outliers · {mode_text}"
+        )
+        self.status_var.set(f"{status} · {suffix}" if suffix else status)
 
-    def change_cycle(self, direction: int) -> None:
+    def change_cycle(
+        self,
+        direction: int,
+        preserve_selection: bool = False,
+        focus_only: bool = False,
+    ) -> None:
         if self.busy or self.state is None:
             return
         cycles = self.state.available_cycles
         index = cycles.index(self.state.active_cycle)
         next_index = max(0, min(len(cycles) - 1, index + direction))
-        self._activate_cycle(cycles[next_index])
+        self._activate_cycle(
+            cycles[next_index],
+            preserve_existing_selection=preserve_selection,
+            focus_only=focus_only,
+        )
 
-    def _activate_cycle(self, cycle_number: int) -> None:
+    def _activate_cycle(
+        self,
+        cycle_number: int,
+        *,
+        preserve_existing_selection: bool = False,
+        focus_only: bool = False,
+    ) -> None:
         if self.state is None or cycle_number == self.state.active_cycle:
             return
         if not self._capture_controls():
@@ -1444,7 +1696,11 @@ class EISApplication:
             self.state.cycles[cycle_number] = new_cycle
         self.state.active_cycle = cycle_number
         self.cycle_var.set(str(cycle_number))
-        self._highlight_explorer_cycle(cycle_number, preserve_existing=True)
+        self._highlight_explorer_cycle(
+            cycle_number,
+            preserve_existing=preserve_existing_selection,
+            focus_only=focus_only,
+        )
         self._restore_controls()
         self._refresh_plot(rescale=True)
         self._update_status()
@@ -1994,6 +2250,58 @@ class EISApplication:
             "Explorer batch fit failed",
         )
 
+    def batch_fit_selected(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        visible_items = list(self.explorer.get_children(""))
+        selected_items = [
+            item for item in visible_items if item in self.explorer.selection()
+        ]
+        if len(selected_items) < 2:
+            self._update_status("select at least two spectra in the explorer first")
+            return
+        if self.current_dataset_id is None:
+            self._update_status("no displayed spectrum is available")
+            return
+        current_item = self._explorer_lookup.get(
+            (self.current_dataset_id, self.state.active_cycle)
+        )
+        if current_item is None or current_item not in selected_items:
+            self._update_status("include the displayed spectrum in the selection")
+            return
+
+        start_index = visible_items.index(current_item)
+        batch_items = [
+            item
+            for item in visible_items[start_index:]
+            if item in self.explorer.selection()
+        ]
+        if len(batch_items) < 2:
+            self._update_status(
+                "select spectra from the displayed one downward in the explorer"
+            )
+            return
+
+        targets = []
+        for item in batch_items:
+            _dataset_id, loaded, spectrum = self._explorer_rows[item]
+            targets.append(
+                SpectrumFitTarget(
+                    loaded=loaded,
+                    cycle=spectrum.cycle,
+                    label=f"{loaded.dataset_label}, cycle {spectrum.cycle}",
+                )
+            )
+        parameters = self.state.parameters_for(self.state.active_cycle)
+        self.status_var.set(
+            f"Batch fitting {len(targets)} selected spectra from the displayed one..."
+        )
+        self._submit(
+            lambda: batch_fit_spectra(targets, parameters),
+            self._finish_explorer_batch_fit,
+            "Selected batch fit failed",
+        )
+
     def _finish_explorer_batch_fit(self, report: SpectrumBatchReport) -> None:
         if self.state is None:
             return
@@ -2313,7 +2621,16 @@ class EISApplication:
         axes.legend(loc="best", fontsize=8)
         canvas = FigureCanvasTkAgg(figure, master=popup)
         canvas.draw()
-        toolbar = NavigationToolbar2Tk(canvas, popup, pack_toolbar=False)
+        def _reset_popup_view() -> None:
+            popup_limits = self._popup_active_limits(plotted_cycles)
+            if popup_limits is None:
+                return
+            x_min, x_max, y_min, y_max = popup_limits
+            axes.set_xlim(x_min, x_max)
+            axes.set_ylim(y_min, y_max)
+            canvas.draw_idle()
+
+        toolbar = self._create_toolbar(canvas, popup, _reset_popup_view)
         toolbar.update()
         toolbar.pack(side=tk.BOTTOM, fill=tk.X)
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -2542,9 +2859,6 @@ class EISApplication:
         self.circuit = restored.circuit
         self.model_var.set(restored.circuit)
         self.cycle_var.set(str(restored.active_cycle))
-        self.cycle_box.configure(
-            values=[str(cycle) for cycle in restored.available_cycles]
-        )
         self._populate_explorer()
         self._highlight_explorer_cycle(restored.active_cycle)
         self._restore_controls()

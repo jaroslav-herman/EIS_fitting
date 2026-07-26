@@ -344,9 +344,9 @@ def load_projects_for_file(
     for spectrum_kind in spectrum_kinds:
         active = load_cycle(dataframe, active_cycle, spectrum_kind)
         active.parameters = [
-            ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
-            for p in parameters
-        ]
+        ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper, None, p.fixed)
+        for p in parameters
+    ]
         state = ProjectState(
             source_path=path,
             circuit=circuit,
@@ -405,7 +405,7 @@ def _map_ridge_to_parameters(
     peak_beta: np.ndarray,
 ) -> list[ParameterValue]:
     mapped = [
-        ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper)
+        ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent, p.fixed)
         for p in parameters
     ]
     by_name = {parameter.name: parameter for parameter in mapped}
@@ -604,7 +604,8 @@ def fit_cycle(
     parameters: list[ParameterValue],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     from impedance.models.circuits import CustomCircuit
-    from wepy.eis import fit_spectrum, show_fit
+    from impedance.models.circuits.fitting import circuit_fit
+    from wepy.eis import show_fit
 
     included = state.included
     frequency = state.frequency_hz[included]
@@ -612,28 +613,47 @@ def fit_cycle(
     if frequency.size < 3:
         raise ValueError("At least three included points are required for fitting")
     frequency, impedance = sort_spectrum(frequency, impedance)
-    initial = [parameter.initial for parameter in parameters]
-    bounds = (
-        [parameter.lower for parameter in parameters],
-        [parameter.upper for parameter in parameters],
+    circuit_parameters_only = np.array(
+        [parameter.initial for parameter in parameters],
+        dtype=float,
     )
-    fitted, errors = fit_spectrum(
-        frequency,
-        impedance,
-        cir=circuit,
-        init=initial,
-        bounds=bounds,
-        outliers=False,
-        E=state.potential_v,
-        I=state.current_ma,
-    )
-    circuit_parameters_only = as_1d_array(fitted)[2:]
-    absolute_errors = np.abs(as_1d_array(errors)[2:])
+    absolute_errors = np.zeros(len(parameters), dtype=float)
+    fixed_constants = {
+        parameter.name: float(parameter.initial)
+        for parameter in parameters
+        if parameter.fixed
+    }
+    free_parameters = [parameter for parameter in parameters if not parameter.fixed]
+    if free_parameters:
+        free_initial = [parameter.initial for parameter in free_parameters]
+        free_bounds = (
+            [parameter.lower for parameter in free_parameters],
+            [parameter.upper for parameter in free_parameters],
+        )
+        fitted_free, errors_free = circuit_fit(
+            frequency,
+            impedance,
+            circuit,
+            free_initial,
+            constants=fixed_constants,
+            bounds=free_bounds,
+        )
+        fitted_free = as_1d_array(fitted_free).astype(float)
+        errors_free = np.abs(as_1d_array(errors_free).astype(float))
+        free_index = 0
+        for index, parameter in enumerate(parameters):
+            if parameter.fixed:
+                continue
+            circuit_parameters_only[index] = fitted_free[free_index]
+            absolute_errors[index] = errors_free[free_index]
+            free_index += 1
+    errors_percent = np.zeros(circuit_parameters_only.size, dtype=float)
+    nonfixed = np.array([not parameter.fixed for parameter in parameters], dtype=bool)
     magnitudes = np.abs(circuit_parameters_only)
-    errors_percent = np.full(circuit_parameters_only.size, np.inf, dtype=float)
-    nonzero = magnitudes > np.finfo(float).eps
-    errors_percent[nonzero] = absolute_errors[nonzero] / magnitudes[nonzero] * 100.0
-    errors_percent[(~nonzero) & (absolute_errors <= np.finfo(float).eps)] = 0.0
+    finite = nonfixed & (magnitudes > np.finfo(float).eps)
+    errors_percent[finite] = absolute_errors[finite] / magnitudes[finite] * 100.0
+    near_zero = nonfixed & ~finite & (absolute_errors > np.finfo(float).eps)
+    errors_percent[near_zero] = np.inf
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -668,7 +688,7 @@ def batch_fit_from_cycle(
     cycle_numbers = project.available_cycles[start_index:]
     next_parameters = [
         ParameterValue(
-            p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+            p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent, p.fixed
         )
         for p in initial_parameters
     ]
@@ -699,6 +719,7 @@ def batch_fit_from_cycle(
                 parameter.lower,
                 parameter.upper,
                 float(error_percent),
+                parameter.fixed,
             )
             for parameter, value, error_percent in zip(
                 next_parameters, fitted, errors_percent
@@ -729,7 +750,7 @@ def batch_fit_spectra(
     expected_names = [parameter.name for parameter in initial_parameters]
     next_parameters = [
         ParameterValue(
-            p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+            p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent, p.fixed
         )
         for p in initial_parameters
     ]
@@ -773,6 +794,7 @@ def batch_fit_spectra(
                 parameter.lower,
                 parameter.upper,
                 float(error_percent),
+                parameter.fixed,
             )
             for parameter, value, error_percent in zip(
                 next_parameters, fitted, errors_percent

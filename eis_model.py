@@ -26,6 +26,7 @@ class ParameterValue:
     lower: float
     upper: float
     error_percent: float | None = None
+    fixed: bool = False
 
 
 @dataclass
@@ -129,7 +130,7 @@ class ProjectState:
     def remember_parameters(self, parameters: list[ParameterValue]) -> None:
         self.active.parameters = [
             ParameterValue(
-                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent, p.fixed
             )
             for p in parameters
         ]
@@ -139,7 +140,7 @@ class ProjectState:
         source = state.parameters if state and state.parameters else self.default_parameters
         return [
             ParameterValue(
-                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent, p.fixed
             )
             for p in source
         ]
@@ -158,14 +159,14 @@ class ProjectState:
         self.circuit = circuit
         self.default_parameters = [
             ParameterValue(
-                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+                p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent, p.fixed
             )
             for p in parameters
         ]
         for cycle in self.cycles.values():
             cycle.parameters = [
                 ParameterValue(
-                    p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent
+                    p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent, p.fixed
                 )
                 for p in parameters
             ]
