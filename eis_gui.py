@@ -1290,7 +1290,7 @@ class EISApplication:
         )
         self.frequency_all_button = ttk.Button(
             options_group,
-            text="Apply to all spectra",
+            text="Apply to selected spectra",
             command=self.apply_frequency_window_to_all,
         )
         self.frequency_all_button.grid(
@@ -1316,7 +1316,7 @@ class EISApplication:
         )
         self.outlier_all_button = ttk.Button(
             options_group,
-            text="Outliers: all spectra",
+            text="Outliers: selected spectra",
             command=self.find_outliers_for_all,
         )
         self.outlier_all_button.grid(
@@ -2176,16 +2176,21 @@ class EISApplication:
     def apply_frequency_window_to_all(self) -> None:
         if self.state is None or not self._capture_controls():
             return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
         window = self.state.active.frequency_window
         assert window is not None
-        for loaded in self.loaded_projects.values():
-            loaded.state.apply_frequency_window_to_all(window)
+        updated = 0
+        for _dataset_id, loaded, spectrum in selected_rows:
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            cycle.frequency_window = window
+            cycle.clear_fit()
+            updated += 1
         self._refresh_plot(rescale=True)
-        spectrum_count = sum(
-            len(loaded.state.available_cycles) for loaded in self.loaded_projects.values()
-        )
         self._update_status(
-            f"frequency range applied to all {spectrum_count} spectra"
+            f"frequency range applied to {updated} selected spectra"
         )
 
     def apply_model(self) -> None:
@@ -2310,21 +2315,51 @@ class EISApplication:
                 "Invalid threshold", "Enter a numeric threshold", parent=self.root
             )
             return
-        spectrum_count = sum(
-            len(loaded.state.available_cycles) for loaded in self.loaded_projects.values()
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        grouped_projects: dict[str, tuple[LoadedProject, ProjectState]] = {}
+        grouped_cycles: dict[str, list[int]] = {}
+        for dataset_id, loaded, spectrum in selected_rows:
+            grouped_cycles.setdefault(dataset_id, []).append(spectrum.cycle)
+            if dataset_id not in grouped_projects:
+                grouped_projects[dataset_id] = (loaded, loaded.state)
+        selected_projects: dict[str, tuple[LoadedProject, ProjectState]] = {}
+        for dataset_id, cycle_numbers in grouped_cycles.items():
+            loaded, _state = grouped_projects[dataset_id]
+            unique_cycles = list(dict.fromkeys(cycle_numbers))
+            selected_projects[dataset_id] = (
+                loaded,
+                ProjectState(
+                    source_path=loaded.state.source_path,
+                    circuit=loaded.state.circuit,
+                    control=loaded.state.control,
+                    available_cycles=unique_cycles,
+                    active_cycle=unique_cycles[0],
+                    default_parameters=loaded.state.default_parameters,
+                    cycles={
+                        cycle_number: self._loaded_cycle_for_popup(loaded, cycle_number)
+                        for cycle_number in unique_cycles
+                    },
+                    all_frequency_window=loaded.state.all_frequency_window,
+                ),
+            )
+        spectrum_count = len(selected_rows)
+        self.status_var.set(
+            f"Finding outliers in {spectrum_count} selected spectra..."
         )
-        self.status_var.set(f"Finding outliers in all {spectrum_count} spectra...")
         self._submit(
             lambda: {
                 dataset_id: find_outliers_for_all_cycles(
                     loaded.dataframe,
-                    loaded.state,
+                    project,
                     threshold,
                 )
-                for dataset_id, loaded in self.loaded_projects.items()
+                for dataset_id, (loaded, project) in selected_projects.items()
             },
             self._finish_all_outliers,
-            "File-wide outlier search failed",
+            "Selected-spectra outlier search failed",
         )
 
     def _finish_all_outliers(self, results) -> None:
@@ -3470,6 +3505,19 @@ class EISApplication:
                 )
             )
         return selected_states
+
+    def _selected_spectrum_rows(self) -> list[tuple[str, LoadedProject, SpectrumMetadata]]:
+        if self.state is None:
+            return []
+        visible_items = list(self.explorer.get_children(""))
+        selected_items = [
+            item for item in visible_items if item in self.explorer.selection()
+        ]
+        return [
+            (dataset_id, loaded, spectrum)
+            for item in selected_items
+            for dataset_id, loaded, spectrum in [self._explorer_rows[item]]
+        ]
 
     def export_fits(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
