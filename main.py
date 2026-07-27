@@ -8,7 +8,12 @@ def main(argv: list[str] | None = None) -> int:
         prog="eis-fitting",
         description="Interactive Nyquist spectrum editor and fitting GUI.",
     )
-    parser.add_argument("mpt", type=Path, help="Path to a BioLogic .mpt file")
+    parser.add_argument(
+        "mpt",
+        type=Path,
+        nargs="?",
+        help="Optional path to a BioLogic .mpt file",
+    )
     parser.add_argument("--cycle", type=int, default=1, help="Cycle number to load")
     parser.add_argument(
         "--control",

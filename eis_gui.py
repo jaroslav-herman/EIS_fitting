@@ -14,6 +14,7 @@ import numpy as np
 from eis_model import ParameterValue, ProjectState
 from eis_project import (
     export_fit_parameters,
+    export_fit_parameters_for_states,
     export_python_workspace as write_python_workspace,
     load_project_file,
     save_project_file,
@@ -237,14 +238,14 @@ class EISApplication:
     def __init__(
         self,
         root: tk.Tk,
-        path: Path,
+        path: Path | None,
         cycle: int,
         control: str,
         threshold: float,
         circuit: str,
     ) -> None:
         self.root = root
-        self.path = path.resolve()
+        self.path = path.resolve() if path is not None else None
         self.current_dataset_id: str | None = None
         self.requested_cycle = cycle
         self.control = control
@@ -286,13 +287,34 @@ class EISApplication:
         self.root.bind("<Shift-Down>", lambda _event: self.change_cycle(1, True))
         self.root.bind("<Control-Up>", lambda _event: self.change_cycle(-1, focus_only=True))
         self.root.bind("<Control-Down>", lambda _event: self.change_cycle(1, focus_only=True))
+        self.root.bind("<Control-a>", self.select_all_spectra)
+        self.root.bind("<Control-e>", self.open_export_menu)
         self.root.bind("<Control-s>", lambda _event: self.save_project())
         self.root.bind("<Control-Shift-O>", lambda _event: self.load_project())
         self.root.bind("<Control-o>", lambda _event: self.import_data())
         self.root.bind("<Alt-a>", lambda _event: self.copy_neighbor_fit(-1))
         self.root.bind("<Alt-d>", lambda _event: self.copy_neighbor_fit(1))
+        self.root.bind("<Alt-e>", self.toggle_point_edit_mode)
         self.root.bind("<Alt-s>", lambda _event: self.fit())
-        self.root.after(30, self._begin_loading)
+        if self.path is not None:
+            self.root.after(30, self._begin_loading)
+        else:
+            self.status_var.set("Ready — import data or load a project.")
+
+    def _current_directory(self) -> Path:
+        if self.path is not None:
+            return self.path.parent
+        return Path.cwd()
+
+    def _current_stem(self) -> str:
+        if self.path is not None:
+            return self.path.stem
+        return "eis_project"
+
+    def _current_name(self) -> str:
+        if self.path is not None:
+            return self.path.name
+        return "No file loaded"
 
     def _configure_window(self) -> None:
         self.root.title("EIS Fitting")
@@ -324,14 +346,6 @@ class EISApplication:
         )
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Save current mask…", command=self.save_mask)
-        self.file_menu.add_command(
-            label="Export fit parameters…",
-            command=self.export_fits,
-        )
-        self.file_menu.add_command(
-            label="Export Python workspace…",
-            command=self.export_python_workspace,
-        )
         self.file_menu.add_separator()
         self.file_menu.add_command(label="Exit", command=self.close)
         menu_bar.add_cascade(label="File", menu=self.file_menu)
@@ -339,8 +353,6 @@ class EISApplication:
             "Load project…",
             "Save project…",
             "Save current mask…",
-            "Export fit parameters…",
-            "Export Python workspace…",
         )
         self.fit_menu = tk.Menu(menu_bar, tearoff=False)
         self.fit_menu.add_command(
@@ -371,6 +383,25 @@ class EISApplication:
             command=lambda: self.batch_fit_explorer(-1, to_metadata_value=True),
         )
         menu_bar.add_cascade(label="Fit", menu=self.fit_menu)
+        self.export_menu = tk.Menu(menu_bar, tearoff=False)
+        self.export_menu.add_command(
+            label="Export fit parameters - all spectra…",
+            command=self.export_fits,
+        )
+        self.export_menu.add_command(
+            label="Export fit parameters - selected spectra…",
+            command=self.export_selected_fits,
+        )
+        self.export_menu.add_separator()
+        self.export_menu.add_command(
+            label="Export to Python - all spectra…",
+            command=self.export_python_workspace,
+        )
+        self.export_menu.add_command(
+            label="Export to Python - selected spectra…",
+            command=self.export_selected_python_workspace,
+        )
+        menu_bar.add_cascade(label="Export", menu=self.export_menu)
         self.root.configure(menu=menu_bar)
         self._fit_menu_actions = (
             "Fit selected spectrum",
@@ -379,6 +410,12 @@ class EISApplication:
             "Batch up",
             "Batch down to metadata value…",
             "Batch up to metadata value…",
+        )
+        self._export_menu_actions = (
+            "Export fit parameters - all spectra…",
+            "Export fit parameters - selected spectra…",
+            "Export to Python - all spectra…",
+            "Export to Python - selected spectra…",
         )
 
     def _build_interface(self) -> None:
@@ -798,6 +835,7 @@ class EISApplication:
         self.explorer.bind("<Delete>", lambda _event: self.delete_selected_spectrum())
         self.explorer.bind("<Up>", lambda event: self._on_explorer_arrow(event, -1))
         self.explorer.bind("<Down>", lambda event: self._on_explorer_arrow(event, 1))
+        self.explorer.bind("<Control-a>", self.select_all_spectra)
 
         explorer_actions = ttk.Frame(group)
         explorer_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
@@ -1058,6 +1096,31 @@ class EISApplication:
             preserve_selection=shift_pressed,
             focus_only=control_pressed and not shift_pressed,
         )
+        return "break"
+
+    def select_all_spectra(self, _event=None):
+        if self.busy or self.state is None or not hasattr(self, "explorer"):
+            return "break"
+        items = list(self.explorer.get_children(""))
+        if not items:
+            return "break"
+        primary = (
+            self._explorer_primary_item
+            if self._explorer_primary_item in items
+            else items[0]
+        )
+        self._set_explorer_selection(items, primary=primary)
+        return "break"
+
+    def open_export_menu(self, _event=None):
+        if not hasattr(self, "export_menu"):
+            return "break"
+        x_position = self.root.winfo_rootx() + max(self.root.winfo_width() // 2, 240)
+        y_position = self.root.winfo_rooty() + 35
+        try:
+            self.export_menu.tk_popup(x_position, y_position)
+        finally:
+            self.export_menu.grab_release()
         return "break"
 
     def _on_explorer_click(self, event):
@@ -1324,6 +1387,9 @@ class EISApplication:
         self._set_controls_enabled(False)
 
     def _begin_loading(self) -> None:
+        if self.path is None:
+            self._set_controls_enabled(False)
+            return
         self.status_var.set(f"Loading {self.path.name}…")
         self._submit(
             lambda: load_projects(
@@ -1458,6 +1524,9 @@ class EISApplication:
         if hasattr(self, "fit_menu"):
             for label in self._fit_menu_actions:
                 self.fit_menu.entryconfigure(label, state=menu_state)
+        if hasattr(self, "export_menu"):
+            for label in self._export_menu_actions:
+                self.export_menu.entryconfigure(label, state=menu_state)
 
     def _restore_controls(self) -> None:
         if self.state is None:
@@ -1597,7 +1666,7 @@ class EISApplication:
                 self.excluded_residual_artist.set_segments(residuals[~included])
         self.axes.set_title(
             (
-                f"{self.loaded.dataset_label if self.loaded is not None else self.path.name}\n"
+                f"{self.loaded.dataset_label if self.loaded is not None else self._current_name()}\n"
                 f"Cycle {cycle.cycle} · {self.state.circuit}"
             )
         )
@@ -2017,7 +2086,7 @@ class EISApplication:
         self.axes.set_ylim(y0, y1)
         self.canvas.draw_idle()
 
-    def toggle_point_edit_mode(self) -> None:
+    def toggle_point_edit_mode(self, _event=None) -> str | None:
         self.point_toggle_mode = not self.point_toggle_mode
         self.toggle_points_button.configure(
             text=f"Edit points: {'On' if self.point_toggle_mode else 'Off'}"
@@ -2025,6 +2094,7 @@ class EISApplication:
         if hasattr(self, "zoom_selector"):
             self.zoom_selector.set_active(not self.point_toggle_mode)
         self._update_status()
+        return "break" if _event is not None else None
 
     def _update_status(self, suffix: str = "") -> None:
         if self.state is None:
@@ -3212,12 +3282,12 @@ class EISApplication:
         if self.busy or self.state is None:
             return
         default_name = (
-            f"{self.path.stem}_cycle{self.state.active_cycle}_mask_included.npy"
+            f"{self._current_stem()}_cycle{self.state.active_cycle}_mask_included.npy"
         )
         selected = filedialog.asksaveasfilename(
             parent=self.root,
             title="Save included-point mask",
-            initialdir=str(self.path.parent),
+            initialdir=str(self._current_directory()),
             initialfile=default_name,
             defaultextension=".npy",
             filetypes=[("NumPy mask", "*.npy")],
@@ -3233,7 +3303,7 @@ class EISApplication:
         selected = filedialog.askopenfilenames(
             parent=self.root,
             title="Add BioLogic impedance data",
-            initialdir=str(self.path.parent),
+            initialdir=str(self._current_directory()),
             filetypes=[("BioLogic MPT", "*.mpt"), ("All files", "*.*")],
         )
         if not selected:
@@ -3294,8 +3364,8 @@ class EISApplication:
         selected = filedialog.asksaveasfilename(
             parent=self.root,
             title="Save EIS fitting project",
-            initialdir=str(self.path.parent),
-            initialfile=f"{self.path.stem}.eisfit.json",
+            initialdir=str(self._current_directory()),
+            initialfile=f"{self._current_stem()}.eisfit.json",
             defaultextension=".eisfit.json",
             filetypes=[("EIS fitting project", "*.eisfit.json"), ("JSON", "*.json")],
         )
@@ -3318,7 +3388,7 @@ class EISApplication:
         selected = filedialog.askopenfilename(
             parent=self.root,
             title="Load EIS fitting project",
-            initialdir=str(self.path.parent),
+            initialdir=str(self._current_directory()),
             filetypes=[("EIS fitting project", "*.eisfit.json"), ("JSON", "*.json")],
         )
         if not selected:
@@ -3358,21 +3428,67 @@ class EISApplication:
         self._refresh_plot(rescale=True)
         self._update_status(f"project loaded from {path.name}")
 
+    def _all_export_states(self) -> list[ProjectState]:
+        return [self.loaded_projects[dataset_id].state for dataset_id in self._dataset_order]
+
+    def _selected_export_states(self) -> list[ProjectState]:
+        if self.state is None:
+            return []
+        visible_items = list(self.explorer.get_children(""))
+        selected_items = [
+            item for item in visible_items if item in self.explorer.selection()
+        ]
+        if not selected_items:
+            return []
+        selected_cycles_by_dataset: dict[str, list[int]] = {}
+        for item in selected_items:
+            dataset_id, _loaded, spectrum = self._explorer_rows[item]
+            selected_cycles_by_dataset.setdefault(dataset_id, []).append(spectrum.cycle)
+        selected_states: list[ProjectState] = []
+        for dataset_id in self._dataset_order:
+            cycle_numbers = selected_cycles_by_dataset.get(dataset_id)
+            if not cycle_numbers:
+                continue
+            loaded = self.loaded_projects[dataset_id]
+            unique_cycles = list(dict.fromkeys(cycle_numbers))
+            cycles = {
+                cycle_number: self._loaded_cycle_for_popup(loaded, cycle_number)
+                for cycle_number in unique_cycles
+            }
+            if not cycles:
+                continue
+            selected_states.append(
+                ProjectState(
+                    source_path=loaded.state.source_path,
+                    circuit=loaded.state.circuit,
+                    control=loaded.state.control,
+                    available_cycles=unique_cycles,
+                    active_cycle=unique_cycles[0],
+                    default_parameters=loaded.state.parameters_for(unique_cycles[0]),
+                    cycles=cycles,
+                    all_frequency_window=loaded.state.all_frequency_window,
+                )
+            )
+        return selected_states
+
     def export_fits(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
         selected = filedialog.asksaveasfilename(
             parent=self.root,
             title="Export fitted parameters",
-            initialdir=str(self.path.parent),
-            initialfile=f"{self.path.stem}_fit_parameters.csv",
+            initialdir=str(self._current_directory()),
+            initialfile=f"{self._current_stem()}_fit_parameters.csv",
             defaultextension=".csv",
             filetypes=[("CSV", "*.csv")],
         )
         if not selected:
             return
         try:
-            count = export_fit_parameters(self.state, Path(selected))
+            count = export_fit_parameters_for_states(
+                self._all_export_states(),
+                Path(selected),
+            )
         except Exception as error:
             messagebox.showerror(
                 "Fit export failed",
@@ -3380,7 +3496,35 @@ class EISApplication:
                 parent=self.root,
             )
             return
-        self._update_status(f"exported fit parameters for {count} cycles")
+        self._update_status(f"exported fit parameters for {count} spectra")
+
+    def export_selected_fits(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        states = self._selected_export_states()
+        if not states:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export fitted parameters for selected spectra",
+            initialdir=str(self._current_directory()),
+            initialfile=f"{self._current_stem()}_selected_fit_parameters.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not selected:
+            return
+        try:
+            count = export_fit_parameters_for_states(states, Path(selected))
+        except Exception as error:
+            messagebox.showerror(
+                "Selected fit export failed",
+                f"{type(error).__name__}: {error}",
+                parent=self.root,
+            )
+            return
+        self._update_status(f"exported fit parameters for {count} selected spectra")
 
     def export_python_workspace(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
@@ -3388,8 +3532,8 @@ class EISApplication:
         selected = filedialog.asksaveasfilename(
             parent=self.root,
             title="Export parameters and metadata for Python",
-            initialdir=str(self.path.parent),
-            initialfile=f"{self.path.stem}_analysis.csv",
+            initialdir=str(self._current_directory()),
+            initialfile=f"{self._current_stem()}_analysis.csv",
             defaultextension=".csv",
             filetypes=[("CSV", "*.csv")],
         )
@@ -3403,9 +3547,7 @@ class EISApplication:
             parent=self.root,
         ):
             return
-        states = [
-            self.loaded_projects[dataset_id].state for dataset_id in self._dataset_order
-        ]
+        states = self._all_export_states()
         try:
             count, script_path = write_python_workspace(states, export_path)
             editor = self._open_python_script(script_path)
@@ -3418,6 +3560,46 @@ class EISApplication:
             return
         self._update_status(
             f"exported {count} fitted spectra and opened "
+            f"{script_path.name} in {editor}"
+        )
+
+    def export_selected_python_workspace(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        states = self._selected_export_states()
+        if not states:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export selected parameters and metadata for Python",
+            initialdir=str(self._current_directory()),
+            initialfile=f"{self._current_stem()}_selected_analysis.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not selected:
+            return
+        export_path = Path(selected)
+        script_path = export_path.with_suffix(".py")
+        if script_path.exists() and not messagebox.askyesno(
+            "Replace Python script?",
+            f"{script_path.name} already exists. Replace it?",
+            parent=self.root,
+        ):
+            return
+        try:
+            count, script_path = write_python_workspace(states, export_path)
+            editor = self._open_python_script(script_path)
+        except Exception as error:
+            messagebox.showerror(
+                "Selected Python export failed",
+                f"{type(error).__name__}: {error}",
+                parent=self.root,
+            )
+            return
+        self._update_status(
+            f"exported {count} selected fitted spectra and opened "
             f"{script_path.name} in {editor}"
         )
 
@@ -3459,9 +3641,9 @@ class EISApplication:
 
 def launch_nyquist_editor(
     *,
-    mpt_path: Path,
+    mpt_path: Path | None = None,
     cycle: int = 1,
-    control: str = "Ewe",
+    control: str = "cell",
     outlier_threshold: float = 1.0,
     circuit: str = "R0-L0-p(R1,CPE1)",
 ) -> None:

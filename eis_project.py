@@ -306,21 +306,46 @@ def load_project_file(
 
 
 def export_fit_parameters(state: ProjectState, path: Path) -> int:
-    fitted_cycles = [
-        cycle
+    return export_fit_parameters_for_states([state], path)
+
+
+def export_fit_parameters_for_states(
+    states: list[ProjectState],
+    path: Path,
+) -> int:
+    fitted = [
+        (state, cycle)
+        for state in states
         for _, cycle in sorted(state.cycles.items())
         if cycle.fit_parameters is not None
     ]
-    if not fitted_cycles:
-        raise ValueError("No cycles have fitted parameters to export")
-    parameter_names = [parameter.name for parameter in state.default_parameters]
-    custom_metadata_columns = _custom_metadata_columns(fitted_cycles)
+    if not fitted:
+        raise ValueError("No spectra have fitted parameters to export")
+    parameter_names = list(
+        dict.fromkeys(
+            parameter.name for state, cycle in fitted for parameter in cycle.parameters
+        )
+    )
+    custom_metadata_columns = list(
+        dict.fromkeys(
+            name for _state, cycle in fitted for name in cycle.custom_metadata.keys()
+        )
+    )
     parameter_columns = []
     for name in parameter_names:
         parameter_columns.extend((name, f"{name}_error_percent"))
-    derived_columns = _derived_block_columns(state.circuit, parameter_names)
+    derived_columns = list(
+        dict.fromkeys(
+            column
+            for state, cycle in fitted
+            for column in _derived_block_columns(
+                state.circuit, [parameter.name for parameter in cycle.parameters]
+            )
+        )
+    )
     fieldnames = [
         "source_file",
+        "source_path",
         "cycle",
         "circuit",
         "potential_V",
@@ -333,12 +358,17 @@ def export_fit_parameters(state: ProjectState, path: Path) -> int:
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
-        for cycle in fitted_cycles:
+        for state, cycle in fitted:
             values = as_1d_array(cycle.fit_parameters)
-            if values.size != len(parameter_names):
-                raise ValueError(f"Cycle {cycle.cycle} has incompatible fit parameters")
+            cycle_names = [parameter.name for parameter in cycle.parameters]
+            if values.size != len(cycle_names):
+                raise ValueError(
+                    f"Cycle {cycle.cycle} in {state.source_path.name} has "
+                    "incompatible fit parameters"
+                )
             row = {
                 "source_file": state.source_path.name,
+                "source_path": str(state.source_path),
                 "cycle": cycle.cycle,
                 "circuit": state.circuit,
                 "potential_V": cycle.potential_v,
@@ -346,7 +376,7 @@ def export_fit_parameters(state: ProjectState, path: Path) -> int:
                 "included_points": int(np.count_nonzero(cycle.included)),
             }
             row.update({name: cycle.custom_metadata.get(name) for name in custom_metadata_columns})
-            row.update(dict(zip(parameter_names, values.tolist())))
+            row.update(dict(zip(cycle_names, values.tolist())))
             errors_by_name = {
                 parameter.name: parameter.error_percent
                 for parameter in cycle.parameters
@@ -357,9 +387,9 @@ def export_fit_parameters(state: ProjectState, path: Path) -> int:
                     for name in parameter_names
                 }
             )
-            row.update(_derived_block_values(state.circuit, parameter_names, values))
+            row.update(_derived_block_values(state.circuit, cycle_names, values))
             writer.writerow(row)
-    return len(fitted_cycles)
+    return len(fitted)
 
 
 def export_python_workspace(
