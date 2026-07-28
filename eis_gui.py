@@ -307,8 +307,11 @@ class EISApplication:
         self.root.bind("<Control-o>", lambda _event: self.import_data())
         self.root.bind("<Alt-a>", lambda _event: self.copy_neighbor_fit(-1))
         self.root.bind("<Alt-d>", lambda _event: self.copy_neighbor_fit(1))
+        self.root.bind("<Alt-Shift-a>", lambda _event: self.copy_neighbor_fit_settings(-1))
+        self.root.bind("<Alt-Shift-d>", lambda _event: self.copy_neighbor_fit_settings(1))
         self.root.bind("<Alt-e>", self.toggle_point_edit_mode)
         self.root.bind("<Alt-s>", lambda _event: self.fit())
+        self.root.bind("<Alt-Shift-s>", lambda _event: self.initialize_and_fit())
         if self.path is not None:
             self.root.after(30, self._begin_loading)
         else:
@@ -2929,6 +2932,37 @@ class EISApplication:
             "Initial-value estimation failed",
         )
 
+    def initialize_and_fit(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        try:
+            threshold = float(self.threshold_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid threshold", "Enter a numeric threshold", parent=self.root
+            )
+            return
+        cycle_number = self.state.active_cycle
+        cycle = self.state.active
+        parameters = self.state.parameters_for(cycle_number)
+        self.status_var.set(
+            f"Cycle {cycle_number} · estimating initial values before fitting..."
+        )
+        self._submit(
+            lambda: self._cached_ridge_analysis(cycle, threshold, parameters)
+            or analyze_outliers(cycle, threshold, parameters),
+            lambda analysis: self._finish_initial_values_and_fit(cycle_number, analysis),
+            "Initial-value estimation failed",
+        )
+
+    def _finish_initial_values_and_fit(
+        self,
+        cycle_number: int,
+        analysis: RidgeInitialization,
+    ) -> None:
+        self._finish_initial_values(cycle_number, analysis)
+        self.root.after(0, self.fit)
+
     def calculate_ridge_drt(self) -> None:
         if self.state is None or not self._capture_controls():
             return
@@ -3532,16 +3566,29 @@ class EISApplication:
     def copy_neighbor_fit(self, direction: int) -> None:
         if self.state is None or self.busy or not self._capture_controls():
             return
-        cycles = self.state.available_cycles
-        current_index = cycles.index(self.state.active_cycle)
-        source_index = current_index + direction
-        if not 0 <= source_index < len(cycles):
-            self._update_status("no neighboring cycle in that direction")
+        visible_items = list(self.explorer.get_children(""))
+        current_item = self._explorer_lookup.get(
+            (self.current_dataset_id, self.state.active_cycle)
+        )
+        if current_item not in visible_items:
+            self._update_status("the displayed spectrum is not in the explorer")
             return
-        source_cycle_number = cycles[source_index]
-        source = self.state.cycles.get(source_cycle_number)
+        source_index = visible_items.index(current_item) + direction
+        if not 0 <= source_index < len(visible_items):
+            self._update_status("no neighboring spectrum in that direction")
+            return
+        source_item = visible_items[source_index]
+        _source_dataset_id, source_loaded, source_spectrum = self._explorer_rows[source_item]
+        source = self._loaded_cycle_for_popup(source_loaded, source_spectrum.cycle)
         if source is None or source.fit_parameters is None:
-            self._update_status(f"cycle {source_cycle_number} has no fit to copy")
+            self._update_status(
+                f"spectrum {source_spectrum.cycle} has no fit to copy"
+            )
+            return
+        current_model = self.state.active.model(self.state.circuit)
+        source_model = source.model(source_loaded.state.circuit)
+        if source_model != current_model:
+            self._update_status("neighboring spectrum uses a different fitting model")
             return
         current_parameters = self.state.parameters_for(self.state.active_cycle)
         fitted = np.asarray(source.fit_parameters).reshape(-1)
@@ -3555,7 +3602,72 @@ class EISApplication:
         self.parameter_table.set_parameters(current_parameters)
         self._refresh_plot()
         self._update_status(
-            f"initial parameters copied from cycle {source_cycle_number}"
+            f"initial parameters copied from spectrum {source_spectrum.cycle}"
+        )
+
+    def copy_neighbor_fit_settings(self, direction: int) -> None:
+        if self.state is None or self.busy or not self._capture_controls():
+            return
+        visible_items = list(self.explorer.get_children(""))
+        current_item = self._explorer_lookup.get(
+            (self.current_dataset_id, self.state.active_cycle)
+        )
+        if current_item not in visible_items:
+            self._update_status("the displayed spectrum is not in the explorer")
+            return
+        source_index = visible_items.index(current_item) + direction
+        if not 0 <= source_index < len(visible_items):
+            self._update_status("no neighboring spectrum in that direction")
+            return
+        source_item = visible_items[source_index]
+        _source_dataset_id, source_loaded, source_spectrum = self._explorer_rows[source_item]
+        source = self._loaded_cycle_for_popup(source_loaded, source_spectrum.cycle)
+        if source.fit_parameters is None:
+            self._update_status(
+                f"spectrum {source_spectrum.cycle} has no fit to copy"
+            )
+            return
+        current_model = self.state.active.model(self.state.circuit)
+        source_model = source.model(source_loaded.state.circuit)
+        if source_model != current_model:
+            self._update_status("neighboring spectrum uses a different fitting model")
+            return
+        current_parameters = self.state.parameters_for(self.state.active_cycle)
+        source_parameters = source_loaded.state.parameters_for(source_spectrum.cycle)
+        fitted = np.asarray(source.fit_parameters).reshape(-1)
+        if (
+            fitted.size != len(current_parameters)
+            or len(source_parameters) != len(current_parameters)
+            or [parameter.name for parameter in source_parameters]
+            != [parameter.name for parameter in current_parameters]
+        ):
+            self._update_status("neighboring fit uses incompatible parameters")
+            return
+        copied_parameters = []
+        for target, source_parameter, value in zip(
+            current_parameters, source_parameters, fitted
+        ):
+            copied_parameters.append(
+                ParameterValue(
+                    target.name,
+                    target.unit,
+                    float(value),
+                    target.lower,
+                    target.upper,
+                    target.error_percent,
+                    source_parameter.fixed,
+                )
+            )
+        self.state.active.parameters = copied_parameters
+        if source.frequency_window is not None:
+            self.state.active.frequency_window = tuple(source.frequency_window)
+        self.state.active.invalidate_drt_cache()
+        self.state.active.clear_fit()
+        self.parameter_table.set_parameters(copied_parameters)
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        self._update_status(
+            f"fit settings copied from spectrum {source_spectrum.cycle}"
         )
 
     def paste_metadata_column_from_clipboard(self) -> None:
