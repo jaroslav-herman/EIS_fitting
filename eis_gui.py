@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,6 +14,8 @@ import numpy as np
 
 from eis_model import ParameterValue, ProjectState
 from eis_project import (
+    dataframe_from_payload,
+    export_drts_for_states,
     export_fit_parameters,
     export_fit_parameters_for_states,
     export_python_workspace as write_python_workspace,
@@ -22,22 +25,27 @@ from eis_project import (
 from eis_services import (
     BatchFitReport,
     DRTComputation,
+    KKResiduals,
     LoadedProject,
     ProjectImportReport,
     RidgeInitialization,
     SPECTRUM_METADATA_COLUMN,
+    WORKING_POTENTIAL_COLUMN,
+    COUNTER_POTENTIAL_COLUMN,
     SpectrumBatchReport,
     SpectrumFitTarget,
     SpectrumMetadata,
     batch_fit_from_cycle,
     batch_fit_spectra,
     calculate_hybrid_drt,
+    calculate_lin_kk_residuals,
     catalog_spectra,
     circuit_parameters,
     analyze_outliers,
     find_outliers_for_all_cycles,
     fit_cycle,
     load_cycle,
+    load_project_from_dataframe,
     load_project,
     load_projects,
 )
@@ -272,6 +280,8 @@ class EISApplication:
         self.threshold_var = tk.StringVar(value=f"{threshold:g}")
         self.model_var = tk.StringVar(value=circuit)
         self.show_drt_var = tk.BooleanVar(value=False)
+        self.show_kk_var = tk.BooleanVar(value=False)
+        self.hide_legends_var = tk.BooleanVar(value=False)
         self.minimum_frequency_var = tk.StringVar()
         self.maximum_frequency_var = tk.StringVar()
         self.cycle_var = tk.StringVar(value=str(cycle))
@@ -401,6 +411,15 @@ class EISApplication:
             label="Export to Python - selected spectra…",
             command=self.export_selected_python_workspace,
         )
+        self.export_menu.add_separator()
+        self.export_menu.add_command(
+            label="Export DRTs - all spectra…",
+            command=self.export_drts,
+        )
+        self.export_menu.add_command(
+            label="Export DRTs - selected spectra…",
+            command=self.export_selected_drts,
+        )
         menu_bar.add_cascade(label="Export", menu=self.export_menu)
         self.root.configure(menu=menu_bar)
         self._fit_menu_actions = (
@@ -416,6 +435,8 @@ class EISApplication:
             "Export fit parameters - selected spectra…",
             "Export to Python - all spectra…",
             "Export to Python - selected spectra…",
+            "Export DRTs - all spectra…",
+            "Export DRTs - selected spectra…",
         )
 
     def _build_interface(self) -> None:
@@ -465,12 +486,29 @@ class EISApplication:
             command=self.reset_plot_view,
         )
         self.reset_view_button.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Checkbutton(
+            self.plot_controls,
+            text="Hide legends",
+            variable=self.hide_legends_var,
+            command=self._update_legend_visibility,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         self.toggle_plot_mode_button = ttk.Button(
             self.plot_controls,
             text="Show Bode",
             command=self.toggle_plot_mode,
         )
         self.toggle_plot_mode_button.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(self.plot_controls, text="DRT").pack(side=tk.LEFT, padx=(10, 4))
+        self.drt_mode_var = tk.StringVar(value="Ridge DRT")
+        self.drt_mode_box = ttk.Combobox(
+            self.plot_controls,
+            textvariable=self.drt_mode_var,
+            values=("Ridge DRT", "Hybrid DRT"),
+            state="readonly",
+            width=12,
+        )
+        self.drt_mode_box.pack(side=tk.LEFT)
+        self.drt_mode_box.bind("<<ComboboxSelected>>", self._on_drt_mode_selected)
         self.figure = Figure(figsize=(7.5, 6.5), dpi=100, constrained_layout=True)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
         self.canvas.draw()
@@ -526,10 +564,21 @@ class EISApplication:
             text="Show Bode" if self.plot_mode == "nyquist" else "Show Nyquist"
         )
 
+    def _update_legend_visibility(self) -> None:
+        for axis in self._active_plot_axes():
+            legend = axis.get_legend()
+            if legend is not None:
+                legend.set_visible(not self.hide_legends_var.get())
+
     def _active_plot_axes(self) -> set:
         return {
             axis
-            for axis in (self.axes, getattr(self, "phase_axes", None), self.drt_axes)
+            for axis in (
+                self.axes,
+                getattr(self, "phase_axes", None),
+                getattr(self, "kk_axes", None),
+                self.drt_axes,
+            )
             if axis is not None
         }
 
@@ -709,11 +758,27 @@ class EISApplication:
     def _configure_plot_layout(self) -> None:
         self.figure.clear()
         self.phase_axes = None
+        self.kk_axes = None
         self._update_plot_mode_button()
-        if self.show_drt_var.get():
+        if self.show_drt_var.get() and self.show_kk_var.get():
+            grid = self.figure.add_gridspec(
+                2,
+                2,
+                width_ratios=[1.55, 1.0],
+                height_ratios=[1.0, 0.42],
+            )
+            self.axes = self.figure.add_subplot(grid[0, 0])
+            self.kk_axes = self.figure.add_subplot(grid[1, 0])
+            self.drt_axes = self.figure.add_subplot(grid[:, 1])
+        elif self.show_drt_var.get():
             grid = self.figure.add_gridspec(1, 2, width_ratios=[1.55, 1.0])
             self.axes = self.figure.add_subplot(grid[0, 0])
             self.drt_axes = self.figure.add_subplot(grid[0, 1])
+        elif self.show_kk_var.get():
+            grid = self.figure.add_gridspec(2, 1, height_ratios=[1.0, 0.42])
+            self.axes = self.figure.add_subplot(grid[0, 0])
+            self.kk_axes = self.figure.add_subplot(grid[1, 0])
+            self.drt_axes = None
         else:
             self.axes = self.figure.add_subplot(111)
             self.drt_axes = None
@@ -721,6 +786,22 @@ class EISApplication:
             self._configure_bode_plot()
         else:
             self._configure_nyquist_plot()
+        if self.kk_axes is not None:
+            self.kk_axes.axhline(0.0, color="#666666", linewidth=0.8, alpha=0.5)
+            self.kk_axes.set_xscale("log")
+            self.kk_axes.grid(True, alpha=0.2)
+            self.kk_axes.set_xlabel("Frequency / Hz")
+            self.kk_axes.set_ylabel("KK residual")
+            (self.kk_real_artist,) = self.kk_axes.plot(
+                [], [], "o-", color="#00897b", markersize=3, linewidth=1.0, label="Real"
+            )
+            (self.kk_imag_artist,) = self.kk_axes.plot(
+                [], [], "s-", color="#8e24aa", markersize=2.8, linewidth=1.0, label="Imag"
+            )
+            self.kk_axes.legend(loc="best", fontsize=8)
+        else:
+            self.kk_real_artist = None
+            self.kk_imag_artist = None
         if self.drt_axes is not None:
             self.drt_axes.set_xscale("log")
             self.drt_axes.set_xlabel("Tau / s")
@@ -732,6 +813,7 @@ class EISApplication:
             self.drt_axes.legend(loc="best")
         else:
             self.drt_artist = None
+        self._update_legend_visibility()
         self.zoom_selector = self._rectangle_selector_class(
             self.axes,
             self._on_zoom_select,
@@ -779,6 +861,7 @@ class EISApplication:
         )
         self._explorer_headings = {
             "fitted": "Fitted",
+            "drt": "DRT",
             "source": "Source file",
             "cycle": "Cycle",
             "potential": "Voltage (V)",
@@ -789,6 +872,7 @@ class EISApplication:
         }
         self._explorer_attributes = {
             "fitted": None,
+            "drt": None,
             "source": None,
             "cycle": "cycle",
             "potential": "potential_v",
@@ -801,6 +885,7 @@ class EISApplication:
         self._explorer_selected_column = "cycle"
         widths = {
             "fitted": 62,
+            "drt": 48,
             "source": 190,
             "cycle": 65,
             "potential": 105,
@@ -842,6 +927,7 @@ class EISApplication:
         explorer_actions.columnconfigure(0, weight=1)
         explorer_actions.columnconfigure(1, weight=1)
         explorer_actions.columnconfigure(2, weight=1)
+        explorer_actions.columnconfigure(3, weight=1)
         self.delete_spectrum_button = ttk.Button(
             explorer_actions,
             text="Delete selected spectra",
@@ -854,13 +940,19 @@ class EISApplication:
             command=self.plot_selected_spectra,
         )
         self.plot_selected_button.grid(row=0, column=1, padx=(6, 0), sticky="ew")
+        self.plot_selected_drts_button = ttk.Button(
+            explorer_actions,
+            text="Plot selected DRTs",
+            command=self.plot_selected_drts,
+        )
+        self.plot_selected_drts_button.grid(row=0, column=2, padx=(6, 0), sticky="ew")
         self.plot_three_electrode_button = ttk.Button(
             explorer_actions,
             text="Plot cell/WE/CE",
             command=self.plot_three_electrode_spectra,
         )
         self.plot_three_electrode_button.grid(
-            row=0, column=2, padx=(6, 0), sticky="ew"
+            row=0, column=3, padx=(6, 0), sticky="ew"
         )
         self.explorer_selection_var = tk.StringVar(value="0 spectra selected")
         ttk.Label(
@@ -872,6 +964,7 @@ class EISApplication:
     def _explorer_base_columns(self) -> tuple[str, ...]:
         return (
             "fitted",
+            "drt",
             "source",
             "cycle",
             "potential",
@@ -888,8 +981,17 @@ class EISApplication:
         columns: list[str] = []
         for dataset_id in self._dataset_order:
             loaded = self.loaded_projects[dataset_id]
+            is_ewe_data = (
+                loaded.state.control == "working"
+                and "ewe_ece_v" not in loaded.dataframe.columns
+            )
             for spectrum in loaded.spectra:
                 for name in spectrum.custom_metadata:
+                    if is_ewe_data and name in {
+                        WORKING_POTENTIAL_COLUMN,
+                        COUNTER_POTENTIAL_COLUMN,
+                    }:
+                        continue
                     if name not in columns:
                         columns.append(name)
         self._custom_metadata_columns = columns
@@ -901,6 +1003,7 @@ class EISApplication:
         self.explorer.configure(columns=columns)
         headings = {
             "fitted": "Fitted",
+            "drt": "DRT",
             "source": "Source file",
             "cycle": "Cycle",
             "potential": "Voltage (V)",
@@ -911,6 +1014,7 @@ class EISApplication:
         }
         widths = {
             "fitted": 62,
+            "drt": 48,
             "source": 190,
             "cycle": 65,
             "potential": 105,
@@ -935,7 +1039,7 @@ class EISApplication:
                 if column == "source" or column in self._custom_metadata_columns
                 else tk.E
             )
-            if column == "fitted":
+            if column in {"fitted", "drt"}:
                 anchor = tk.CENTER
             self.explorer.column(column, width=widths[column], minwidth=55, anchor=anchor)
 
@@ -956,6 +1060,15 @@ class EISApplication:
         if column == "fitted":
             cycle = loaded.state.cycles.get(spectrum.cycle)
             return "Yes" if cycle is not None and cycle.fit_parameters is not None else "No"
+        if column == "drt":
+            cycle = loaded.state.cycles.get(spectrum.cycle)
+            if cycle is None:
+                return "N"
+            if cycle.saved_hybrid_tau_s is not None and cycle.saved_hybrid_gamma_ohm is not None:
+                return "H"
+            if cycle.saved_ridge_tau_s is not None and cycle.saved_ridge_gamma_ohm is not None:
+                return "R"
+            return "N"
         if column == "source":
             return loaded.state.source_path.name
         if column == "cycle":
@@ -1025,6 +1138,15 @@ class EISApplication:
         if column == "fitted":
             cycle = loaded.state.cycles.get(spectrum.cycle)
             return (0, 1 if cycle is not None and cycle.fit_parameters is not None else 0)
+        elif column == "drt":
+            cycle = loaded.state.cycles.get(spectrum.cycle)
+            if cycle is None:
+                return (0, 0)
+            if cycle.saved_hybrid_tau_s is not None and cycle.saved_hybrid_gamma_ohm is not None:
+                return (0, 2)
+            if cycle.saved_ridge_tau_s is not None and cycle.saved_ridge_gamma_ohm is not None:
+                return (0, 1)
+            return (0, 0)
         elif column == "source":
             value = loaded.state.source_path.name
         elif column == "cycle":
@@ -1122,6 +1244,11 @@ class EISApplication:
         finally:
             self.export_menu.grab_release()
         return "break"
+
+    def _on_drt_mode_selected(self, _event=None):
+        if self.state is None:
+            return
+        self._ensure_current_drt_mode()
 
     def _on_explorer_click(self, event):
         if self.busy or self.state is None:
@@ -1288,12 +1415,12 @@ class EISApplication:
         self.frequency_button.grid(
             row=2, column=0, padx=(0, 4), pady=(6, 0), sticky="ew"
         )
-        self.frequency_all_button = ttk.Button(
+        self.frequency_selected_button = ttk.Button(
             options_group,
             text="Apply to selected spectra",
-            command=self.apply_frequency_window_to_all,
+            command=self.apply_frequency_window_to_selected,
         )
-        self.frequency_all_button.grid(
+        self.frequency_selected_button.grid(
             row=2, column=1, padx=(4, 0), pady=(6, 0), sticky="ew"
         )
         ttk.Label(options_group, text="Outlier threshold").grid(
@@ -1308,18 +1435,24 @@ class EISApplication:
             variable=self.show_drt_var,
             command=self.toggle_drt_view,
         ).grid(row=6, column=0, columnspan=2, pady=(8, 0), sticky="w")
+        ttk.Checkbutton(
+            options_group,
+            text="Show KK residuals",
+            variable=self.show_kk_var,
+            command=self.toggle_kk_view,
+        ).grid(row=7, column=0, columnspan=2, pady=(6, 0), sticky="w")
         self.outlier_button = ttk.Button(
             options_group, text="Outliers: current", command=self.find_outliers
         )
         self.outlier_button.grid(
             row=4, column=0, padx=(0, 4), pady=(6, 0), sticky="ew"
         )
-        self.outlier_all_button = ttk.Button(
+        self.outlier_selected_button = ttk.Button(
             options_group,
             text="Outliers: selected spectra",
-            command=self.find_outliers_for_all,
+            command=self.find_outliers_for_selected,
         )
-        self.outlier_all_button.grid(
+        self.outlier_selected_button.grid(
             row=4, column=1, padx=(4, 0), pady=(6, 0), sticky="ew"
         )
         self.reset_button = ttk.Button(
@@ -1349,27 +1482,45 @@ class EISApplication:
             actions, text="Hybrid DRT", command=self.calculate_hybrid_drt
         )
         self.hybrid_drt_button.grid(row=1, column=1, padx=(4, 0), pady=3, sticky="ew")
+        self.ridge_drt_selected_button = ttk.Button(
+            actions,
+            text="Ridge DRT: selected",
+            command=self.calculate_selected_ridge_drts,
+        )
+        self.ridge_drt_selected_button.grid(
+            row=2, column=0, padx=(0, 4), pady=3, sticky="ew"
+        )
+        self.hybrid_drt_selected_button = ttk.Button(
+            actions,
+            text="Hybrid DRT: selected",
+            command=self.calculate_selected_hybrid_drts,
+        )
+        self.hybrid_drt_selected_button.grid(
+            row=2, column=1, padx=(4, 0), pady=3, sticky="ew"
+        )
         self.batch_fit_button = ttk.Button(
             actions,
             text="Batch fit from current",
             command=self.batch_fit,
         )
-        self.batch_fit_button.grid(row=2, column=0, columnspan=2, pady=3, sticky="ew")
+        self.batch_fit_button.grid(row=3, column=0, columnspan=2, pady=3, sticky="ew")
         self.python_export_button = ttk.Button(
             actions,
             text="Export to Python",
             command=self.export_python_workspace,
         )
         self.python_export_button.grid(
-            row=3, column=0, columnspan=2, pady=3, sticky="ew"
+            row=4, column=0, columnspan=2, pady=3, sticky="ew"
         )
         self.action_buttons = (
             self.fit_button,
             self.initial_values_button,
             self.ridge_drt_button,
             self.hybrid_drt_button,
+            self.ridge_drt_selected_button,
+            self.hybrid_drt_selected_button,
             self.outlier_button,
-            self.outlier_all_button,
+            self.outlier_selected_button,
             self.reset_button,
             self.batch_fit_button,
             self.python_export_button,
@@ -1381,7 +1532,7 @@ class EISApplication:
             self.plot_three_electrode_button,
             self.paste_metadata_button,
             self.frequency_button,
-            self.frequency_all_button,
+            self.frequency_selected_button,
             self.model_button,
         )
         self._set_controls_enabled(False)
@@ -1432,6 +1583,8 @@ class EISApplication:
         cycle_number: int,
         *,
         capture_current: bool = True,
+        preserve_existing_selection: bool = True,
+        focus_only: bool = False,
     ) -> None:
         if capture_current and self.state is not None and not self._capture_controls():
             self._highlight_explorer_cycle(
@@ -1458,11 +1611,14 @@ class EISApplication:
         self.cycle_var.set(str(self.state.active_cycle))
         self._highlight_explorer_cycle(
             self.state.active_cycle,
-            preserve_existing=True,
+            preserve_existing=preserve_existing_selection,
+            focus_only=focus_only,
         )
         self._restore_controls()
         self._refresh_plot(rescale=True)
         self._update_status(f"source: {loaded.dataset_label}")
+        if self.show_kk_var.get():
+            self._ensure_kk_residuals()
 
     def _submit(
         self,
@@ -1505,6 +1661,10 @@ class EISApplication:
         state = tk.NORMAL if enabled and not self.busy else tk.DISABLED
         for button in getattr(self, "action_buttons", ()):
             button.configure(state=state)
+        if hasattr(self, "drt_mode_box"):
+            self.drt_mode_box.configure(
+                state="readonly" if enabled and not self.busy else "disabled"
+            )
         if hasattr(self, "model_box"):
             self.model_box.configure(
                 state="normal" if enabled and not self.busy else "disabled"
@@ -1519,7 +1679,11 @@ class EISApplication:
                 "Import data…",
                 state=tk.DISABLED if self.busy else tk.NORMAL,
             )
-            for label in self._project_menu_actions:
+            self.file_menu.entryconfigure(
+                "Load project…",
+                state=tk.DISABLED if self.busy else tk.NORMAL,
+            )
+            for label in self._project_menu_actions[1:]:
                 self.file_menu.entryconfigure(label, state=menu_state)
         if hasattr(self, "fit_menu"):
             for label in self._fit_menu_actions:
@@ -1557,7 +1721,10 @@ class EISApplication:
             messagebox.showerror("Invalid value", str(error), parent=self.root)
             return False
         self.state.remember_parameters(parameters)
+        previous_window = self.state.active.frequency_window
         self.state.active.frequency_window = (minimum, maximum)
+        if previous_window != self.state.active.frequency_window:
+            self.state.active.invalidate_drt_cache()
         return True
 
     def _refresh_plot(self, rescale: bool = False) -> None:
@@ -1664,6 +1831,18 @@ class EISApplication:
                 residuals = np.stack((measured_points, fitted_points), axis=1)
                 self.residual_artist.set_segments(residuals[included])
                 self.excluded_residual_artist.set_segments(residuals[~included])
+        if self.kk_axes is not None and self.kk_real_artist is not None and self.kk_imag_artist is not None:
+            if (
+                cycle.kk_cache_matches()
+                and cycle.kk_residual_real is not None
+                and cycle.kk_residual_imag is not None
+            ):
+                x_values = cycle.frequency_hz[cycle.included]
+                self.kk_real_artist.set_data(x_values, cycle.kk_residual_real)
+                self.kk_imag_artist.set_data(x_values, cycle.kk_residual_imag)
+            else:
+                self.kk_real_artist.set_data([], [])
+                self.kk_imag_artist.set_data([], [])
         self.axes.set_title(
             (
                 f"{self.loaded.dataset_label if self.loaded is not None else self._current_name()}\n"
@@ -1671,13 +1850,16 @@ class EISApplication:
             )
         )
         if self.drt_artist is not None and self.drt_axes is not None:
-            if cycle.ridge_tau_s is None or cycle.ridge_gamma_ohm is None:
+            drt_tau_s, drt_gamma_ohm, drt_label = self._apply_saved_drt_mode(cycle)
+            if drt_tau_s is None or drt_gamma_ohm is None:
                 self.drt_artist.set_data([], [])
             else:
-                self.drt_artist.set_data(cycle.ridge_tau_s, cycle.ridge_gamma_ohm)
-            self.drt_axes.set_title(cycle.drt_label or "DRT")
+                self.drt_artist.set_data(drt_tau_s, drt_gamma_ohm)
+            self.drt_axes.set_title(drt_label)
         if rescale:
             self._autoscale_to_included(cycle)
+            if self.kk_axes is not None:
+                self._autoscale_kk(cycle)
             if self.drt_artist is not None and self.drt_axes is not None:
                 self._autoscale_drt(cycle)
         self._refresh_explorer_values()
@@ -1773,6 +1955,30 @@ class EISApplication:
         self.drt_axes.set_xlim(x_min, x_max)
         self.drt_axes.set_ylim(y_min - y_padding, y_max + y_padding)
 
+    def _autoscale_kk(self, cycle) -> None:
+        if (
+            self.kk_axes is None
+            or cycle.kk_residual_real is None
+            or cycle.kk_residual_imag is None
+            or not cycle.kk_cache_matches()
+        ):
+            return
+        y_values = np.concatenate((cycle.kk_residual_real, cycle.kk_residual_imag))
+        finite = np.isfinite(y_values)
+        if not np.any(finite):
+            return
+        y_values = y_values[finite]
+        y_min = float(np.min(y_values))
+        y_max = float(np.max(y_values))
+        y_span = y_max - y_min
+        y_padding = 0.1 * (y_span if y_span > 0 else max(abs(y_max), 0.01))
+        self.kk_axes.set_ylim(y_min - y_padding, y_max + y_padding)
+        frequency = cycle.frequency_hz[cycle.included]
+        finite_frequency = np.isfinite(frequency) & (frequency > 0)
+        if np.any(finite_frequency):
+            frequency = frequency[finite_frequency]
+            self.kk_axes.set_xlim(float(np.min(frequency)), float(np.max(frequency)))
+
     def reset_plot_view(self) -> None:
         if self.state is None:
             return
@@ -1799,6 +2005,17 @@ class EISApplication:
                 self.drt_axes.set_title("Ridge DRT")
         else:
             self._refresh_plot(rescale=True)
+        self.canvas.draw_idle()
+
+    def toggle_kk_view(self) -> None:
+        self._configure_plot_layout()
+        if self.state is None:
+            self.axes.set_title("No spectrum loaded")
+        else:
+            self._refresh_plot(rescale=True)
+            if self.show_kk_var.get():
+                self._ensure_kk_residuals()
+                return
         self.canvas.draw_idle()
 
     @staticmethod
@@ -1943,6 +2160,10 @@ class EISApplication:
         self.fit_points_excluded_artist.set_data([], [])
         self.residual_artist.set_segments([])
         self.excluded_residual_artist.set_segments([])
+        if self.kk_real_artist is not None:
+            self.kk_real_artist.set_data([], [])
+        if self.kk_imag_artist is not None:
+            self.kk_imag_artist.set_data([], [])
         if self.phase_included_artist is not None:
             self.phase_included_artist.set_data([], [])
         if self.phase_excluded_artist is not None:
@@ -1961,6 +2182,8 @@ class EISApplication:
             self.drt_artist.set_data([], [])
         if self.drt_axes is not None:
             self.drt_axes.set_title("Ridge DRT")
+        if self.kk_axes is not None:
+            self.kk_axes.set_title("Lin-KK residuals")
         self.axes.set_title("No spectrum loaded")
         self.canvas.draw_idle()
         self.status_var.set(message)
@@ -2122,14 +2345,35 @@ class EISApplication:
     ) -> None:
         if self.busy or self.state is None:
             return
-        cycles = self.state.available_cycles
-        index = cycles.index(self.state.active_cycle)
-        next_index = max(0, min(len(cycles) - 1, index + direction))
-        self._activate_cycle(
-            cycles[next_index],
-            preserve_existing_selection=preserve_selection,
-            focus_only=focus_only,
+        visible_items = list(self.explorer.get_children(""))
+        if not visible_items:
+            return
+        current_item = self._explorer_lookup.get(
+            (self.current_dataset_id, self.state.active_cycle)
         )
+        if current_item not in visible_items:
+            current_item = self._explorer_primary_item
+        if current_item in visible_items:
+            index = visible_items.index(current_item)
+        else:
+            index = 0 if direction > 0 else len(visible_items) - 1
+        next_index = max(0, min(len(visible_items) - 1, index + direction))
+        next_item = visible_items[next_index]
+        dataset_id, loaded, spectrum = self._explorer_rows[next_item]
+        if dataset_id == self.current_dataset_id:
+            self._activate_cycle(
+                spectrum.cycle,
+                preserve_existing_selection=preserve_selection,
+                focus_only=focus_only,
+            )
+        else:
+            self._switch_dataset(
+                dataset_id,
+                loaded,
+                spectrum.cycle,
+                preserve_existing_selection=preserve_selection,
+                focus_only=focus_only,
+            )
 
     def _activate_cycle(
         self,
@@ -2166,6 +2410,8 @@ class EISApplication:
         self._restore_controls()
         self._refresh_plot(rescale=True)
         self._update_status()
+        if self.show_kk_var.get():
+            self._ensure_kk_residuals()
 
     def apply_frequency_window(self) -> None:
         if self._capture_controls():
@@ -2173,7 +2419,7 @@ class EISApplication:
             self._refresh_plot(rescale=True)
             self._update_status("frequency range applied")
 
-    def apply_frequency_window_to_all(self) -> None:
+    def apply_frequency_window_to_selected(self) -> None:
         if self.state is None or not self._capture_controls():
             return
         selected_rows = self._selected_spectrum_rows()
@@ -2186,6 +2432,7 @@ class EISApplication:
         for _dataset_id, loaded, spectrum in selected_rows:
             cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
             cycle.frequency_window = window
+            cycle.invalidate_drt_cache()
             cycle.clear_fit()
             updated += 1
         self._refresh_plot(rescale=True)
@@ -2235,7 +2482,8 @@ class EISApplication:
         parameters = self.state.parameters_for(cycle_number)
         self.status_var.set(f"Cycle {cycle_number} · finding outliers…")
         self._submit(
-            lambda: analyze_outliers(cycle, threshold, parameters),
+            lambda: self._cached_ridge_analysis(cycle, threshold, parameters)
+            or analyze_outliers(cycle, threshold, parameters),
             lambda analysis: self._finish_outliers(cycle_number, analysis),
             "Outlier search failed",
         )
@@ -2260,7 +2508,7 @@ class EISApplication:
                 f"{analysis.peak_count} peaks"
             )
 
-    def find_outliers_for_all(self) -> None:
+    def find_outliers_for_selected(self) -> None:
         if self.state is None or self.loaded is None or not self._capture_controls():
             return
         try:
@@ -2305,7 +2553,7 @@ class EISApplication:
             f"({peak_count} peaks)"
         )
 
-    def find_outliers_for_all(self) -> None:
+    def find_outliers_for_selected(self) -> None:
         if self.state is None or self.loaded is None or not self._capture_controls():
             return
         try:
@@ -2406,7 +2654,8 @@ class EISApplication:
         parameters = self.state.parameters_for(cycle_number)
         self.status_var.set(f"Cycle {cycle_number} · estimating initial values...")
         self._submit(
-            lambda: analyze_outliers(cycle, threshold, parameters),
+            lambda: self._cached_ridge_analysis(cycle, threshold, parameters)
+            or analyze_outliers(cycle, threshold, parameters),
             lambda analysis: self._finish_initial_values(cycle_number, analysis),
             "Initial-value estimation failed",
         )
@@ -2426,7 +2675,8 @@ class EISApplication:
         parameters = self.state.parameters_for(cycle_number)
         self.status_var.set(f"Cycle {cycle_number} · calculating ridge DRT...")
         self._submit(
-            lambda: analyze_outliers(cycle, threshold, parameters),
+            lambda: self._cached_ridge_analysis(cycle, threshold, parameters)
+            or analyze_outliers(cycle, threshold, parameters),
             lambda analysis: self._finish_ridge_drt(cycle_number, analysis),
             "Ridge DRT calculation failed",
         )
@@ -2452,9 +2702,16 @@ class EISApplication:
             return
         cycle = self.state.cycles[cycle_number]
         cycle.parameters = analysis.parameters
-        cycle.ridge_tau_s = analysis.ridge_tau_s
-        cycle.ridge_gamma_ohm = analysis.ridge_gamma_ohm
-        cycle.drt_label = "Ridge DRT"
+        cycle.store_ridge_analysis(
+            self._require_threshold_value(),
+            analysis.outlier_indices,
+            analysis.parameters,
+            analysis.peak_count,
+            analysis.ohmic_resistance,
+            analysis.inductance,
+            analysis.ridge_tau_s,
+            analysis.ridge_gamma_ohm,
+        )
         if self.state.active_cycle == cycle_number:
             self.parameter_table.set_parameters(analysis.parameters)
             self._refresh_plot(rescale=True)
@@ -2473,9 +2730,16 @@ class EISApplication:
         if self.state is None:
             return
         cycle = self.state.cycles[cycle_number]
-        cycle.ridge_tau_s = analysis.ridge_tau_s
-        cycle.ridge_gamma_ohm = analysis.ridge_gamma_ohm
-        cycle.drt_label = "Ridge DRT"
+        cycle.store_ridge_analysis(
+            self._require_threshold_value(),
+            analysis.outlier_indices,
+            analysis.parameters,
+            analysis.peak_count,
+            analysis.ohmic_resistance,
+            analysis.inductance,
+            analysis.ridge_tau_s,
+            analysis.ridge_gamma_ohm,
+        )
         if self.state.active_cycle == cycle_number:
             self._refresh_plot(rescale=True)
             self._update_status(
@@ -2492,9 +2756,11 @@ class EISApplication:
         if self.state is None:
             return
         cycle = self.state.cycles[cycle_number]
-        cycle.ridge_tau_s = result.tau_s
-        cycle.ridge_gamma_ohm = result.gamma_ohm
-        cycle.drt_label = "Hybrid DRT"
+        cycle.store_hybrid_drt(
+            result.tau_s,
+            result.gamma_ohm,
+            result.ohmic_resistance,
+        )
         if self.state.active_cycle == cycle_number:
             self._refresh_plot(rescale=True)
             if result.ohmic_resistance is None:
@@ -2513,9 +2779,16 @@ class EISApplication:
             return
         cycle = self.state.cycles[cycle_number]
         cycle.apply_outliers(analysis.outlier_indices)
-        cycle.ridge_tau_s = analysis.ridge_tau_s
-        cycle.ridge_gamma_ohm = analysis.ridge_gamma_ohm
-        cycle.drt_label = "Ridge DRT"
+        cycle.store_ridge_analysis(
+            self._require_threshold_value(),
+            analysis.outlier_indices,
+            analysis.parameters,
+            analysis.peak_count,
+            analysis.ohmic_resistance,
+            analysis.inductance,
+            analysis.ridge_tau_s,
+            analysis.ridge_gamma_ohm,
+        )
         if self.state.active_cycle == cycle_number:
             self._refresh_plot(rescale=True)
             self._update_status(
@@ -2523,7 +2796,7 @@ class EISApplication:
                 f"points excluded"
             )
 
-    def find_outliers_for_all(self) -> None:
+    def find_outliers_for_selected(self) -> None:
         if self.state is None or self.loaded is None or not self._capture_controls():
             return
         try:
@@ -2533,24 +2806,65 @@ class EISApplication:
                 "Invalid threshold", "Enter a numeric threshold", parent=self.root
             )
             return
-        spectrum_count = sum(
-            len(loaded.state.available_cycles) for loaded in self.loaded_projects.values()
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        grouped_projects: dict[str, tuple[LoadedProject, ProjectState]] = {}
+        grouped_cycles: dict[str, list[int]] = {}
+        for dataset_id, loaded, spectrum in selected_rows:
+            grouped_cycles.setdefault(dataset_id, []).append(spectrum.cycle)
+            if dataset_id not in grouped_projects:
+                grouped_projects[dataset_id] = (loaded, loaded.state)
+        selected_projects: dict[str, tuple[LoadedProject, ProjectState]] = {}
+        for dataset_id, cycle_numbers in grouped_cycles.items():
+            loaded, _state = grouped_projects[dataset_id]
+            unique_cycles = list(dict.fromkeys(cycle_numbers))
+            selected_projects[dataset_id] = (
+                loaded,
+                ProjectState(
+                    source_path=loaded.state.source_path,
+                    circuit=loaded.state.circuit,
+                    control=loaded.state.control,
+                    available_cycles=unique_cycles,
+                    active_cycle=unique_cycles[0],
+                    default_parameters=loaded.state.default_parameters,
+                    cycles={
+                        cycle_number: self._loaded_cycle_for_popup(loaded, cycle_number)
+                        for cycle_number in unique_cycles
+                    },
+                    all_frequency_window=loaded.state.all_frequency_window,
+                ),
+            )
+        spectrum_count = len(selected_rows)
+        self.status_var.set(
+            f"Finding outliers in {spectrum_count} selected spectra..."
         )
-        self.status_var.set(f"Finding outliers in all {spectrum_count} spectra...")
         self._submit(
             lambda: {
-                dataset_id: find_outliers_for_all_cycles(
-                    loaded.dataframe,
-                    loaded.state,
-                    threshold,
-                )
-                for dataset_id, loaded in self.loaded_projects.items()
+                dataset_id: {
+                    cycle_number: (
+                        project.cycles[cycle_number],
+                        self._cached_ridge_analysis(
+                            project.cycles[cycle_number],
+                            threshold,
+                            project.parameters_for(cycle_number),
+                        )
+                        or analyze_outliers(
+                            project.cycles[cycle_number],
+                            threshold,
+                            project.parameters_for(cycle_number),
+                        )
+                    )
+                    for cycle_number in project.available_cycles
+                }
+                for dataset_id, (loaded, project) in selected_projects.items()
             },
-            self._finish_all_outliers,
-            "File-wide outlier search failed",
+            self._finish_selected_outliers,
+            "Selected-spectra outlier search failed",
         )
 
-    def _finish_all_outliers(self, results) -> None:
+    def _finish_selected_outliers(self, results) -> None:
         if self.state is None:
             return
         spectra_count = 0
@@ -2569,9 +2883,16 @@ class EISApplication:
                 if loaded.state.all_frequency_window is not None:
                     cycle.frequency_window = loaded.state.all_frequency_window
                 cycle.apply_outliers(analysis.outlier_indices)
-                cycle.ridge_tau_s = analysis.ridge_tau_s
-                cycle.ridge_gamma_ohm = analysis.ridge_gamma_ohm
-                cycle.drt_label = "Ridge DRT"
+                cycle.store_ridge_analysis(
+                    self._require_threshold_value(),
+                    analysis.outlier_indices,
+                    analysis.parameters,
+                    analysis.peak_count,
+                    analysis.ohmic_resistance,
+                    analysis.inductance,
+                    analysis.ridge_tau_s,
+                    analysis.ridge_gamma_ohm,
+                )
                 outlier_count += int(np.count_nonzero(analysis.outlier_indices))
                 spectra_count += 1
         self._restore_controls()
@@ -2580,6 +2901,108 @@ class EISApplication:
             f"outlier search complete for {spectra_count} spectra "
             f"({outlier_count} points excluded)"
         )
+
+    def calculate_selected_ridge_drts(self) -> None:
+        if self.state is None or not self._capture_controls():
+            return
+        try:
+            threshold = float(self.threshold_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid threshold", "Enter a numeric threshold", parent=self.root
+            )
+            return
+        batches = self._selected_project_batches()
+        if not batches:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        spectrum_count = sum(len(project.available_cycles) for _loaded, project in batches.values())
+        self.status_var.set(f"Calculating ridge DRT for {spectrum_count} selected spectra...")
+        self._submit(
+            lambda: {
+                dataset_id: {
+                    cycle_number: analyze_outliers(
+                        project.cycles[cycle_number],
+                        threshold,
+                        project.parameters_for(cycle_number),
+                    )
+                    for cycle_number in project.available_cycles
+                }
+                for dataset_id, (_loaded, project) in batches.items()
+            },
+            self._finish_selected_ridge_drts,
+            "Selected ridge DRT calculation failed",
+        )
+
+    def _finish_selected_ridge_drts(self, results) -> None:
+        if self.state is None:
+            return
+        spectra_count = 0
+        for dataset_id, dataset_results in results.items():
+            loaded = self.loaded_projects.get(dataset_id)
+            if loaded is None:
+                continue
+            for cycle_number, analysis in dataset_results.items():
+                cycle = loaded.state.cycles.get(cycle_number)
+                if cycle is None:
+                    cycle = self._loaded_cycle_for_popup(loaded, cycle_number)
+                    loaded.state.cycles[cycle_number] = cycle
+                cycle.store_ridge_analysis(
+                    self._require_threshold_value(),
+                    analysis.outlier_indices,
+                    analysis.parameters,
+                    analysis.peak_count,
+                    analysis.ohmic_resistance,
+                    analysis.inductance,
+                    analysis.ridge_tau_s,
+                    analysis.ridge_gamma_ohm,
+                )
+                spectra_count += 1
+        self._refresh_plot(rescale=True)
+        self._update_status(f"ridge DRT recalculated for {spectra_count} selected spectra")
+
+    def calculate_selected_hybrid_drts(self) -> None:
+        if self.state is None or not self._capture_controls():
+            return
+        batches = self._selected_project_batches()
+        if not batches:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        spectrum_count = sum(len(project.available_cycles) for _loaded, project in batches.values())
+        self.status_var.set(f"Calculating hybrid DRT for {spectrum_count} selected spectra...")
+        self._submit(
+            lambda: {
+                dataset_id: {
+                    cycle_number: calculate_hybrid_drt(project.cycles[cycle_number])
+                    for cycle_number in project.available_cycles
+                }
+                for dataset_id, (_loaded, project) in batches.items()
+            },
+            self._finish_selected_hybrid_drts,
+            "Selected hybrid DRT calculation failed",
+        )
+
+    def _finish_selected_hybrid_drts(self, results) -> None:
+        if self.state is None:
+            return
+        spectra_count = 0
+        for dataset_id, dataset_results in results.items():
+            loaded = self.loaded_projects.get(dataset_id)
+            if loaded is None:
+                continue
+            for cycle_number, result in dataset_results.items():
+                cycle = loaded.state.cycles.get(cycle_number)
+                if cycle is None:
+                    cycle = self._loaded_cycle_for_popup(loaded, cycle_number)
+                    loaded.state.cycles[cycle_number] = cycle
+                cycle.store_hybrid_drt(
+                    result.tau_s,
+                    result.gamma_ohm,
+                    result.ohmic_resistance,
+                )
+                spectra_count += 1
+        self._refresh_plot(rescale=True)
+        self._update_status(f"hybrid DRT recalculated for {spectra_count} selected spectra")
 
     def fit(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
@@ -3059,6 +3482,83 @@ class EISApplication:
             loaded.state.cycles[cycle_number] = cycle
         return cycle
 
+    def _ensure_saved_drt_for_cycles(
+        self,
+        plotted_cycles,
+        mode: str,
+        *,
+        force: bool,
+        on_ready: Callable[[], None],
+    ) -> None:
+        missing = []
+        for loaded, cycle in plotted_cycles:
+            has_saved = (
+                cycle.saved_ridge_tau_s is not None
+                if mode == "ridge"
+                else cycle.saved_hybrid_tau_s is not None
+            )
+            if force or not has_saved:
+                missing.append((loaded, cycle))
+        if not missing:
+            on_ready()
+            return
+        if mode == "ridge":
+            threshold = self._require_threshold_value()
+            self.status_var.set(f"Calculating ridge DRT for {len(missing)} spectra...")
+            self._submit(
+                lambda: [
+                    (
+                        loaded,
+                        cycle.cycle,
+                        analyze_outliers(
+                            cycle,
+                            threshold,
+                            loaded.state.parameters_for(cycle.cycle),
+                        ),
+                    )
+                    for loaded, cycle in missing
+                ],
+                lambda results: self._finish_saved_ridge_batch(results, on_ready),
+                "Ridge DRT calculation failed",
+            )
+            return
+        self.status_var.set(f"Calculating hybrid DRT for {len(missing)} spectra...")
+        self._submit(
+            lambda: [
+                (loaded, cycle.cycle, calculate_hybrid_drt(cycle))
+                for loaded, cycle in missing
+            ],
+            lambda results: self._finish_saved_hybrid_batch(results, on_ready),
+            "Hybrid DRT calculation failed",
+        )
+
+    def _finish_saved_ridge_batch(self, results, on_ready: Callable[[], None]) -> None:
+        for loaded, cycle_number, analysis in results:
+            cycle = self._loaded_cycle_for_popup(loaded, cycle_number)
+            cycle.store_ridge_analysis(
+                self._require_threshold_value(),
+                analysis.outlier_indices,
+                analysis.parameters,
+                analysis.peak_count,
+                analysis.ohmic_resistance,
+                analysis.inductance,
+                analysis.ridge_tau_s,
+                analysis.ridge_gamma_ohm,
+            )
+        self._refresh_plot(rescale=True)
+        on_ready()
+
+    def _finish_saved_hybrid_batch(self, results, on_ready: Callable[[], None]) -> None:
+        for loaded, cycle_number, result in results:
+            cycle = self._loaded_cycle_for_popup(loaded, cycle_number)
+            cycle.store_hybrid_drt(
+                result.tau_s,
+                result.gamma_ohm,
+                result.ohmic_resistance,
+            )
+        self._refresh_plot(rescale=True)
+        on_ready()
+
     def _open_spectra_popup(
         self,
         title: str,
@@ -3234,6 +3734,149 @@ class EISApplication:
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self._update_status(status_message)
 
+    def _open_drt_popup(
+        self,
+        title: str,
+        plotted_cycles,
+        status_message: str,
+    ) -> None:
+        from matplotlib import colormaps
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        popup = tk.Toplevel(self.root)
+        popup.title(title)
+        popup.geometry("920x700")
+        popup.minsize(640, 480)
+
+        mode_state = {"value": self._selected_drt_mode()}
+        controls = ttk.Frame(popup, padding=(8, 8, 8, 0))
+        controls.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(controls, text="DRT mode").pack(side=tk.LEFT, padx=(0, 6))
+        mode_var = tk.StringVar(
+            value="Ridge DRT" if mode_state["value"] == "ridge" else "Hybrid DRT"
+        )
+        mode_box = ttk.Combobox(
+            controls,
+            textvariable=mode_var,
+            values=("Ridge DRT", "Hybrid DRT"),
+            state="readonly",
+            width=12,
+        )
+        mode_box.pack(side=tk.LEFT)
+
+        figure = Figure(figsize=(8.2, 6.2), dpi=100, constrained_layout=True)
+        canvas = FigureCanvasTkAgg(figure, master=popup)
+        popup_axes: dict[str, object | None] = {"main": None}
+
+        def _drt_limits(selected_mode: str):
+            tau_segments = []
+            gamma_segments = []
+            for _loaded, cycle in plotted_cycles:
+                tau_values = (
+                    cycle.saved_ridge_tau_s if selected_mode == "ridge" else cycle.saved_hybrid_tau_s
+                )
+                gamma_values = (
+                    cycle.saved_ridge_gamma_ohm if selected_mode == "ridge" else cycle.saved_hybrid_gamma_ohm
+                )
+                if tau_values is None or gamma_values is None:
+                    continue
+                tau_values = np.asarray(tau_values, dtype=float)
+                gamma_values = np.asarray(gamma_values, dtype=float)
+                finite = np.isfinite(tau_values) & np.isfinite(gamma_values) & (tau_values > 0)
+                if not np.any(finite):
+                    continue
+                tau_segments.append(tau_values[finite])
+                gamma_segments.append(gamma_values[finite])
+            if not tau_segments:
+                return None
+            tau_values = np.concatenate(tau_segments)
+            gamma_values = np.concatenate(gamma_segments)
+            x_min = float(np.min(tau_values))
+            x_max = float(np.max(tau_values))
+            y_min = float(np.min(gamma_values))
+            y_max = float(np.max(gamma_values))
+            y_span = y_max - y_min
+            y_padding = 0.08 * (y_span if y_span > 0 else max(abs(y_max), 1.0))
+            if x_min == x_max:
+                x_min /= 1.3
+                x_max *= 1.3
+            return x_min, x_max, y_min - y_padding, y_max + y_padding
+
+        def _render_popup() -> None:
+            figure.clear()
+            axes = figure.add_subplot(111)
+            popup_axes["main"] = axes
+            axes.set_xscale("log")
+            axes.set_xlabel("Tau / s")
+            axes.set_ylabel("Gamma / Ohm")
+            axes.grid(True, alpha=0.25)
+            color_scale = colormaps["tab20"]
+            for index, (loaded, cycle) in enumerate(plotted_cycles):
+                color = color_scale(index % color_scale.N)
+                tau_values = (
+                    cycle.saved_ridge_tau_s if mode_state["value"] == "ridge" else cycle.saved_hybrid_tau_s
+                )
+                gamma_values = (
+                    cycle.saved_ridge_gamma_ohm if mode_state["value"] == "ridge" else cycle.saved_hybrid_gamma_ohm
+                )
+                if tau_values is None or gamma_values is None:
+                    continue
+                axes.plot(
+                    tau_values,
+                    gamma_values,
+                    "-",
+                    color=color,
+                    linewidth=1.4,
+                    alpha=0.9,
+                    label=f"{loaded.dataset_label} - cycle {cycle.cycle}",
+                )
+            limits = _drt_limits(mode_state["value"])
+            if limits is not None:
+                x_min, x_max, y_min, y_max = limits
+                axes.set_xlim(x_min, x_max)
+                axes.set_ylim(y_min, y_max)
+            axes.set_title("Ridge DRT" if mode_state["value"] == "ridge" else "Hybrid DRT")
+            axes.legend(loc="best", fontsize=8)
+            canvas.draw_idle()
+
+        def _reset_popup_view() -> None:
+            axes = popup_axes["main"]
+            if axes is None:
+                return
+            limits = _drt_limits(mode_state["value"])
+            if limits is None:
+                return
+            x_min, x_max, y_min, y_max = limits
+            axes.set_xlim(x_min, x_max)
+            axes.set_ylim(y_min, y_max)
+            canvas.draw_idle()
+
+        def _after_mode_ready(selected_mode: str) -> None:
+            if not popup.winfo_exists():
+                return
+            mode_state["value"] = selected_mode
+            mode_var.set("Ridge DRT" if selected_mode == "ridge" else "Hybrid DRT")
+            _render_popup()
+
+        def _on_mode_change(_event=None) -> None:
+            selected_mode = "hybrid" if mode_var.get() == "Hybrid DRT" else "ridge"
+            self._ensure_saved_drt_for_cycles(
+                plotted_cycles,
+                selected_mode,
+                force=False,
+                on_ready=lambda: _after_mode_ready(selected_mode),
+            )
+
+        mode_box.bind("<<ComboboxSelected>>", _on_mode_change)
+        canvas.draw()
+        toolbar = self._create_toolbar(canvas, popup, _reset_popup_view)
+        toolbar.update()
+        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        _render_popup()
+        self._update_status(status_message)
+
     def plot_selected_spectra(self) -> None:
         if self.busy or self.state is None:
             return
@@ -3257,6 +3900,36 @@ class EISApplication:
             f"Selected spectra ({len(selected_cycles)})",
             selected_cycles,
             f"opened comparison plot for {len(selected_cycles)} selected spectra",
+        )
+
+    def plot_selected_drts(self) -> None:
+        if self.busy or self.state is None:
+            return
+        selected_items = [
+            item
+            for item in self.explorer.get_children("")
+            if item in self.explorer.selection()
+        ]
+        if not selected_items:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        if not self._capture_controls():
+            return
+        selected_cycles = []
+        for item in selected_items:
+            _dataset_id, loaded, spectrum = self._explorer_rows[item]
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            selected_cycles.append((loaded, cycle))
+        selected_mode = self._selected_drt_mode()
+        self._ensure_saved_drt_for_cycles(
+            selected_cycles,
+            selected_mode,
+            force=False,
+            on_ready=lambda: self._open_drt_popup(
+                f"Selected DRTs ({len(selected_cycles)})",
+                selected_cycles,
+                f"opened DRT comparison for {len(selected_cycles)} selected spectra",
+            ),
         )
 
     def plot_three_electrode_spectra(self) -> None:
@@ -3407,7 +4080,24 @@ class EISApplication:
         if not selected:
             return
         try:
-            save_project_file(self.state, Path(selected))
+            ordered_dataset_ids = [
+                self.current_dataset_id,
+                *(
+                    dataset_id
+                    for dataset_id in self._dataset_order
+                    if dataset_id != self.current_dataset_id
+                ),
+            ]
+            datasets = [
+                (
+                    dataset_id,
+                    self.loaded_projects[dataset_id].state,
+                    self.loaded_projects[dataset_id].dataframe,
+                )
+                for dataset_id in ordered_dataset_ids
+                if dataset_id is not None and dataset_id in self.loaded_projects
+            ]
+            save_project_file(self.state, Path(selected), datasets=datasets)
         except Exception as error:
             messagebox.showerror(
                 "Project save failed",
@@ -3418,7 +4108,7 @@ class EISApplication:
         self._update_status(f"project saved as {Path(selected).name}")
 
     def load_project(self) -> None:
-        if self.busy or self.state is None or self.loaded is None:
+        if self.busy:
             return
         selected = filedialog.askopenfilename(
             parent=self.root,
@@ -3428,22 +4118,75 @@ class EISApplication:
         )
         if not selected:
             return
-        current = self.state
-        dataframe = self.loaded.dataframe
         project_path = Path(selected)
         self.status_var.set(f"Loading project {project_path.name}…")
         self._submit(
-            lambda: load_project_file(current, dataframe, project_path),
-            lambda restored: self._finish_project_load(restored, project_path),
+            lambda: self._load_saved_project(project_path),
+            lambda result: self._finish_project_load(result, project_path),
             "Project load failed",
         )
 
-    def _finish_project_load(self, restored: ProjectState, path: Path) -> None:
-        self.state = restored
-        assert self.loaded is not None
-        self.loaded.state = restored
-        self.loaded.spectra = catalog_spectra(
-            self.loaded.dataframe,
+    @staticmethod
+    def _load_saved_project(
+        path: Path,
+    ) -> list[tuple[str, LoadedProject, ProjectState]]:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        embedded_datasets = payload.get("datasets")
+        if embedded_datasets:
+            restored_projects = []
+            for dataset in embedded_datasets:
+                state_payload = dataset["state"]
+                source_path = Path(str(state_payload["source_path"]))
+                dataframe = dataframe_from_payload(dataset["dataframe"])
+                loaded = load_project_from_dataframe(
+                    dataframe,
+                    source_path,
+                    int(state_payload.get("active_cycle", 1)),
+                    str(state_payload.get("control", "working")),
+                    str(state_payload["circuit"]),
+                )
+                restored = load_project_file(
+                    loaded.state,
+                    dataframe,
+                    path,
+                    payload=state_payload,
+                )
+                loaded.state = restored
+                loaded.spectra = catalog_spectra(
+                    dataframe,
+                    restored.available_cycles,
+                    restored.control,
+                    {
+                        cycle_number: cycle.custom_metadata
+                        for cycle_number, cycle in restored.cycles.items()
+                    },
+                )
+                restored_projects.append(
+                    (str(dataset["dataset_id"]), loaded, restored)
+                )
+            if not restored_projects:
+                raise ValueError("The project contains no embedded datasets")
+            return restored_projects
+        source_path = Path(str(payload["source_path"]))
+        if not source_path.is_absolute():
+            source_path = (path.parent / source_path).resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(
+                f"The source data file saved in this project was not found: {source_path}"
+            )
+        circuit = str(payload["circuit"])
+        control = str(payload.get("control", "cell"))
+        active_cycle = int(payload.get("active_cycle", 1))
+        report = load_projects([source_path], control, circuit, active_cycle)
+        if report.errors:
+            raise ValueError(report.errors[0][1])
+        if not report.loaded:
+            raise ValueError(f"No spectra could be loaded from {source_path.name}")
+        dataset_id, loaded = report.loaded[0]
+        restored = load_project_file(loaded.state, loaded.dataframe, path)
+        loaded.state = restored
+        loaded.spectra = catalog_spectra(
+            loaded.dataframe,
             restored.available_cycles,
             restored.control,
             {
@@ -3451,8 +4194,21 @@ class EISApplication:
                 for cycle_number, cycle in restored.cycles.items()
             },
         )
-        if self.current_dataset_id is not None:
-            self.loaded_projects[self.current_dataset_id] = self.loaded
+        return [(dataset_id, loaded, restored)]
+
+    def _finish_project_load(
+        self,
+        result: list[tuple[str, LoadedProject, ProjectState]],
+        path: Path,
+    ) -> None:
+        self.loaded_projects.clear()
+        self._dataset_order.clear()
+        for dataset_id, loaded, _restored in result:
+            self._register_dataset(dataset_id, loaded)
+        dataset_id, loaded, restored = result[0]
+        self.current_dataset_id = dataset_id
+        self.loaded = loaded
+        self.state = restored
         self.control = restored.control
         self.circuit = restored.circuit
         self.model_var.set(restored.circuit)
@@ -3518,6 +4274,158 @@ class EISApplication:
             for item in selected_items
             for dataset_id, loaded, spectrum in [self._explorer_rows[item]]
         ]
+
+    def _selected_project_batches(self) -> dict[str, tuple[LoadedProject, ProjectState]]:
+        grouped_rows: dict[str, tuple[LoadedProject, list[int]]] = {}
+        for dataset_id, loaded, spectrum in self._selected_spectrum_rows():
+            if dataset_id not in grouped_rows:
+                grouped_rows[dataset_id] = (loaded, [])
+            grouped_rows[dataset_id][1].append(spectrum.cycle)
+        batches: dict[str, tuple[LoadedProject, ProjectState]] = {}
+        for dataset_id, (loaded, cycle_numbers) in grouped_rows.items():
+            unique_cycles = list(dict.fromkeys(cycle_numbers))
+            batches[dataset_id] = (
+                loaded,
+                ProjectState(
+                    source_path=loaded.state.source_path,
+                    circuit=loaded.state.circuit,
+                    control=loaded.state.control,
+                    available_cycles=unique_cycles,
+                    active_cycle=unique_cycles[0],
+                    default_parameters=loaded.state.default_parameters,
+                    cycles={
+                        cycle_number: self._loaded_cycle_for_popup(loaded, cycle_number)
+                        for cycle_number in unique_cycles
+                    },
+                    all_frequency_window=loaded.state.all_frequency_window,
+                ),
+            )
+        return batches
+
+    def _cached_ridge_analysis(
+        self,
+        cycle,
+        threshold: float,
+        parameters: list[ParameterValue],
+    ) -> RidgeInitialization | None:
+        parameter_names = [parameter.name for parameter in parameters]
+        if not cycle.ridge_cache_matches(threshold, parameter_names):
+            return None
+        return RidgeInitialization(
+            outlier_indices=cycle.saved_ridge_outlier_indices.copy(),
+            parameters=[
+                ParameterValue(
+                    value.name,
+                    value.unit,
+                    value.initial,
+                    value.lower,
+                    value.upper,
+                    value.error_percent,
+                    value.fixed,
+                )
+                for value in cycle.saved_ridge_parameters
+            ],
+            peak_count=int(cycle.saved_ridge_peak_count or 0),
+            ohmic_resistance=float(cycle.saved_ridge_ohmic_resistance or 0.0),
+            inductance=float(cycle.saved_ridge_inductance or 0.0),
+            ridge_tau_s=cycle.saved_ridge_tau_s.copy(),
+            ridge_gamma_ohm=cycle.saved_ridge_gamma_ohm.copy(),
+        )
+
+    def _require_threshold_value(self) -> float:
+        return float(self.threshold_var.get())
+
+    def _selected_drt_mode(self) -> str:
+        return "hybrid" if self.drt_mode_var.get() == "Hybrid DRT" else "ridge"
+
+    def _apply_saved_drt_mode(self, cycle) -> tuple[np.ndarray | None, np.ndarray | None, str]:
+        mode = self._selected_drt_mode()
+        if mode == "hybrid":
+            if cycle.saved_hybrid_tau_s is not None and cycle.saved_hybrid_gamma_ohm is not None:
+                cycle.show_hybrid_drt()
+                return cycle.ridge_tau_s, cycle.ridge_gamma_ohm, "Hybrid DRT"
+            cycle.ridge_tau_s = None
+            cycle.ridge_gamma_ohm = None
+            return None, None, "Hybrid DRT (not saved)"
+        if cycle.saved_ridge_tau_s is not None and cycle.saved_ridge_gamma_ohm is not None:
+            cycle.show_ridge_drt()
+            return cycle.ridge_tau_s, cycle.ridge_gamma_ohm, "Ridge DRT"
+        cycle.ridge_tau_s = None
+        cycle.ridge_gamma_ohm = None
+        return None, None, "Ridge DRT (not saved)"
+
+    def _ensure_current_drt_mode(self) -> None:
+        if self.state is None or not self._capture_controls():
+            return
+        cycle = self.state.active
+        mode = self._selected_drt_mode()
+        if mode == "ridge":
+            threshold = self._require_threshold_value()
+            parameters = self.state.parameters_for(cycle.cycle)
+            cached = self._cached_ridge_analysis(cycle, threshold, parameters)
+            if cached is not None:
+                cycle.store_ridge_analysis(
+                    threshold,
+                    cached.outlier_indices,
+                    cached.parameters,
+                    cached.peak_count,
+                    cached.ohmic_resistance,
+                    cached.inductance,
+                    cached.ridge_tau_s,
+                    cached.ridge_gamma_ohm,
+                )
+                self._refresh_plot(rescale=True)
+                self._update_status("displaying saved ridge DRT")
+                return
+            cycle_number = cycle.cycle
+            self.status_var.set(f"Cycle {cycle_number} · calculating ridge DRT...")
+            self._submit(
+                lambda: analyze_outliers(cycle, threshold, parameters),
+                lambda analysis: self._finish_ridge_drt(cycle_number, analysis),
+                "Ridge DRT calculation failed",
+            )
+            return
+        if cycle.hybrid_cache_matches():
+            cycle.show_hybrid_drt()
+            self._refresh_plot(rescale=True)
+            self._update_status("displaying saved hybrid DRT")
+            return
+        cycle_number = cycle.cycle
+        self.status_var.set(f"Cycle {cycle_number} · calculating hybrid DRT...")
+        self._submit(
+            lambda: calculate_hybrid_drt(cycle),
+            lambda result: self._finish_hybrid_drt(cycle_number, result),
+            "Hybrid DRT calculation failed",
+        )
+
+    def _ensure_kk_residuals(self) -> None:
+        if self.state is None or not self.show_kk_var.get():
+            return
+        cycle = self.state.active
+        if cycle.kk_cache_matches():
+            self._refresh_plot(rescale=True)
+            self._update_status("displaying saved Lin-KK residuals")
+            return
+        cycle_number = cycle.cycle
+        self.status_var.set(f"Cycle {cycle_number} · calculating Lin-KK residuals...")
+        self._submit(
+            lambda: calculate_lin_kk_residuals(cycle),
+            lambda result: self._finish_kk_residuals(cycle_number, result),
+            "Lin-KK calculation failed",
+        )
+
+    def _finish_kk_residuals(self, cycle_number: int, result: KKResiduals) -> None:
+        if self.state is None:
+            return
+        cycle = self.state.cycles[cycle_number]
+        cycle.store_kk_result(
+            result.fit_impedance,
+            result.residual_real,
+            result.residual_imag,
+        )
+        if self.state.active_cycle == cycle_number:
+            self._refresh_plot(rescale=True)
+            self._update_status("Lin-KK residuals calculated")
 
     def export_fits(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
@@ -3650,6 +4558,58 @@ class EISApplication:
             f"exported {count} selected fitted spectra and opened "
             f"{script_path.name} in {editor}"
         )
+
+    def export_drts(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export saved DRTs",
+            initialdir=str(self._current_directory()),
+            initialfile=f"{self._current_stem()}_drts.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not selected:
+            return
+        try:
+            count = export_drts_for_states(self._all_export_states(), Path(selected))
+        except Exception as error:
+            messagebox.showerror(
+                "DRT export failed",
+                f"{type(error).__name__}: {error}",
+                parent=self.root,
+            )
+            return
+        self._update_status(f"exported {count} saved DRT points")
+
+    def export_selected_drts(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        states = self._selected_export_states()
+        if not states:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        selected = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export saved DRTs for selected spectra",
+            initialdir=str(self._current_directory()),
+            initialfile=f"{self._current_stem()}_selected_drts.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv")],
+        )
+        if not selected:
+            return
+        try:
+            count = export_drts_for_states(states, Path(selected))
+        except Exception as error:
+            messagebox.showerror(
+                "Selected DRT export failed",
+                f"{type(error).__name__}: {error}",
+                parent=self.root,
+            )
+            return
+        self._update_status(f"exported {count} saved DRT points for selected spectra")
 
     @staticmethod
     def _open_python_script(path: Path) -> str:

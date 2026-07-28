@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from io import StringIO
 import json
 import re
 from pathlib import Path
@@ -12,7 +13,7 @@ from wepy.eis import capacitance as cpe_capacitance
 from wepy.eis import tau as cpe_tau
 
 PROJECT_FORMAT = "eis-fitting-project"
-PROJECT_VERSION = 1
+PROJECT_VERSION = 3
 
 
 def _parameter_to_dict(parameter: ParameterValue) -> dict[str, object]:
@@ -151,12 +152,55 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
             else None
         ),
         "drt_label": cycle.drt_label,
+        "saved_ridge_tau_s": (
+            cycle.saved_ridge_tau_s.tolist()
+            if cycle.saved_ridge_tau_s is not None
+            else None
+        ),
+        "saved_ridge_gamma_ohm": (
+            cycle.saved_ridge_gamma_ohm.tolist()
+            if cycle.saved_ridge_gamma_ohm is not None
+            else None
+        ),
+        "saved_ridge_included_mask": (
+            cycle.saved_ridge_included_mask.astype(bool).tolist()
+            if cycle.saved_ridge_included_mask is not None
+            else None
+        ),
+        "saved_ridge_outlier_indices": (
+            cycle.saved_ridge_outlier_indices.tolist()
+            if cycle.saved_ridge_outlier_indices is not None
+            else None
+        ),
+        "saved_ridge_parameters": [
+            _parameter_to_dict(value) for value in cycle.saved_ridge_parameters
+        ],
+        "saved_ridge_threshold": cycle.saved_ridge_threshold,
+        "saved_ridge_peak_count": cycle.saved_ridge_peak_count,
+        "saved_ridge_ohmic_resistance": cycle.saved_ridge_ohmic_resistance,
+        "saved_ridge_inductance": cycle.saved_ridge_inductance,
+        "saved_hybrid_tau_s": (
+            cycle.saved_hybrid_tau_s.tolist()
+            if cycle.saved_hybrid_tau_s is not None
+            else None
+        ),
+        "saved_hybrid_gamma_ohm": (
+            cycle.saved_hybrid_gamma_ohm.tolist()
+            if cycle.saved_hybrid_gamma_ohm is not None
+            else None
+        ),
+        "saved_hybrid_included_mask": (
+            cycle.saved_hybrid_included_mask.astype(bool).tolist()
+            if cycle.saved_hybrid_included_mask is not None
+            else None
+        ),
+        "saved_hybrid_ohmic_resistance": cycle.saved_hybrid_ohmic_resistance,
         "custom_metadata": dict(cycle.custom_metadata),
     }
 
 
-def save_project_file(state: ProjectState, path: Path) -> None:
-    payload = {
+def _state_to_payload(state: ProjectState) -> dict[str, object]:
+    return {
         "format": PROJECT_FORMAT,
         "version": PROJECT_VERSION,
         "source_path": str(state.source_path),
@@ -176,6 +220,33 @@ def save_project_file(state: ProjectState, path: Path) -> None:
             for cycle_number, cycle in sorted(state.cycles.items())
         },
     }
+
+
+def _dataframe_to_payload(dataframe) -> str:
+    return dataframe.to_json(orient="split", date_format="iso")
+
+
+def dataframe_from_payload(payload: str):
+    import pandas as pd
+
+    return pd.read_json(StringIO(payload), orient="split")
+
+
+def save_project_file(
+    state: ProjectState,
+    path: Path,
+    datasets: list[tuple[str, ProjectState, object]] | None = None,
+) -> None:
+    payload = _state_to_payload(state)
+    if datasets:
+        payload["datasets"] = [
+            {
+                "dataset_id": dataset_id,
+                "state": _state_to_payload(dataset_state),
+                "dataframe": _dataframe_to_payload(dataframe),
+            }
+            for dataset_id, dataset_state, dataframe in datasets
+        ]
     temporary = path.with_suffix(f"{path.suffix}.tmp")
     temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     temporary.replace(path)
@@ -185,13 +256,16 @@ def load_project_file(
     current: ProjectState,
     dataframe,
     path: Path,
+    payload: dict[str, object] | None = None,
 ) -> ProjectState:
     from eis_services import load_cycle
 
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload is None:
+        payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("format") != PROJECT_FORMAT:
         raise ValueError("This is not an EIS fitting project file")
-    if int(payload.get("version", 0)) != PROJECT_VERSION:
+    version = int(payload.get("version", 0))
+    if version not in {1, 2, PROJECT_VERSION}:
         raise ValueError(f"Unsupported project version: {payload.get('version')}")
 
     circuit = str(payload["circuit"])
@@ -264,6 +338,56 @@ def load_project_file(
         cycle.drt_label = (
             str(saved["drt_label"]) if saved.get("drt_label") is not None else None
         )
+        cycle.saved_ridge_tau_s = _optional_array(saved.get("saved_ridge_tau_s"))
+        cycle.saved_ridge_gamma_ohm = _optional_array(
+            saved.get("saved_ridge_gamma_ohm")
+        )
+        cycle.saved_ridge_included_mask = _optional_array(
+            saved.get("saved_ridge_included_mask")
+        )
+        cycle.saved_ridge_outlier_indices = _optional_array(
+            saved.get("saved_ridge_outlier_indices")
+        )
+        cycle.saved_ridge_parameters = [
+            _parameter_from_dict(value)
+            for value in saved.get("saved_ridge_parameters", [])
+        ]
+        cycle.saved_ridge_threshold = (
+            float(saved["saved_ridge_threshold"])
+            if saved.get("saved_ridge_threshold") is not None
+            else None
+        )
+        cycle.saved_ridge_peak_count = (
+            int(saved["saved_ridge_peak_count"])
+            if saved.get("saved_ridge_peak_count") is not None
+            else None
+        )
+        cycle.saved_ridge_ohmic_resistance = (
+            float(saved["saved_ridge_ohmic_resistance"])
+            if saved.get("saved_ridge_ohmic_resistance") is not None
+            else None
+        )
+        cycle.saved_ridge_inductance = (
+            float(saved["saved_ridge_inductance"])
+            if saved.get("saved_ridge_inductance") is not None
+            else None
+        )
+        cycle.saved_hybrid_tau_s = _optional_array(saved.get("saved_hybrid_tau_s"))
+        cycle.saved_hybrid_gamma_ohm = _optional_array(
+            saved.get("saved_hybrid_gamma_ohm")
+        )
+        cycle.saved_hybrid_included_mask = _optional_array(
+            saved.get("saved_hybrid_included_mask")
+        )
+        cycle.saved_hybrid_ohmic_resistance = (
+            float(saved["saved_hybrid_ohmic_resistance"])
+            if saved.get("saved_hybrid_ohmic_resistance") is not None
+            else None
+        )
+        if cycle.drt_label == "Hybrid DRT" and cycle.saved_hybrid_tau_s is not None:
+            cycle.show_hybrid_drt()
+        elif cycle.drt_label == "Ridge DRT" and cycle.saved_ridge_tau_s is not None:
+            cycle.show_ridge_drt()
         cycle.custom_metadata = dict(saved.get("custom_metadata", {}))
         restored_cycles[cycle_number] = cycle
 
@@ -546,3 +670,78 @@ print(fit_data.head())
 """
     script_path.write_text(script, encoding="utf-8")
     return len(fitted), script_path
+
+
+def export_drts_for_states(
+    states: list[ProjectState],
+    path: Path,
+) -> int:
+    fieldnames = [
+        "source_file",
+        "source_path",
+        "cycle",
+        "circuit",
+        "potential_V",
+        "current_mA",
+        "drt_method",
+        "point_index",
+        "tau_s",
+        "gamma_ohm",
+        "ohmic_resistance_ohm",
+        "ridge_threshold",
+    ]
+    rows: list[dict[str, object]] = []
+    for state in states:
+        for cycle_number, cycle in sorted(state.cycles.items()):
+            for method, tau_values, gamma_values, ohmic_resistance, threshold in (
+                (
+                    "ridge",
+                    cycle.saved_ridge_tau_s,
+                    cycle.saved_ridge_gamma_ohm,
+                    cycle.saved_ridge_ohmic_resistance,
+                    cycle.saved_ridge_threshold,
+                ),
+                (
+                    "hybrid",
+                    cycle.saved_hybrid_tau_s,
+                    cycle.saved_hybrid_gamma_ohm,
+                    cycle.saved_hybrid_ohmic_resistance,
+                    None,
+                ),
+            ):
+                if tau_values is None or gamma_values is None:
+                    continue
+                tau_values = as_1d_array(tau_values).astype(float)
+                gamma_values = as_1d_array(gamma_values).astype(float)
+                if tau_values.size != gamma_values.size:
+                    raise ValueError(
+                        f"Cycle {cycle_number} in {state.source_path.name} has "
+                        f"an invalid saved {method} DRT"
+                    )
+                for point_index, (tau_s, gamma_ohm) in enumerate(
+                    zip(tau_values, gamma_values),
+                    start=1,
+                ):
+                    rows.append(
+                        {
+                            "source_file": state.source_path.name,
+                            "source_path": str(state.source_path),
+                            "cycle": cycle_number,
+                            "circuit": state.circuit,
+                            "potential_V": cycle.potential_v,
+                            "current_mA": cycle.current_ma,
+                            "drt_method": method,
+                            "point_index": point_index,
+                            "tau_s": float(tau_s),
+                            "gamma_ohm": float(gamma_ohm),
+                            "ohmic_resistance_ohm": ohmic_resistance,
+                            "ridge_threshold": threshold,
+                        }
+                    )
+    if not rows:
+        raise ValueError("No saved DRTs are available to export")
+    with path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)

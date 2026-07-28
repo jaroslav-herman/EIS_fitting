@@ -74,6 +74,13 @@ class DRTComputation:
 
 
 @dataclass
+class KKResiduals:
+    fit_impedance: np.ndarray
+    residual_real: np.ndarray
+    residual_imag: np.ndarray
+
+
+@dataclass
 class BatchCycleFit:
     cycle: CycleState
     parameters: list[ParameterValue]
@@ -202,12 +209,22 @@ def _cycle_custom_metadata(dataframe, cycle: int, spectrum_kind: str) -> dict[st
     rows = dataframe["freq_hz"] != 0
     if "cycle_number" in dataframe.columns:
         rows &= dataframe["cycle_number"] == cycle
-    return {
-        SPECTRUM_METADATA_COLUMN: SPECTRUM_KIND_LABELS.get(spectrum_kind, spectrum_kind.title()),
-        WORKING_POTENTIAL_COLUMN: _mean_if_present(dataframe, rows, "ewe_v"),
-        COUNTER_POTENTIAL_COLUMN: _mean_if_present(dataframe, rows, "ece_v"),
-        CELL_POTENTIAL_COLUMN: _mean_if_present(dataframe, rows, "ewe_ece_v"),
+    metadata = {
+        SPECTRUM_METADATA_COLUMN: SPECTRUM_KIND_LABELS.get(
+            spectrum_kind, spectrum_kind.title()
+        ),
     }
+    if spectrum_kind == "working" and "ewe_ece_v" not in dataframe.columns:
+        metadata[CELL_POTENTIAL_COLUMN] = _mean_if_present(dataframe, rows, "ewe_v")
+        return metadata
+    metadata.update(
+        {
+            WORKING_POTENTIAL_COLUMN: _mean_if_present(dataframe, rows, "ewe_v"),
+            COUNTER_POTENTIAL_COLUMN: _mean_if_present(dataframe, rows, "ece_v"),
+            CELL_POTENTIAL_COLUMN: _mean_if_present(dataframe, rows, "ewe_ece_v"),
+        }
+    )
+    return metadata
 
 
 def _dataset_id(path: Path, spectrum_kind: str) -> str:
@@ -369,6 +386,51 @@ def load_projects_for_file(
             )
         )
     return projects
+
+
+def load_project_from_dataframe(
+    dataframe,
+    source_path: Path,
+    cycle: int,
+    control: str,
+    circuit: str,
+    technique: str = "Saved project",
+) -> LoadedProject:
+    spectrum_kind = _normalize_spectrum_kind(control)
+    if "freq_hz" not in dataframe.columns:
+        raise KeyError("The saved data has no 'freq_hz' column")
+    cycles = (
+        _safe_unique_ints(dataframe["cycle_number"].values)
+        if "cycle_number" in dataframe.columns
+        else [cycle]
+    )
+    if not cycles:
+        raise ValueError("No cycles were found in the saved data")
+    active_cycle = cycle if cycle in cycles else cycles[0]
+    parameters = circuit_parameters(circuit)
+    active = load_cycle(dataframe, active_cycle, spectrum_kind)
+    active.parameters = [
+        ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper, None, p.fixed)
+        for p in parameters
+    ]
+    state = ProjectState(
+        source_path=source_path,
+        circuit=circuit,
+        control=spectrum_kind,
+        available_cycles=cycles.copy(),
+        active_cycle=active_cycle,
+        default_parameters=parameters,
+        cycles={active_cycle: active},
+    )
+    dataset_id = _dataset_id(source_path, spectrum_kind)
+    return LoadedProject(
+        dataframe=dataframe,
+        state=state,
+        technique=technique,
+        spectra=catalog_spectra(dataframe, cycles, spectrum_kind),
+        dataset_id=dataset_id,
+        dataset_label=f"{source_path.name} [{SPECTRUM_KIND_LABELS.get(spectrum_kind, spectrum_kind.title())}]",
+    )
 
 
 def load_projects(
@@ -595,6 +657,34 @@ def calculate_hybrid_drt(state: CycleState) -> DRTComputation:
         tau_s=as_1d_array(tau_s).astype(float),
         gamma_ohm=as_1d_array(gamma_ohm).astype(float),
         ohmic_resistance=float(ohmic_resistance),
+    )
+
+
+def calculate_lin_kk_residuals(state: CycleState) -> KKResiduals:
+    import impedance.validation as validation
+
+    validation.np = np
+    validation.eval_linKK.__globals__["np"] = np
+    validation.circuit_elements["np"] = np
+
+    included = state.included
+    if int(np.count_nonzero(included)) < 3:
+        raise ValueError("At least three active points are required for Lin-KK")
+    frequency = state.frequency_hz[included]
+    impedance = state.impedance[included]
+    frequency, impedance = sort_spectrum(
+        as_1d_array(frequency),
+        as_1d_array(impedance),
+    )
+    _M, _mu, fit_impedance, residual_real, residual_imag = validation.linKK(
+        frequency,
+        impedance,
+        fit_type="complex",
+    )
+    return KKResiduals(
+        fit_impedance=as_1d_array(fit_impedance),
+        residual_real=as_1d_array(residual_real).astype(float),
+        residual_imag=as_1d_array(residual_imag).astype(float),
     )
 
 
