@@ -307,13 +307,13 @@ class EISApplication:
         self.root.bind("<Control-s>", lambda _event: self.save_project())
         self.root.bind("<Control-Shift-O>", lambda _event: self.load_project())
         self.root.bind("<Control-o>", lambda _event: self.import_data())
-        self.root.bind("<Alt-a>", lambda _event: self.copy_neighbor_fit(-1))
-        self.root.bind("<Alt-d>", lambda _event: self.copy_neighbor_fit(1))
-        self.root.bind("<Alt-Shift-a>", lambda _event: self.copy_neighbor_fit_settings(-1))
-        self.root.bind("<Alt-Shift-d>", lambda _event: self.copy_neighbor_fit_settings(1))
+        self.root.bind("<Alt-a>", self._on_alt_a)
+        self.root.bind("<Alt-A>", self._on_alt_a)
+        self.root.bind("<Alt-d>", self._on_alt_d)
+        self.root.bind("<Alt-D>", self._on_alt_d)
         self.root.bind("<Alt-e>", self.toggle_point_edit_mode)
-        self.root.bind("<Alt-s>", lambda _event: self.fit())
-        self.root.bind("<Alt-Shift-s>", lambda _event: self.initialize_and_fit())
+        self.root.bind("<Alt-s>", self._on_alt_s)
+        self.root.bind("<Alt-S>", self._on_alt_s)
         if self.path is not None:
             self.root.after(30, self._begin_loading)
         else:
@@ -1359,6 +1359,27 @@ class EISApplication:
             self.export_menu.tk_popup(x_position, y_position)
         finally:
             self.export_menu.grab_release()
+        return "break"
+
+    def _on_alt_a(self, event):
+        if event.state & 0x0001 or event.keysym == "A":
+            self.copy_neighbor_fit_settings(-1)
+        else:
+            self.copy_neighbor_fit(-1)
+        return "break"
+
+    def _on_alt_d(self, event):
+        if event.state & 0x0001 or event.keysym == "D":
+            self.copy_neighbor_fit_settings(1)
+        else:
+            self.copy_neighbor_fit(1)
+        return "break"
+
+    def _on_alt_s(self, event):
+        if event.state & 0x0001 or event.keysym == "S":
+            self.initialize_and_fit()
+        else:
+            self.fit()
         return "break"
 
     def _on_drt_mode_selected(self, _event=None):
