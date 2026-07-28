@@ -80,6 +80,7 @@ class CycleState:
     kk_residual_imag: np.ndarray | None = None
     kk_included_mask: np.ndarray | None = None
     custom_metadata: dict[str, object] = field(default_factory=dict)
+    circuit: str | None = None
 
     def __post_init__(self) -> None:
         self.frequency_hz = as_1d_array(self.frequency_hz)
@@ -121,6 +122,9 @@ class CycleState:
             return mask
         minimum, maximum = sorted(self.frequency_window)
         return mask & (self.frequency_hz >= minimum) & (self.frequency_hz <= maximum)
+
+    def model(self, fallback: str) -> str:
+        return self.circuit or fallback
 
     def toggle_point(self, index: int) -> None:
         if not 0 <= index < self.frequency_hz.size:
@@ -336,18 +340,12 @@ class ProjectState:
         circuit: str,
         parameters: list[ParameterValue],
     ) -> None:
-        self.circuit = circuit
-        self.default_parameters = [
+        self.active.circuit = circuit
+        self.active.parameters = [
             ParameterValue(
                 p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent, p.fixed
             )
             for p in parameters
         ]
-        for cycle in self.cycles.values():
-            cycle.parameters = [
-                ParameterValue(
-                    p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent, p.fixed
-                )
-                for p in parameters
-            ]
-            cycle.clear_fit()
+        self.active.clear_fit()
+        self.active.invalidate_drt_cache()

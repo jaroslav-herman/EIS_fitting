@@ -127,6 +127,7 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
             "imaginary": cycle.fit_at_data_impedance.imag.tolist(),
         }
     return {
+        "circuit": cycle.circuit,
         "frequency_window": (
             list(cycle.frequency_window) if cycle.frequency_window is not None else None
         ),
@@ -278,6 +279,7 @@ def load_project_file(
         if cycle_number not in available:
             continue
         cycle = load_cycle(dataframe, cycle_number, control)
+        cycle.circuit = str(saved.get("circuit") or circuit)
         included = as_1d_array(saved["manually_included"]).astype(bool)
         outliers = as_1d_array(saved.get("outliers", [])).astype(bool)
         if included.size != cycle.frequency_hz.size:
@@ -399,6 +401,7 @@ def load_project_file(
     )
     if active_cycle not in restored_cycles:
         active = load_cycle(dataframe, active_cycle, control)
+        active.circuit = circuit
         active.parameters = [
             ParameterValue(
                 p.name,
@@ -463,7 +466,7 @@ def export_fit_parameters_for_states(
             column
             for state, cycle in fitted
             for column in _derived_block_columns(
-                state.circuit, [parameter.name for parameter in cycle.parameters]
+                cycle.model(state.circuit), [parameter.name for parameter in cycle.parameters]
             )
         )
     )
@@ -494,7 +497,7 @@ def export_fit_parameters_for_states(
                 "source_file": state.source_path.name,
                 "source_path": str(state.source_path),
                 "cycle": cycle.cycle,
-                "circuit": state.circuit,
+                "circuit": cycle.model(state.circuit),
                 "potential_V": cycle.potential_v,
                 "current_mA": cycle.current_ma,
                 "included_points": int(np.count_nonzero(cycle.included)),
@@ -511,7 +514,7 @@ def export_fit_parameters_for_states(
                     for name in parameter_names
                 }
             )
-            row.update(_derived_block_values(state.circuit, cycle_names, values))
+            row.update(_derived_block_values(cycle.model(state.circuit), cycle_names, values))
             writer.writerow(row)
     return len(fitted)
 
@@ -544,7 +547,7 @@ def export_python_workspace(
             column
             for state, cycle in fitted
             for column in _derived_block_columns(
-                state.circuit, [parameter.name for parameter in cycle.parameters]
+                cycle.model(state.circuit), [parameter.name for parameter in cycle.parameters]
             )
         )
     )
@@ -586,7 +589,7 @@ def export_python_workspace(
                 "source_file": state.source_path.name,
                 "source_path": str(state.source_path),
                 "cycle": cycle.cycle,
-                "circuit": state.circuit,
+                "circuit": cycle.model(state.circuit),
                 "potential_V": cycle.potential_v,
                 "current_mA": cycle.current_ma,
                 "total_points": int(cycle.frequency_hz.size),
@@ -610,7 +613,7 @@ def export_python_workspace(
             )
             row.update(
                 _derived_block_values(
-                    state.circuit,
+                    cycle.model(state.circuit),
                     cycle_names,
                     values,
                 )
@@ -727,7 +730,7 @@ def export_drts_for_states(
                             "source_file": state.source_path.name,
                             "source_path": str(state.source_path),
                             "cycle": cycle_number,
-                            "circuit": state.circuit,
+                            "circuit": cycle.model(state.circuit),
                             "potential_V": cycle.potential_v,
                             "current_mA": cycle.current_ma,
                             "drt_method": method,

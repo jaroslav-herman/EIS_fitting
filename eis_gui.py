@@ -73,13 +73,13 @@ class ParameterTable(ttk.Frame):
                 tk.StringVar,
             ]
         ] = []
-        headers = ("Parameter", "Error (%)", "Fix", "Initial", "Lower", "Upper")
+        headers = ("Parameter", "Fix", "Initial", "Error (%)", "Lower", "Upper")
         for column, text in enumerate(headers):
             ttk.Label(self, text=text, style="Heading.TLabel").grid(
                 row=0, column=column, padx=3, pady=(0, 4), sticky="ew"
             )
         for column in range(6):
-            self.columnconfigure(column, weight=1 if column >= 3 else 0)
+            self.columnconfigure(column, weight=1 if column >= 2 else 0)
 
     def set_parameters(self, parameters: list[ParameterValue]) -> None:
         for child in self.grid_slaves():
@@ -92,6 +92,12 @@ class ParameterTable(ttk.Frame):
             lower = tk.StringVar(value=f"{parameter.lower:g}")
             upper = tk.StringVar(value=f"{parameter.upper:g}")
             ttk.Label(self, text=parameter.name).grid(row=row, column=0, padx=3, pady=2)
+            ttk.Checkbutton(self, variable=fixed).grid(
+                row=row, column=1, padx=3, pady=2
+            )
+            ttk.Entry(self, textvariable=initial, width=10).grid(
+                row=row, column=2, padx=3, pady=2, sticky="ew"
+            )
             error_text, error_color = self._format_error(parameter.error_percent)
             tk.Label(
                 self,
@@ -100,11 +106,8 @@ class ParameterTable(ttk.Frame):
                 relief=tk.SOLID,
                 borderwidth=1,
                 width=10,
-            ).grid(row=row, column=1, padx=3, pady=2, sticky="ew")
-            ttk.Checkbutton(self, variable=fixed).grid(
-                row=row, column=2, padx=3, pady=2
-            )
-            for column, variable in enumerate((initial, lower, upper), start=3):
+            ).grid(row=row, column=3, padx=3, pady=2, sticky="ew")
+            for column, variable in enumerate((lower, upper), start=4):
                 ttk.Entry(self, textvariable=variable, width=10).grid(
                     row=row, column=column, padx=3, pady=2, sticky="ew"
                 )
@@ -380,6 +383,10 @@ class EISApplication:
             command=self.batch_fit_selected,
         )
         self.fit_menu.add_command(
+            label="Batch fit selected up",
+            command=lambda: self.batch_fit_selected(-1),
+        )
+        self.fit_menu.add_command(
             label="Batch up",
             command=lambda: self.batch_fit_explorer(-1),
         )
@@ -426,6 +433,7 @@ class EISApplication:
             "Fit selected spectrum",
             "Batch down",
             "Batch fit selected",
+            "Batch fit selected up",
             "Batch up",
             "Batch down to metadata value…",
             "Batch up to metadata value…",
@@ -1470,18 +1478,52 @@ class EISApplication:
             model_group, text="Set model", command=self.apply_model
         )
         self.model_button.grid(row=0, column=1)
+        self.model_selected_button = ttk.Button(
+            model_group,
+            text="Set model for selected",
+            command=self.apply_model_to_selected,
+        )
+        self.model_selected_button.grid(row=0, column=2, padx=(5, 0))
 
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
         parameters_group.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         parent.rowconfigure(1, weight=1)
         self.parameter_table = ParameterTable(parameters_group)
         self.parameter_table.pack(fill=tk.BOTH, expand=True)
+        parameter_actions = ttk.Frame(parameters_group)
+        parameter_actions.pack(fill=tk.X, pady=(8, 0))
+        for column in range(2):
+            parameter_actions.columnconfigure(column, weight=1)
         self.parameters_selected_button = ttk.Button(
-            parameters_group,
-            text="Apply parameters to selected spectra",
+            parameter_actions,
+            text="Apply all to selected",
             command=self.apply_parameters_to_selected,
         )
-        self.parameters_selected_button.pack(fill=tk.X, pady=(8, 0))
+        self.parameters_selected_button.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.apply_fix_selected_button = ttk.Button(
+            parameter_actions,
+            text="Apply Fix",
+            command=lambda: self.apply_parameters_to_selected({"fixed"}),
+        )
+        self.apply_fix_selected_button.grid(row=1, column=0, padx=(0, 3), pady=(4, 0), sticky="ew")
+        self.apply_initial_selected_button = ttk.Button(
+            parameter_actions,
+            text="Apply Initial",
+            command=lambda: self.apply_parameters_to_selected({"initial"}),
+        )
+        self.apply_initial_selected_button.grid(row=1, column=1, padx=(3, 0), pady=(4, 0), sticky="ew")
+        self.apply_lower_selected_button = ttk.Button(
+            parameter_actions,
+            text="Apply Lower",
+            command=lambda: self.apply_parameters_to_selected({"lower"}),
+        )
+        self.apply_lower_selected_button.grid(row=2, column=0, padx=(0, 3), pady=(4, 0), sticky="ew")
+        self.apply_upper_selected_button = ttk.Button(
+            parameter_actions,
+            text="Apply Upper",
+            command=lambda: self.apply_parameters_to_selected({"upper"}),
+        )
+        self.apply_upper_selected_button.grid(row=2, column=1, padx=(3, 0), pady=(4, 0), sticky="ew")
 
         options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
         options_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -1625,7 +1667,12 @@ class EISApplication:
             self.frequency_button,
             self.frequency_selected_button,
             self.model_button,
+            self.model_selected_button,
             self.parameters_selected_button,
+            self.apply_fix_selected_button,
+            self.apply_initial_selected_button,
+            self.apply_lower_selected_button,
+            self.apply_upper_selected_button,
         )
         self._set_controls_enabled(False)
 
@@ -1690,6 +1737,7 @@ class EISApplication:
             if state.all_frequency_window is not None:
                 cycle.frequency_window = state.all_frequency_window
             cycle.parameters = state.parameters_for(cycle_number)
+            cycle.circuit = state.circuit
             state.cycles[cycle_number] = cycle
         state.active_cycle = cycle_number
         self.path = state.source_path.resolve()
@@ -1698,7 +1746,6 @@ class EISApplication:
         self.state = state
         self.control = state.control
         self.circuit = state.circuit
-        self.model_var.set(self.state.circuit)
         self.root.title(f"EIS Fitting — {loaded.dataset_label}")
         self.cycle_var.set(str(self.state.active_cycle))
         self._highlight_explorer_cycle(
@@ -1789,6 +1836,7 @@ class EISApplication:
             return
         cycle = self.state.active
         self.parameter_table.set_parameters(self.state.parameters_for(cycle.cycle))
+        self.model_var.set(cycle.model(self.state.circuit))
         if cycle.frequency_window is not None:
             self.minimum_frequency_var.set(f"{cycle.frequency_window[0]:g}")
             self.maximum_frequency_var.set(f"{cycle.frequency_window[1]:g}")
@@ -1819,7 +1867,10 @@ class EISApplication:
             self.state.active.invalidate_drt_cache()
         return True
 
-    def apply_parameters_to_selected(self) -> None:
+    def apply_parameters_to_selected(
+        self,
+        fields: set[str] | None = None,
+    ) -> None:
         if self.busy or self.state is None:
             return
         if not self._capture_controls():
@@ -1842,6 +1893,7 @@ class EISApplication:
         except ValueError as error:
             messagebox.showerror("Invalid parameter value", str(error), parent=self.root)
             return
+        fields = fields or {"fixed", "initial", "lower", "upper"}
         source_by_name = {parameter.name: parameter for parameter in source_parameters}
         updated = 0
         skipped = 0
@@ -1857,15 +1909,19 @@ class EISApplication:
                 if source is None:
                     copied.append(target)
                     continue
+                initial = source.initial if "initial" in fields else target.initial
+                lower = source.lower if "lower" in fields else target.lower
+                upper = source.upper if "upper" in fields else target.upper
+                fixed = source.fixed if "fixed" in fields else target.fixed
                 copied.append(
                     ParameterValue(
                         target.name,
                         target.unit,
-                        source.initial,
-                        source.lower,
-                        source.upper,
+                        initial,
+                        lower,
+                        upper,
                         target.error_percent,
-                        source.fixed,
+                        fixed,
                     )
                 )
             cycle.parameters = copied
@@ -1875,7 +1931,20 @@ class EISApplication:
         self._restore_controls()
         self._refresh_plot(rescale=True)
         suffix = f", {skipped} skipped" if skipped else ""
-        self._update_status(f"parameter settings applied to {updated} spectra{suffix}")
+        if fields == {"fixed", "initial", "lower", "upper"}:
+            action = "parameter settings"
+        else:
+            action = ", ".join(
+                label
+                for field, label in (
+                    ("fixed", "Fix"),
+                    ("initial", "Initial values"),
+                    ("lower", "Lower limits"),
+                    ("upper", "Upper limits"),
+                )
+                if field in fields
+            )
+        self._update_status(f"{action} applied to {updated} spectra{suffix}")
 
     def _refresh_plot(self, rescale: bool = False) -> None:
         if self.state is None:
@@ -1996,7 +2065,7 @@ class EISApplication:
         self.axes.set_title(
             (
                 f"{self.loaded.dataset_label if self.loaded is not None else self._current_name()}\n"
-                f"Cycle {cycle.cycle} · {self.state.circuit}"
+                f"Cycle {cycle.cycle} · {cycle.model(self.state.circuit)}"
             )
         )
         if self.drt_artist is not None and self.drt_axes is not None:
@@ -2549,6 +2618,7 @@ class EISApplication:
             if self.state.all_frequency_window is not None:
                 new_cycle.frequency_window = self.state.all_frequency_window
             new_cycle.parameters = self.state.parameters_for(cycle_number)
+            new_cycle.circuit = self.state.circuit
             self.state.cycles[cycle_number] = new_cycle
         self.state.active_cycle = cycle_number
         self.cycle_var.set(str(cycle_number))
@@ -2607,15 +2677,64 @@ class EISApplication:
                 f"{type(error).__name__}: {error}",
                 parent=self.root,
             )
-            self.model_var.set(self.state.circuit)
+            self.model_var.set(self.state.active.model(self.state.circuit))
             return
-        self.state.replace_circuit(circuit, parameters)
+        self.state.active.circuit = circuit
+        self.state.active.parameters = parameters
+        self.state.active.clear_fit()
+        self.state.active.invalidate_drt_cache()
         self.circuit = circuit
         self.parameter_table.set_parameters(
             self.state.parameters_for(self.state.active_cycle)
         )
         self._refresh_plot(rescale=True)
         self._update_status("fitting model changed")
+
+    def apply_model_to_selected(self) -> None:
+        if self.state is None or self.busy or not self._capture_controls():
+            return
+        circuit = self.model_var.get().strip()
+        if not circuit:
+            messagebox.showerror(
+                "Invalid model", "Enter a circuit model", parent=self.root
+            )
+            return
+        try:
+            parameters = circuit_parameters(circuit)
+        except Exception as error:
+            messagebox.showerror(
+                "Invalid model",
+                f"{type(error).__name__}: {error}",
+                parent=self.root,
+            )
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        updated = 0
+        for _dataset_id, loaded, spectrum in selected_rows:
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            cycle.circuit = circuit
+            cycle.parameters = [
+                ParameterValue(
+                    parameter.name,
+                    parameter.unit,
+                    parameter.initial,
+                    parameter.lower,
+                    parameter.upper,
+                    parameter.error_percent,
+                    parameter.fixed,
+                )
+                for parameter in parameters
+            ]
+            cycle.clear_fit()
+            cycle.invalidate_drt_cache()
+            updated += 1
+        self._restore_controls()
+        self._refresh_explorer_values()
+        self._refresh_plot(rescale=True)
+        self._update_status(f"model applied to {updated} selected spectra")
 
     def find_outliers(self) -> None:
         if self.state is None or not self._capture_controls():
@@ -3162,7 +3281,7 @@ class EISApplication:
         parameters = self.state.parameters_for(cycle_number)
         self.status_var.set(f"Cycle {cycle_number} · fitting…")
         self._submit(
-            lambda: fit_cycle(cycle, self.state.circuit, parameters),
+            lambda: fit_cycle(cycle, cycle.model(self.state.circuit), parameters),
             lambda result: self._finish_fit(cycle_number, parameters, result),
             "Fit failed",
         )
@@ -3320,7 +3439,7 @@ class EISApplication:
             "Explorer batch fit failed",
         )
 
-    def batch_fit_selected(self) -> None:
+    def batch_fit_selected(self, direction: int = 1) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
         visible_items = list(self.explorer.get_children(""))
@@ -3341,14 +3460,23 @@ class EISApplication:
             return
 
         start_index = visible_items.index(current_item)
-        batch_items = [
-            item
-            for item in visible_items[start_index:]
-            if item in self.explorer.selection()
-        ]
+        if direction > 0:
+            batch_items = [
+                item
+                for item in visible_items[start_index:]
+                if item in self.explorer.selection()
+            ]
+            direction_name = "downward"
+        else:
+            batch_items = [
+                item
+                for item in reversed(visible_items[: start_index + 1])
+                if item in self.explorer.selection()
+            ]
+            direction_name = "upward"
         if len(batch_items) < 2:
             self._update_status(
-                "select spectra from the displayed one downward in the explorer"
+                f"select spectra from the displayed one {direction_name} in the explorer"
             )
             return
 
@@ -3364,7 +3492,7 @@ class EISApplication:
             )
         parameters = self.state.parameters_for(self.state.active_cycle)
         self.status_var.set(
-            f"Batch fitting {len(targets)} selected spectra from the displayed one..."
+            f"Batch fitting {len(targets)} selected spectra {direction_name}..."
         )
         self._submit(
             lambda: batch_fit_spectra(targets, parameters),
@@ -3497,9 +3625,10 @@ class EISApplication:
                     spectrum.cycle,
                     loaded.state.control,
                 )
-                if loaded.state.all_frequency_window is not None:
-                    cycle.frequency_window = loaded.state.all_frequency_window
-                loaded.state.cycles[spectrum.cycle] = cycle
+            if loaded.state.all_frequency_window is not None:
+                cycle.frequency_window = loaded.state.all_frequency_window
+            cycle.circuit = loaded.state.circuit
+            loaded.state.cycles[spectrum.cycle] = cycle
             cycle.custom_metadata[column_name] = value
             spectrum.custom_metadata[column_name] = value
 
@@ -3629,6 +3758,7 @@ class EISApplication:
             if loaded.state.all_frequency_window is not None:
                 cycle.frequency_window = loaded.state.all_frequency_window
             cycle.parameters = loaded.state.parameters_for(cycle_number)
+            cycle.circuit = loaded.state.circuit
             loaded.state.cycles[cycle_number] = cycle
         return cycle
 
@@ -4181,7 +4311,11 @@ class EISApplication:
             return
         if self.state is not None and not self._capture_controls():
             return
-        circuit = self.state.circuit if self.state is not None else self.circuit
+        circuit = (
+            self.state.active.model(self.state.circuit)
+            if self.state is not None
+            else self.circuit
+        )
         control = self.state.control if self.state is not None else self.control
         self.status_var.set(f"Importing {len(new_paths)} data files…")
         self._submit(

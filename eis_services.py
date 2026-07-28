@@ -373,6 +373,7 @@ def load_projects_for_file(
             default_parameters=parameters,
             cycles={active_cycle: active},
         )
+        active.circuit = circuit
         spectra = catalog_spectra(dataframe, cycles, spectrum_kind)
         label = f"{path.name} [{SPECTRUM_KIND_LABELS.get(spectrum_kind, spectrum_kind.title())}]"
         projects.append(
@@ -422,6 +423,7 @@ def load_project_from_dataframe(
         default_parameters=parameters,
         cycles={active_cycle: active},
     )
+    active.circuit = circuit
     dataset_id = _dataset_id(source_path, spectrum_kind)
     return LoadedProject(
         dataframe=dataframe,
@@ -627,6 +629,7 @@ def find_outliers_for_all_cycles(
             cycle = load_cycle(dataframe, cycle_number, project.control)
             if project.all_frequency_window is not None:
                 cycle.frequency_window = project.all_frequency_window
+            cycle.circuit = project.circuit
         analysis = analyze_outliers(
             cycle,
             threshold,
@@ -789,10 +792,23 @@ def batch_fit_from_cycle(
             cycle = load_cycle(dataframe, cycle_number, project.control)
             if project.all_frequency_window is not None:
                 cycle.frequency_window = project.all_frequency_window
+            cycle.circuit = project.circuit
+            cycle.circuit = project.circuit
+            cycle.circuit = project.circuit
+        cycle_circuit = cycle.model(project.circuit)
+        cycle_parameters = project.parameters_for(cycle_number)
+        if [parameter.name for parameter in cycle_parameters] != [
+            parameter.name for parameter in next_parameters
+        ]:
+            return BatchFitReport(
+                fits=completed,
+                failed_cycle=cycle_number,
+                error="The spectrum uses a different fitting model",
+            )
         try:
             fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
                 cycle,
-                project.circuit,
+                cycle_circuit,
                 next_parameters,
             )
         except Exception as error:
@@ -836,7 +852,13 @@ def batch_fit_spectra(
 ) -> SpectrumBatchReport:
     if not targets:
         return SpectrumBatchReport([])
-    expected_circuit = targets[0].loaded.state.circuit
+    first_project = targets[0].loaded.state
+    first_cycle = first_project.cycles.get(targets[0].cycle)
+    expected_circuit = (
+        first_cycle.model(first_project.circuit)
+        if first_cycle is not None
+        else first_project.circuit
+    )
     expected_names = [parameter.name for parameter in initial_parameters]
     next_parameters = [
         ParameterValue(
@@ -847,23 +869,26 @@ def batch_fit_spectra(
     completed: list[SpectrumBatchFit] = []
     for target in targets:
         project = target.loaded.state
-        if project.circuit != expected_circuit:
-            return SpectrumBatchReport(
-                completed,
-                target.label,
-                "The spectrum uses a different fitting model",
-            )
-        if [parameter.name for parameter in project.default_parameters] != expected_names:
-            return SpectrumBatchReport(
-                completed,
-                target.label,
-                "The spectrum has incompatible fitting parameters",
-            )
         cycle = project.cycles.get(target.cycle)
         if cycle is None:
             cycle = load_cycle(target.loaded.dataframe, target.cycle, project.control)
             if project.all_frequency_window is not None:
                 cycle.frequency_window = project.all_frequency_window
+            cycle.circuit = project.circuit
+        target_circuit = cycle.model(project.circuit)
+        if target_circuit != expected_circuit:
+            return SpectrumBatchReport(
+                completed,
+                target.label,
+                "The spectrum uses a different fitting model",
+            )
+        target_parameters = project.parameters_for(target.cycle)
+        if [parameter.name for parameter in target_parameters] != expected_names:
+            return SpectrumBatchReport(
+                completed,
+                target.label,
+                "The spectrum has incompatible fitting parameters",
+            )
         try:
             fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
                 cycle,
