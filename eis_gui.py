@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tkinter as tk
@@ -11,6 +12,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
 
 import numpy as np
+from wepy.eis import tau as cpe_tau
 
 from eis_model import ParameterValue, ProjectState
 from eis_project import (
@@ -482,6 +484,7 @@ class EISApplication:
         self._line_collection_class = LineCollection
         self._rectangle_selector_class = RectangleSelector
         self.point_toggle_mode = False
+        self.point_auto_fit = False
         self._pan_state = None
         self.plot_controls = ttk.Frame(self.plot_frame)
         self.plot_controls.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
@@ -491,6 +494,12 @@ class EISApplication:
             command=self.toggle_point_edit_mode,
         )
         self.toggle_points_button.pack(side=tk.LEFT)
+        self.auto_fit_points_button = ttk.Button(
+            self.plot_controls,
+            text="Edit points and fit: Off",
+            command=self.toggle_auto_fit_points,
+        )
+        self.auto_fit_points_button.pack(side=tk.LEFT, padx=(6, 0))
         self.reset_view_button = ttk.Button(
             self.plot_controls,
             text="Active zoom",
@@ -836,6 +845,17 @@ class EISApplication:
             interactive=False,
         )
         self.zoom_selector.set_active(not self.point_toggle_mode)
+        self.edit_selector = self._rectangle_selector_class(
+            self.axes,
+            self._on_edit_area_select,
+            useblit=True,
+            button=[3],
+            minspanx=5,
+            minspany=5,
+            spancoords="pixels",
+            interactive=False,
+        )
+        self.edit_selector.set_active(self.point_toggle_mode)
         self.canvas.draw_idle()
 
     def _build_explorer(self, parent: ttk.Frame) -> None:
@@ -1469,6 +1489,8 @@ class EISApplication:
         model_group = ttk.LabelFrame(parent, text="Fitting model", padding=8)
         model_group.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         model_group.columnconfigure(0, weight=1)
+        model_group.columnconfigure(1, weight=1)
+        model_group.columnconfigure(2, weight=1)
         self.model_box = ttk.Combobox(
             model_group,
             textvariable=self.model_var,
@@ -1487,6 +1509,18 @@ class EISApplication:
             command=self.apply_model_to_selected,
         )
         self.model_selected_button.grid(row=0, column=2, padx=(5, 0))
+        self.sort_tau_button = ttk.Button(
+            model_group,
+            text="Sort by tau: current",
+            command=self.sort_parameters_by_tau,
+        )
+        self.sort_tau_button.grid(row=1, column=0, padx=(0, 3), pady=(5, 0), sticky="ew")
+        self.sort_tau_selected_button = ttk.Button(
+            model_group,
+            text="Sort by tau: selected",
+            command=self.sort_selected_parameters_by_tau,
+        )
+        self.sort_tau_selected_button.grid(row=1, column=1, columnspan=2, padx=(3, 0), pady=(5, 0), sticky="ew")
 
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
         parameters_group.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
@@ -1661,6 +1695,7 @@ class EISApplication:
             self.batch_fit_button,
             self.python_export_button,
             self.toggle_points_button,
+            self.auto_fit_points_button,
             self.reset_view_button,
             self.toggle_plot_mode_button,
             self.delete_spectrum_button,
@@ -1671,6 +1706,8 @@ class EISApplication:
             self.frequency_selected_button,
             self.model_button,
             self.model_selected_button,
+            self.sort_tau_button,
+            self.sort_tau_selected_button,
             self.parameters_selected_button,
             self.apply_fix_selected_button,
             self.apply_initial_selected_button,
@@ -2450,6 +2487,7 @@ class EISApplication:
         cycle.toggle_point(index)
         self._refresh_plot(rescale=True)
         self._update_status()
+        self._fit_after_point_edit()
 
     def _on_plot_button_press(self, event) -> None:
         if self.busy or self.state is None or event.button != 2 or event.inaxes is None:
@@ -2531,6 +2569,50 @@ class EISApplication:
         self.axes.set_ylim(y0, y1)
         self.canvas.draw_idle()
 
+    def _on_edit_area_select(self, press_event, release_event) -> None:
+        if (
+            not self.point_toggle_mode
+            or self.busy
+            or self.state is None
+            or press_event.inaxes is not self.axes
+            or release_event.inaxes is not self.axes
+            or press_event.xdata is None
+            or press_event.ydata is None
+            or release_event.xdata is None
+            or release_event.ydata is None
+        ):
+            return
+        x0, x1 = sorted((press_event.xdata, release_event.xdata))
+        y0, y1 = sorted((press_event.ydata, release_event.ydata))
+        cycle = self.state.active
+        if self.plot_mode == "bode":
+            x_values = cycle.frequency_hz
+            y_values = np.abs(cycle.impedance)
+        else:
+            x_values = cycle.impedance.real
+            y_values = -cycle.impedance.imag
+        selected = (
+            np.isfinite(x_values)
+            & np.isfinite(y_values)
+            & (x_values >= x0)
+            & (x_values <= x1)
+            & (y_values >= y0)
+            & (y_values <= y1)
+        )
+        if cycle.frequency_window is not None:
+            minimum, maximum = sorted(cycle.frequency_window)
+            selected &= (cycle.frequency_hz >= minimum) & (cycle.frequency_hz <= maximum)
+        indices = np.flatnonzero(selected)
+        if indices.size == 0:
+            return
+        cycle.manually_included[indices] = ~cycle.manually_included[indices]
+        cycle.outliers[indices[cycle.manually_included[indices]]] = False
+        cycle.invalidate_drt_cache()
+        cycle.clear_fit()
+        self._refresh_plot(rescale=True)
+        self._update_status(f"toggled {indices.size} points in selected area")
+        self._fit_after_point_edit()
+
     def toggle_point_edit_mode(self, _event=None) -> str | None:
         self.point_toggle_mode = not self.point_toggle_mode
         self.toggle_points_button.configure(
@@ -2538,8 +2620,28 @@ class EISApplication:
         )
         if hasattr(self, "zoom_selector"):
             self.zoom_selector.set_active(not self.point_toggle_mode)
+        if hasattr(self, "edit_selector"):
+            self.edit_selector.set_active(self.point_toggle_mode)
         self._update_status()
         return "break" if _event is not None else None
+
+    def toggle_auto_fit_points(self) -> None:
+        self.point_auto_fit = not self.point_auto_fit
+        if self.point_auto_fit and not self.point_toggle_mode:
+            self.point_toggle_mode = True
+            self.toggle_points_button.configure(text="Edit points: On")
+            if hasattr(self, "zoom_selector"):
+                self.zoom_selector.set_active(False)
+            if hasattr(self, "edit_selector"):
+                self.edit_selector.set_active(True)
+        self.auto_fit_points_button.configure(
+            text=f"Edit points and fit: {'On' if self.point_auto_fit else 'Off'}"
+        )
+        self._update_status()
+
+    def _fit_after_point_edit(self) -> None:
+        if self.point_auto_fit and not self.busy:
+            self.fit()
 
     def _update_status(self, suffix: str = "") -> None:
         if self.state is None:
@@ -2738,6 +2840,110 @@ class EISApplication:
         self._refresh_explorer_values()
         self._refresh_plot(rescale=True)
         self._update_status(f"model applied to {updated} selected spectra")
+
+    def _sort_cycle_parameters_by_tau(
+        self,
+        state: ProjectState,
+        cycle,
+    ) -> bool:
+        circuit = cycle.model(state.circuit)
+        group_ids = re.findall(r"p\(\s*R(\d+)\s*,\s*CPE\1\s*\)", circuit)
+        if len(group_ids) < 2:
+            return False
+        parameters_by_name = {parameter.name: parameter for parameter in cycle.parameters}
+        groups = []
+        for group_id in group_ids:
+            names = (f"R{group_id}", f"CPE{group_id}_0", f"CPE{group_id}_1")
+            if not all(name in parameters_by_name for name in names):
+                continue
+            try:
+                tau_value = float(
+                    cpe_tau(
+                        parameters_by_name[names[0]].initial,
+                        parameters_by_name[names[1]].initial,
+                        parameters_by_name[names[2]].initial,
+                    )
+                )
+            except (TypeError, ValueError):
+                tau_value = float("inf")
+            groups.append((group_id, tau_value))
+        if len(groups) < 2:
+            return False
+        original_parameter_names = [parameter.name for parameter in cycle.parameters]
+        ordered_groups = sorted(groups, key=lambda item: item[1])
+        if [group_id for group_id, _tau in groups] == [
+            group_id for group_id, _tau in ordered_groups
+        ]:
+            return False
+        original_parameters = dict(parameters_by_name)
+        for destination, (destination_id, _tau) in enumerate(ordered_groups):
+            source_id = groups[destination][0]
+            for suffix in ("", "_0", "_1"):
+                destination_name = (
+                    f"R{destination_id}" if suffix == "" else f"CPE{destination_id}{suffix}"
+                )
+                source_name = (
+                    f"R{source_id}" if suffix == "" else f"CPE{source_id}{suffix}"
+                )
+                source = original_parameters[source_name]
+                parameters_by_name[destination_name] = ParameterValue(
+                    destination_name,
+                    source.unit,
+                    source.initial,
+                    source.lower,
+                    source.upper,
+                    source.error_percent,
+                    source.fixed,
+                )
+        cycle.parameters = [parameters_by_name[parameter.name] for parameter in cycle.parameters]
+        if cycle.fit_parameters is not None:
+            fitted_by_name = {
+                name: float(value)
+                for name, value in zip(original_parameter_names, cycle.fit_parameters)
+            }
+            original_fitted = dict(fitted_by_name)
+            for destination, (destination_id, _tau) in enumerate(ordered_groups):
+                source_id = groups[destination][0]
+                for suffix in ("", "_0", "_1"):
+                    destination_name = (
+                        f"R{destination_id}" if suffix == "" else f"CPE{destination_id}{suffix}"
+                    )
+                    source_name = (
+                        f"R{source_id}" if suffix == "" else f"CPE{source_id}{suffix}"
+                    )
+                    fitted_by_name[destination_name] = original_fitted[source_name]
+            cycle.fit_parameters = np.asarray(
+                [fitted_by_name[parameter.name] for parameter in cycle.parameters],
+                dtype=float,
+            )
+        return True
+
+    def sort_parameters_by_tau(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        changed = self._sort_cycle_parameters_by_tau(self.state, self.state.active)
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        self._update_status(
+            "parameters sorted by tau" if changed else "parameters are already sorted by tau"
+        )
+
+    def sort_selected_parameters_by_tau(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        changed = 0
+        for _dataset_id, loaded, spectrum in selected_rows:
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            if self._sort_cycle_parameters_by_tau(loaded.state, cycle):
+                changed += 1
+        self._restore_controls()
+        self._refresh_explorer_values()
+        self._refresh_plot(rescale=True)
+        self._update_status(f"parameters sorted by tau for {changed} selected spectra")
 
     def find_outliers(self) -> None:
         if self.state is None or not self._capture_controls():

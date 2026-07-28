@@ -477,7 +477,12 @@ def export_fit_parameters_for_states(
         "circuit",
         "potential_V",
         "current_mA",
-        "included_points",
+        "total_points",
+        "active_points",
+        "minimum_frequency_Hz",
+        "maximum_frequency_Hz",
+        "active_minimum_frequency_Hz",
+        "active_maximum_frequency_Hz",
         *custom_metadata_columns,
         *parameter_columns,
         *derived_columns,
@@ -500,7 +505,20 @@ def export_fit_parameters_for_states(
                 "circuit": cycle.model(state.circuit),
                 "potential_V": cycle.potential_v,
                 "current_mA": cycle.current_ma,
-                "included_points": int(np.count_nonzero(cycle.included)),
+                "total_points": int(cycle.frequency_hz.size),
+                "active_points": int(np.count_nonzero(cycle.included)),
+                "minimum_frequency_Hz": float(np.min(cycle.frequency_hz)),
+                "maximum_frequency_Hz": float(np.max(cycle.frequency_hz)),
+                "active_minimum_frequency_Hz": (
+                    float(np.min(cycle.frequency_hz[cycle.included]))
+                    if np.any(cycle.included)
+                    else None
+                ),
+                "active_maximum_frequency_Hz": (
+                    float(np.max(cycle.frequency_hz[cycle.included]))
+                    if np.any(cycle.included)
+                    else None
+                ),
             }
             row.update({name: cycle.custom_metadata.get(name) for name in custom_metadata_columns})
             row.update(dict(zip(cycle_names, values.tolist())))
