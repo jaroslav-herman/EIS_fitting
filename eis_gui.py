@@ -1214,7 +1214,12 @@ class EISApplication:
                 marker = f" {position}{' ▼' if reverse else ' ▲'}"
             self.explorer.heading(name, text=f"{label}{marker}")
 
-    def _explorer_sort_key(loaded: LoadedProject, spectrum: SpectrumMetadata, column: str):
+    def _explorer_sort_key(
+        self,
+        loaded: LoadedProject,
+        spectrum: SpectrumMetadata,
+        column: str,
+    ):
         if column == "fitted":
             cycle = loaded.state.cycles.get(spectrum.cycle)
             return (0, 1 if cycle is not None and cycle.fit_parameters is not None else 0)
