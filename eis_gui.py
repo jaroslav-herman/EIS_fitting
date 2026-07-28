@@ -882,6 +882,7 @@ class EISApplication:
             "f_max": "maximum_frequency_hz",
         }
         self._explorer_sort_reverse: dict[str, bool] = {}
+        self._explorer_sort_columns: list[tuple[str, bool]] = []
         self._explorer_selected_column = "cycle"
         widths = {
             "fitted": 62,
@@ -916,6 +917,7 @@ class EISApplication:
         )
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.explorer.bind("<Button-1>", self._on_explorer_click, add="+")
+        self.explorer.bind("<Button-1>", self._on_explorer_heading_click, add="+")
         self.explorer.bind("<<TreeviewSelect>>", self._select_explorer_spectrum)
         self.explorer.bind("<Delete>", lambda _event: self.delete_selected_spectrum())
         self.explorer.bind("<Up>", lambda event: self._on_explorer_arrow(event, -1))
@@ -1044,11 +1046,25 @@ class EISApplication:
             self.explorer.column(column, width=widths[column], minwidth=55, anchor=anchor)
 
     @staticmethod
-    def _format_explorer_value(value) -> str:
+    def _format_explorer_value(value, column: str | None = None) -> str:
         if value is None:
             return ""
         if isinstance(value, float) and np.isnan(value):
             return ""
+        numeric_column = column in {"potential", "current", "f_min", "f_max"}
+        if column is not None:
+            numeric_column |= any(
+                keyword in column.casefold()
+                for keyword in ("potential", "voltage", "frequency")
+            )
+        if numeric_column:
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                pass
+            else:
+                if np.isfinite(numeric_value):
+                    return f"{numeric_value:.5g}"
         return str(value)
 
     def _explorer_value(
@@ -1080,10 +1096,25 @@ class EISApplication:
         if column == "points":
             return spectrum.point_count
         if column == "f_min":
-            return spectrum.minimum_frequency_hz
+            return self._explorer_frequency_range(loaded, spectrum)[0]
         if column == "f_max":
-            return spectrum.maximum_frequency_hz
+            return self._explorer_frequency_range(loaded, spectrum)[1]
         return spectrum.custom_metadata.get(column)
+
+    @staticmethod
+    def _explorer_frequency_range(
+        loaded: LoadedProject,
+        spectrum: SpectrumMetadata,
+    ) -> tuple[float, float]:
+        cycle = loaded.state.cycles.get(spectrum.cycle)
+        frequency_window = (
+            cycle.frequency_window
+            if cycle is not None and cycle.frequency_window is not None
+            else loaded.state.all_frequency_window
+        )
+        if frequency_window is not None:
+            return float(frequency_window[0]), float(frequency_window[1])
+        return spectrum.minimum_frequency_hz, spectrum.maximum_frequency_hz
 
     def _populate_explorer(self) -> None:
         self._sync_custom_metadata_columns()
@@ -1101,7 +1132,7 @@ class EISApplication:
                 self._explorer_lookup[(dataset_id, spectrum.cycle)] = item
                 values = [
                     self._format_explorer_value(
-                        self._explorer_value(loaded, spectrum, column)
+                        self._explorer_value(loaded, spectrum, column), column
                     )
                     for column in self._explorer_columns()
                 ]
@@ -1113,27 +1144,76 @@ class EISApplication:
                 )
         self._refresh_explorer_focus_tag()
         self._update_explorer_selection_status()
+        if self._explorer_sort_columns:
+            self._apply_explorer_sort()
 
     def _sort_explorer(self, column: str) -> None:
         if not self._explorer_rows:
             return
         reverse = self._explorer_sort_reverse.get(column, False)
         self._explorer_selected_column = column
-        ordered = sorted(
-            self._explorer_rows.items(),
-            key=lambda item: self._explorer_sort_key(item[1][1], item[1][2], column),
-            reverse=reverse,
-        )
-        for index, (item, _row) in enumerate(ordered):
-            self.explorer.move(item, "", index)
-        for name, label in self._explorer_headings.items():
-            marker = ""
-            if name == column:
-                marker = " ▼" if reverse else " ▲"
-            self.explorer.heading(name, text=f"{label}{marker}")
+        self._explorer_sort_columns = [(column, reverse)]
+        self._apply_explorer_sort()
         self._explorer_sort_reverse[column] = not reverse
 
-    @staticmethod
+    def _on_explorer_heading_click(self, event):
+        if self.explorer.identify_region(event.x, event.y) != "heading":
+            return
+        column_index = self.explorer.identify_column(event.x)
+        columns = list(self._explorer_columns())
+        if not column_index.startswith("#"):
+            return "break"
+        index = int(column_index[1:]) - 1
+        if index < 0 or index >= len(columns):
+            return "break"
+        column = columns[index]
+        if not self._explorer_rows:
+            return "break"
+        shift_pressed = bool(event.state & 0x0001)
+        if not shift_pressed:
+            reverse = self._explorer_sort_reverse.get(column, False)
+            self._explorer_sort_columns = [(column, reverse)]
+            self._explorer_selected_column = column
+            self._apply_explorer_sort()
+            self._explorer_sort_reverse[column] = not reverse
+            return "break"
+        existing = {name: reverse for name, reverse in self._explorer_sort_columns}
+        if column in existing:
+            reverse = not existing[column]
+            self._explorer_sort_columns = [
+                (name, reverse if name == column else current_reverse)
+                for name, current_reverse in self._explorer_sort_columns
+            ]
+        else:
+            self._explorer_sort_columns.append((column, False))
+            reverse = False
+        self._explorer_selected_column = column
+        self._apply_explorer_sort()
+        self._explorer_sort_reverse[column] = not reverse
+        return "break"
+
+    def _apply_explorer_sort(self) -> None:
+        ordered = list(self._explorer_rows.items())
+        for column, reverse in reversed(self._explorer_sort_columns):
+            ordered.sort(
+                key=lambda item, selected_column=column: self._explorer_sort_key(
+                    item[1][1], item[1][2], selected_column
+                ),
+                reverse=reverse,
+            )
+        for index, (item, _row) in enumerate(ordered):
+            self.explorer.move(item, "", index)
+        priorities = {
+            column: (position, reverse)
+            for position, (column, reverse) in enumerate(self._explorer_sort_columns, 1)
+        }
+        for name, label in self._explorer_headings.items():
+            marker = ""
+            if name in priorities:
+                position, reverse = priorities[name]
+                marker = f" {position}{' ▼' if reverse else ' ▲'}"
+            self.explorer.heading(name, text=f"{label}{marker}")
+
     def _explorer_sort_key(loaded: LoadedProject, spectrum: SpectrumMetadata, column: str):
         if column == "fitted":
             cycle = loaded.state.cycles.get(spectrum.cycle)
@@ -1158,9 +1238,9 @@ class EISApplication:
         elif column == "points":
             value = spectrum.point_count
         elif column == "f_min":
-            value = spectrum.minimum_frequency_hz
+            value = self._explorer_frequency_range(loaded, spectrum)[0]
         elif column == "f_max":
-            value = spectrum.maximum_frequency_hz
+            value = self._explorer_frequency_range(loaded, spectrum)[1]
         else:
             value = spectrum.custom_metadata.get(column)
         if value is None:
@@ -1186,7 +1266,7 @@ class EISApplication:
                 continue
             values = [
                 self._format_explorer_value(
-                    self._explorer_value(loaded, spectrum, column)
+                    self._explorer_value(loaded, spectrum, column), column
                 )
                 for column in self._explorer_columns()
             ]
@@ -1391,6 +1471,12 @@ class EISApplication:
         parent.rowconfigure(1, weight=1)
         self.parameter_table = ParameterTable(parameters_group)
         self.parameter_table.pack(fill=tk.BOTH, expand=True)
+        self.parameters_selected_button = ttk.Button(
+            parameters_group,
+            text="Apply parameters to selected spectra",
+            command=self.apply_parameters_to_selected,
+        )
+        self.parameters_selected_button.pack(fill=tk.X, pady=(8, 0))
 
         options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
         options_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -1534,6 +1620,7 @@ class EISApplication:
             self.frequency_button,
             self.frequency_selected_button,
             self.model_button,
+            self.parameters_selected_button,
         )
         self._set_controls_enabled(False)
 
@@ -1726,6 +1813,64 @@ class EISApplication:
         if previous_window != self.state.active.frequency_window:
             self.state.active.invalidate_drt_cache()
         return True
+
+    def apply_parameters_to_selected(self) -> None:
+        if self.busy or self.state is None:
+            return
+        if not self._capture_controls():
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        try:
+            source_parameters = self.parameter_table.values()
+            for parameter in source_parameters:
+                if parameter.lower > parameter.upper:
+                    raise ValueError(
+                        f"{parameter.name}: lower bound exceeds upper bound"
+                    )
+                if not parameter.lower <= parameter.initial <= parameter.upper:
+                    raise ValueError(
+                        f"{parameter.name}: initial value is outside its bounds"
+                    )
+        except ValueError as error:
+            messagebox.showerror("Invalid parameter value", str(error), parent=self.root)
+            return
+        source_by_name = {parameter.name: parameter for parameter in source_parameters}
+        updated = 0
+        skipped = 0
+        for _dataset_id, loaded, spectrum in selected_rows:
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            target_parameters = loaded.state.parameters_for(spectrum.cycle)
+            if not target_parameters:
+                skipped += 1
+                continue
+            copied = []
+            for target in target_parameters:
+                source = source_by_name.get(target.name)
+                if source is None:
+                    copied.append(target)
+                    continue
+                copied.append(
+                    ParameterValue(
+                        target.name,
+                        target.unit,
+                        source.initial,
+                        source.lower,
+                        source.upper,
+                        target.error_percent,
+                        source.fixed,
+                    )
+                )
+            cycle.parameters = copied
+            cycle.clear_fit()
+            updated += 1
+        self._refresh_explorer_values()
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        suffix = f", {skipped} skipped" if skipped else ""
+        self._update_status(f"parameter settings applied to {updated} spectra{suffix}")
 
     def _refresh_plot(self, rescale: bool = False) -> None:
         if self.state is None:
@@ -3975,7 +4120,7 @@ class EISApplication:
             for project, _cycle in plotted_cycles
             if project.spectra
         }
-        if not {"Cell", "Working electrode", "Counter electrode"}.issubset(role_names):
+        if not {"Cell", "WE", "CE"}.issubset(role_names):
             self._update_status(
                 "this source does not contain the full cell/working/counter trio"
             )

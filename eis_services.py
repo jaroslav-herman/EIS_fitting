@@ -18,9 +18,9 @@ SPECTRUM_KIND_COLUMN_MAP = {
     "ece": ("re_zwe_ce_ohm", "minus_im_zwe_ce_ohm", "ewe_ece_v"),
 }
 SPECTRUM_KIND_LABELS = {
-    "working": "Working electrode",
+    "working": "WE",
     "cell": "Cell",
-    "counter": "Counter electrode",
+    "counter": "CE",
 }
 SPECTRUM_METADATA_COLUMN = "Spectrum"
 WORKING_POTENTIAL_COLUMN = "Working electrode potential (V)"
