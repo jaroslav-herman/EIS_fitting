@@ -4376,6 +4376,43 @@ class EISApplication:
                     color=color_scale(index / max(len(groups) - 1, 1)),
                     label=str(group),
                 )
+            axes.relim()
+            axes.autoscale(enable=True, axis="both", tight=False)
+            axes.autoscale_view()
+            plotted_values = [
+                point
+                for _group, points in ordered_groups
+                for point in points
+            ]
+            if plotted_values:
+                plotted_x = np.asarray([point[0] for point in plotted_values], dtype=float)
+                plotted_y = np.asarray([point[1] for point in plotted_values], dtype=float)
+                x_min, x_max = float(np.min(plotted_x)), float(np.max(plotted_x))
+                y_min, y_max = float(np.min(plotted_y)), float(np.max(plotted_y))
+                if x_min == x_max:
+                    padding = max(abs(x_min) * 0.05, 1.0)
+                    x_min -= padding
+                    x_max += padding
+                elif x_log.get():
+                    x_min /= 1.05
+                    x_max *= 1.05
+                else:
+                    padding = 0.05 * (x_max - x_min)
+                    x_min -= padding
+                    x_max += padding
+                if y_min == y_max:
+                    padding = max(abs(y_min) * 0.05, 1.0)
+                    y_min -= padding
+                    y_max += padding
+                elif y_log.get():
+                    y_min /= 1.05
+                    y_max *= 1.05
+                else:
+                    padding = 0.05 * (y_max - y_min)
+                    y_min -= padding
+                    y_max += padding
+                axes.set_xlim(x_min, x_max)
+                axes.set_ylim(y_min, y_max)
             axes.set_xlabel(x_equation.get().strip() or x_field)
             axes.set_ylabel(y_equation.get().strip() or y_field)
             axes.set_xscale("log" if x_log.get() else "linear")
