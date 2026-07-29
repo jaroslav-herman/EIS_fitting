@@ -16,6 +16,7 @@ from wepy.eis import tau as cpe_tau
 
 from eis_model import ParameterValue, ProjectState
 from eis_project import (
+    _derived_block_values,
     dataframe_from_payload,
     export_drts_for_states,
     export_fit_parameters,
@@ -608,6 +609,8 @@ class EISApplication:
         self.axes.set_ylabel("−Im(Z) / Ω")
         self.axes.set_aspect("equal", adjustable="box")
         self.axes.grid(True, alpha=0.25)
+        self.axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
+        self.axes.axvline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
         (self.included_artist,) = self.axes.plot(
             [], [], "o", color="#1769aa", markersize=5, label="Included"
         )
@@ -806,8 +809,18 @@ class EISApplication:
             self._configure_bode_plot()
         else:
             self._configure_nyquist_plot()
+        self.axes.axhline(
+            0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0
+        )
+        if self.phase_axes is not None:
+            self.phase_axes.axhline(
+                0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0
+            )
         if self.kk_axes is not None:
             self.kk_axes.axhline(0.0, color="#666666", linewidth=0.8, alpha=0.5)
+            self.kk_axes.axhline(
+                0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0
+            )
             self.kk_axes.set_xscale("log")
             self.kk_axes.grid(True, alpha=0.2)
             self.kk_axes.set_xlabel("Frequency / Hz")
@@ -827,6 +840,9 @@ class EISApplication:
             self.drt_axes.set_xlabel("Tau / s")
             self.drt_axes.set_ylabel("Gamma / Ohm")
             self.drt_axes.grid(True, alpha=0.25)
+            self.drt_axes.axhline(
+                0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0
+            )
             (self.drt_artist,) = self.drt_axes.plot(
                 [], [], "-", color="#6a1b9a", linewidth=1.8, alpha=0.9, label="Ridge DRT"
             )
@@ -986,6 +1002,14 @@ class EISApplication:
         )
         self.plot_three_electrode_button.grid(
             row=0, column=3, padx=(6, 0), sticky="ew"
+        )
+        self.plot_fit_parameters_button = ttk.Button(
+            explorer_actions,
+            text="Fit parameters explorer",
+            command=self.open_fit_parameters_explorer,
+        )
+        self.plot_fit_parameters_button.grid(
+            row=1, column=0, columnspan=4, pady=(6, 0), sticky="ew"
         )
         self.explorer_selection_var = tk.StringVar(value="0 spectra selected")
         ttk.Label(
@@ -1722,6 +1746,7 @@ class EISApplication:
             self.delete_spectrum_button,
             self.plot_selected_button,
             self.plot_three_electrode_button,
+            self.plot_fit_parameters_button,
             self.paste_metadata_button,
             self.frequency_button,
             self.frequency_selected_button,
@@ -3896,6 +3921,349 @@ class EISApplication:
         self._update_status(
             f"fit settings copied from spectrum {source_spectrum.cycle}"
         )
+
+    def _collect_fit_parameter_records(self) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for dataset_id in self._dataset_order:
+            loaded = self.loaded_projects[dataset_id]
+            for spectrum in loaded.spectra:
+                cycle = loaded.state.cycles.get(spectrum.cycle)
+                if cycle is None or cycle.fit_parameters is None:
+                    continue
+                values = np.asarray(cycle.fit_parameters).reshape(-1)
+                if values.size != len(cycle.parameters):
+                    continue
+                record: dict[str, object] = {
+                    "source_file": loaded.state.source_path.name,
+                    "cycle": spectrum.cycle,
+                    "potential_V": cycle.potential_v,
+                    "current_mA": cycle.current_ma,
+                    "circuit": cycle.model(loaded.state.circuit),
+                }
+                record.update(
+                    {
+                        parameter.name: float(value)
+                        for parameter, value in zip(cycle.parameters, values)
+                    }
+                )
+                record.update(
+                    _derived_block_values(
+                        cycle.model(loaded.state.circuit),
+                        [parameter.name for parameter in cycle.parameters],
+                        values,
+                    )
+                )
+                metadata = dict(cycle.custom_metadata)
+                metadata.update(spectrum.custom_metadata)
+                for name, value in metadata.items():
+                    try:
+                        numeric_value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(numeric_value):
+                        record[name] = numeric_value
+                records.append(record)
+        return records
+
+    def open_fit_parameters_explorer(self) -> None:
+        if self.busy or self.state is None:
+            return
+        existing_popup = getattr(self, "fit_parameters_popup", None)
+        if existing_popup is not None and existing_popup.winfo_exists():
+            existing_popup.lift()
+            existing_popup.focus_force()
+            return
+        records: list[dict[str, object]] = []
+        for dataset_id in self._dataset_order:
+            loaded = self.loaded_projects[dataset_id]
+            for spectrum in loaded.spectra:
+                cycle = loaded.state.cycles.get(spectrum.cycle)
+                if cycle is None or cycle.fit_parameters is None:
+                    continue
+                values = np.asarray(cycle.fit_parameters).reshape(-1)
+                if values.size != len(cycle.parameters):
+                    continue
+                record: dict[str, object] = {
+                    "source_file": loaded.state.source_path.name,
+                    "cycle": spectrum.cycle,
+                    "potential_V": cycle.potential_v,
+                    "current_mA": cycle.current_ma,
+                    "circuit": cycle.model(loaded.state.circuit),
+                }
+                record.update(
+                    {
+                        parameter.name: float(value)
+                        for parameter, value in zip(cycle.parameters, values)
+                    }
+                )
+                record.update(
+                    _derived_block_values(
+                        cycle.model(loaded.state.circuit),
+                        [parameter.name for parameter in cycle.parameters],
+                        values,
+                    )
+                )
+                metadata = dict(cycle.custom_metadata)
+                metadata.update(spectrum.custom_metadata)
+                for name, value in metadata.items():
+                    try:
+                        numeric_value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(numeric_value):
+                        record[name] = numeric_value
+                records.append(record)
+        if not records:
+            self._update_status("no fitted spectra are available")
+            return
+
+        numeric_fields = []
+        for field in dict.fromkeys(
+            key for record in records for key in record if key != "circuit" and key != "source_file"
+        ):
+            values = [record.get(field) for record in records]
+            if any(isinstance(value, (int, float, np.integer, np.floating)) for value in values):
+                numeric_fields.append(field)
+        parameter_fields = [
+            field
+            for field in numeric_fields
+            if any(field.startswith(prefix) for prefix in ("R", "C", "L", "W"))
+        ]
+        x_default = "current_mA" if "current_mA" in numeric_fields else numeric_fields[0]
+        y_default = parameter_fields[0] if parameter_fields else numeric_fields[0]
+
+        popup = tk.Toplevel(self.root)
+        self.fit_parameters_popup = popup
+        popup.title("Fit Parameters Explorer")
+        popup.geometry("1180x760")
+        popup.minsize(900, 600)
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+
+        def close_popup() -> None:
+            self.fit_parameters_popup = None
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+
+        controls = ttk.Frame(popup, padding=8)
+        controls.grid(row=0, column=0, sticky="ew")
+        for column in range(5):
+            controls.columnconfigure(column, weight=1)
+
+        x_var = tk.StringVar(value=x_default)
+        y_var = tk.StringVar(value=y_default)
+        split_var = tk.StringVar(value="None")
+        x_equation = tk.StringVar(value="x")
+        y_equation = tk.StringVar(value="y")
+        x_log = tk.BooleanVar(value=False)
+        y_log = tk.BooleanVar(value=False)
+        ttk.Label(controls, text="X axis").grid(row=0, column=0, sticky="w")
+        ttk.Label(controls, text="Y axis").grid(row=0, column=1, sticky="w")
+        ttk.Label(controls, text="Split by").grid(row=0, column=2, sticky="w")
+        x_box = ttk.Combobox(controls, textvariable=x_var, values=numeric_fields, state="readonly")
+        y_box = ttk.Combobox(controls, textvariable=y_var, values=numeric_fields, state="readonly")
+        split_box = ttk.Combobox(
+            controls, textvariable=split_var, values=["None", *numeric_fields], state="readonly"
+        )
+        x_box.grid(row=1, column=0, padx=(0, 6), sticky="ew")
+        y_box.grid(row=1, column=1, padx=3, sticky="ew")
+        split_box.grid(row=1, column=2, padx=(6, 12), sticky="ew")
+        ttk.Checkbutton(controls, text="Log X", variable=x_log).grid(row=1, column=3, sticky="w")
+        ttk.Checkbutton(controls, text="Log Y", variable=y_log).grid(row=1, column=4, sticky="w")
+        ttk.Label(controls, text="X equation").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(controls, text="Y equation").grid(row=2, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(controls, textvariable=x_equation).grid(row=3, column=0, padx=(0, 6), sticky="ew")
+        ttk.Entry(controls, textvariable=y_equation).grid(row=3, column=1, padx=3, sticky="ew")
+        ttk.Label(
+            controls,
+            text="Use column names and np functions, e.g. 1/R1 or np.log10(current_mA)",
+        ).grid(row=3, column=2, columnspan=3, padx=(6, 0), sticky="w")
+        ttk.Button(
+            controls,
+            text="Refresh",
+            command=lambda: refresh_data(),
+        ).grid(row=4, column=0, pady=(6, 0), sticky="w")
+
+        range_frame = ttk.LabelFrame(popup, text="Displayed value ranges", padding=6)
+        range_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 6))
+        range_controls = ttk.Frame(range_frame)
+        range_controls.grid(row=0, column=0, columnspan=4, sticky="ew")
+        range_controls.columnconfigure(1, weight=1)
+        range_controls.columnconfigure(2, weight=1)
+        chart_frame = ttk.Frame(range_frame)
+        range_frame.rowconfigure(0, weight=0)
+        range_frame.rowconfigure(1, weight=1)
+        chart_frame.grid(row=1, column=0, columnspan=4, sticky="nsew")
+        chart_frame.columnconfigure(0, weight=1)
+        chart_frame.rowconfigure(0, weight=1)
+
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        from matplotlib.figure import Figure
+
+        figure = Figure(figsize=(8.5, 5.8), dpi=100, constrained_layout=True)
+        axes = figure.add_subplot(111)
+        canvas = FigureCanvasTkAgg(figure, master=chart_frame)
+        canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        toolbar = NavigationToolbar2Tk(canvas, chart_frame, pack_toolbar=False)
+        toolbar.update()
+        toolbar.grid(row=1, column=0, sticky="ew")
+
+        range_state: dict[str, tuple[tk.DoubleVar, tk.DoubleVar, float, float]] = {}
+        range_labels: dict[str, tk.StringVar] = {}
+        range_widgets: dict[str, list[tk.Widget]] = {}
+
+        def field_bounds(field: str) -> tuple[float, float]:
+            values = np.asarray(
+                [float(record[field]) for record in records if field in record and np.isfinite(float(record[field]))],
+                dtype=float,
+            )
+            if values.size == 0:
+                return 0.0, 1.0
+            return float(np.min(values)), float(np.max(values))
+
+        def range_value(field: str, position: float) -> float:
+            _low, _high, minimum, maximum = range_state[field]
+            return minimum + (maximum - minimum) * position / 100.0
+
+        def range_text(field: str) -> str:
+            low, high, _minimum, _maximum = range_state[field]
+            return f"{range_value(field, low.get()):.5g} – {range_value(field, high.get()):.5g}"
+
+        def refresh_ranges() -> None:
+            fields = [x_var.get(), y_var.get()]
+            if split_var.get() != "None":
+                fields.append(split_var.get())
+            for widget_list in range_widgets.values():
+                for widget in widget_list:
+                    widget.grid_remove()
+            for row, field in enumerate(dict.fromkeys(fields)):
+                if field not in range_state:
+                    low = tk.DoubleVar(value=0.0)
+                    high = tk.DoubleVar(value=100.0)
+                    minimum, maximum = field_bounds(field)
+                    range_state[field] = (low, high, minimum, maximum)
+                    range_labels[field] = tk.StringVar(value=range_text(field))
+                    range_widgets[field] = []
+                    ttk.Label(range_controls, text=field).grid(row=row, column=0, sticky="w")
+                    low_scale = ttk.Scale(
+                        range_controls, from_=0, to=100, variable=low,
+                        command=lambda _value, selected=field: update_range_label(selected),
+                    )
+                    high_scale = ttk.Scale(
+                        range_controls, from_=0, to=100, variable=high,
+                        command=lambda _value, selected=field: update_range_label(selected),
+                    )
+                    low_scale.grid(row=row, column=1, padx=6, sticky="ew")
+                    high_scale.grid(row=row, column=2, padx=6, sticky="ew")
+                    ttk.Label(range_controls, textvariable=range_labels[field], width=24).grid(
+                        row=row, column=3, sticky="w"
+                    )
+                    range_widgets[field].extend((low_scale, high_scale))
+                else:
+                    for widget in range_widgets[field]:
+                        widget.grid()
+                    range_controls.grid_slaves(row=row, column=0)[0].grid()
+                    range_controls.grid_slaves(row=row, column=3)[0].grid()
+            refresh_plot()
+
+        def update_range_label(field: str) -> None:
+            low, high, _minimum, _maximum = range_state[field]
+            if low.get() > high.get():
+                if low.get() <= 100:
+                    high.set(low.get())
+            range_labels[field].set(range_text(field))
+            refresh_plot()
+
+        def evaluate(
+            record: dict[str, object],
+            expression: str,
+            fallback: str,
+            x_field: str,
+            y_field: str,
+        ) -> float:
+            expression = expression.strip() or fallback
+            variables = dict(record)
+            variables["x"] = float(record[x_field])
+            variables["y"] = float(record[y_field])
+            value = eval(expression, {"__builtins__": {}, "np": np}, variables)
+            return float(value)
+
+        def refresh_plot(*_args) -> None:
+            axes.clear()
+            axes.grid(True, alpha=0.25)
+            x_field = x_var.get()
+            y_field = y_var.get()
+            split_field = split_var.get()
+            filtered = []
+            fields = [x_field, y_field]
+            if split_field != "None":
+                fields.append(split_field)
+            for record in records:
+                try:
+                    if any(
+                        field not in record
+                        or not np.isfinite(float(record[field]))
+                        or not (
+                            range_value(field, range_state[field][0].get())
+                            <= float(record[field])
+                            <= range_value(field, range_state[field][1].get())
+                        )
+                        for field in dict.fromkeys(fields)
+                    ):
+                        continue
+                    x_value = evaluate(
+                        record, x_equation.get(), x_field, x_field, y_field
+                    )
+                    y_value = evaluate(
+                        record, y_equation.get(), y_field, x_field, y_field
+                    )
+                    if not np.isfinite(x_value) or not np.isfinite(y_value):
+                        continue
+                    if x_log.get() and x_value <= 0 or y_log.get() and y_value <= 0:
+                        continue
+                    filtered.append((record, x_value, y_value))
+                except Exception:
+                    continue
+            groups: dict[object, list[tuple[float, float]]] = {}
+            for record, x_value, y_value in filtered:
+                group = record.get(split_field) if split_field != "None" else "All spectra"
+                groups.setdefault(group, []).append((x_value, y_value))
+            for group, points in groups.items():
+                points.sort(key=lambda point: point[0])
+                x_values, y_values = zip(*points)
+                axes.plot(x_values, y_values, "o-", label=str(group))
+            axes.set_xlabel(x_equation.get().strip() or x_field)
+            axes.set_ylabel(y_equation.get().strip() or y_field)
+            axes.set_xscale("log" if x_log.get() else "linear")
+            axes.set_yscale("log" if y_log.get() else "linear")
+            if split_field != "None" and groups:
+                axes.legend(loc="best", fontsize=8)
+            canvas.draw_idle()
+
+        def refresh_data() -> None:
+            refreshed = self._collect_fit_parameter_records()
+            if not refreshed:
+                self._update_status("no fitted spectra are available")
+                return
+            records[:] = refreshed
+            for field, (low, high, _minimum, _maximum) in list(range_state.items()):
+                minimum, maximum = field_bounds(field)
+                range_state[field] = (low, high, minimum, maximum)
+                range_labels[field].set(range_text(field))
+            refresh_plot()
+
+        for variable in (x_var, y_var, split_var, x_equation, y_equation, x_log, y_log):
+            variable.trace_add("write", lambda *_args: refresh_ranges())
+        x_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+        y_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+        split_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+        refresh_ranges()
+
+    def refresh_fit_parameters_explorer(self, popup: tk.Toplevel) -> None:
+        if popup.winfo_exists():
+            popup.destroy()
+        self.open_fit_parameters_explorer()
 
     def paste_metadata_column_from_clipboard(self) -> None:
         if self.busy or self.state is None:
