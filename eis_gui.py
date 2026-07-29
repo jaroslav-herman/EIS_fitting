@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import copy
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,11 @@ from wepy.eis import tau as cpe_tau
 
 from eis_model import ParameterValue, ProjectState
 from eis_project import (
+    _dataframe_to_payload,
+    _state_to_payload,
     _derived_block_values,
+    _dataframe_to_payload,
+    _state_to_payload,
     dataframe_from_payload,
     export_drts_for_states,
     export_fit_parameters,
@@ -260,6 +265,8 @@ class EISApplication:
     ) -> None:
         self.root = root
         self.path = path.resolve() if path is not None else None
+        self.project_path: Path | None = None
+        self._saved_project_signature: str | None = None
         self.current_dataset_id: str | None = None
         self.requested_cycle = cycle
         self.control = control
@@ -280,6 +287,8 @@ class EISApplication:
             max_workers=1, thread_name_prefix="eis-worker"
         )
         self.busy = False
+        self._fit_cancel_requested = False
+        self._fit_parameter_snapshot = None
         self._plot_imports = None
         self.plot_mode = "nyquist"
 
@@ -305,7 +314,8 @@ class EISApplication:
         self.root.bind("<Control-Down>", lambda _event: self.change_cycle(1, focus_only=True))
         self.root.bind("<Control-a>", self.select_all_spectra)
         self.root.bind("<Control-e>", self.open_export_menu)
-        self.root.bind("<Control-s>", lambda _event: self.save_project())
+        self.root.bind("<Control-s>", self._on_control_s)
+        self.root.bind("<Control-S>", self._on_control_s)
         self.root.bind("<Control-Shift-O>", lambda _event: self.load_project())
         self.root.bind("<Control-o>", lambda _event: self.import_data())
         self.root.bind("<Alt-a>", self._on_alt_a)
@@ -824,7 +834,7 @@ class EISApplication:
             self.kk_axes.set_xscale("log")
             self.kk_axes.grid(True, alpha=0.2)
             self.kk_axes.set_xlabel("Frequency / Hz")
-            self.kk_axes.set_ylabel("KK residual")
+            self.kk_axes.set_ylabel("KK residual / %")
             (self.kk_real_artist,) = self.kk_axes.plot(
                 [], [], "o-", color="#00897b", markersize=3, linewidth=1.0, label="Real"
             )
@@ -964,6 +974,7 @@ class EISApplication:
         )
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.explorer.bind("<Button-1>", self._on_explorer_click, add="+")
+        self.explorer.bind("<Double-Button-1>", self._on_explorer_double_click, add="+")
         self.explorer.bind("<Button-1>", self._on_explorer_heading_click, add="+")
         self.explorer.bind("<<TreeviewSelect>>", self._select_explorer_spectrum)
         self.explorer.bind("<Delete>", lambda _event: self.delete_selected_spectrum())
@@ -1447,6 +1458,37 @@ class EISApplication:
         self._activate_explorer_item(item)
         return "break"
 
+    def _on_explorer_double_click(self, event):
+        if self.busy or self.state is None:
+            return "break"
+        if self.explorer.identify("region", event.x, event.y) not in {"tree", "cell"}:
+            return "break"
+        item = self.explorer.identify_row(event.y)
+        column_id = self.explorer.identify_column(event.x)
+        columns = self._explorer_columns()
+        if not item or not column_id.startswith("#"):
+            return "break"
+        column_index = int(column_id[1:]) - 1
+        if column_index < 0 or column_index >= len(columns):
+            return "break"
+        row = self._explorer_rows.get(item)
+        if row is None:
+            return "break"
+        column = columns[column_index]
+        clicked_value = self._format_explorer_value(
+            self._explorer_value(row[1], row[2], column), column
+        )
+        matching_items = []
+        for candidate, (_dataset_id, loaded, spectrum) in self._explorer_rows.items():
+            value = self._format_explorer_value(
+                self._explorer_value(loaded, spectrum, column), column
+            )
+            if value == clicked_value:
+                matching_items.append(candidate)
+        self._set_explorer_selection(matching_items, primary=item)
+        self._activate_explorer_item(item)
+        return "break"
+
     def _set_explorer_selection(
         self,
         items: list[str],
@@ -1727,6 +1769,10 @@ class EISApplication:
         self.python_export_button.grid(
             row=4, column=0, columnspan=2, pady=3, sticky="ew"
         )
+        self.stop_fit_button = ttk.Button(
+            actions, text="Stop fit", command=self._cancel_fit, state="disabled"
+        )
+        self.stop_fit_button.grid(row=5, column=0, columnspan=2, pady=3, sticky="ew")
         self.action_buttons = (
             self.fit_button,
             self.initial_values_button,
@@ -1853,7 +1899,11 @@ class EISApplication:
     ) -> None:
         if self.busy:
             return
+        self._fit_cancel_requested = False
+        self._fit_parameter_snapshot = copy.deepcopy(self.state)
         self.busy = True
+        if hasattr(self, "stop_fit_button"):
+            self.stop_fit_button.configure(state="normal")
         self._set_controls_enabled(False)
         future = self.executor.submit(work)
         self.root.after(40, lambda: self._poll_future(future, success, error_title))
@@ -1879,13 +1929,26 @@ class EISApplication:
                 error_title, f"{type(error).__name__}: {error}", parent=self.root
             )
             return
-        success(result)
+        if self._fit_cancel_requested:
+            if self._fit_parameter_snapshot is not None and self.state is not None:
+                self.state = copy.deepcopy(self._fit_parameter_snapshot)
+                refresh = getattr(self, "_refresh_parameter_table", None)
+                if refresh is not None:
+                    refresh()
+            self._update_status("fit cancelled")
+        else:
+            success(result)
+        self._fit_parameter_snapshot = None
         self._set_controls_enabled(self.state is not None)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled and not self.busy else tk.DISABLED
         for button in getattr(self, "action_buttons", ()):
             button.configure(state=state)
+        if hasattr(self, "stop_fit_button"):
+            self.stop_fit_button.configure(
+                state=tk.NORMAL if self.busy else tk.DISABLED
+            )
         if hasattr(self, "drt_mode_box"):
             self.drt_mode_box.configure(
                 state="readonly" if enabled and not self.busy else "disabled"
@@ -1927,7 +1990,50 @@ class EISApplication:
             self.minimum_frequency_var.set(f"{cycle.frequency_window[0]:g}")
             self.maximum_frequency_var.set(f"{cycle.frequency_window[1]:g}")
 
+    @staticmethod
+    def _clamp_parameter_value(value, lower, upper):
+        try:
+            if lower is not None and value < lower:
+                return lower
+            if upper is not None and value > upper:
+                return upper
+        except (TypeError, ValueError):
+            pass
+        return value
+
+    def _clamp_state_parameter_values(self) -> None:
+        state_values = getattr(self.state, "parameters", None)
+        if state_values is None:
+            return
+        if isinstance(state_values, dict):
+            parameter_values = state_values.values()
+        else:
+            parameter_values = state_values
+        for parameter in parameter_values:
+            if isinstance(parameter, dict):
+                value_key = "initial" if "initial" in parameter else "value"
+                if value_key in parameter:
+                    parameter[value_key] = self._clamp_parameter_value(
+                        parameter[value_key],
+                        parameter.get("lower"),
+                        parameter.get("upper"),
+                    )
+            else:
+                value_name = "initial" if hasattr(parameter, "initial") else "value"
+                if hasattr(parameter, value_name):
+                    current_value = getattr(parameter, value_name)
+                    setattr(
+                        parameter,
+                        value_name,
+                        self._clamp_parameter_value(
+                            current_value,
+                            getattr(parameter, "lower", None),
+                            getattr(parameter, "upper", None),
+                        ),
+                    )
+
     def _capture_controls(self) -> bool:
+        self._clamp_state_parameter_values()
         if self.state is None:
             return False
         try:
@@ -1939,10 +2045,12 @@ class EISApplication:
                     raise ValueError(
                         f"{parameter.name}: lower bound exceeds upper bound"
                     )
-                if not parameter.lower <= parameter.initial <= parameter.upper:
-                    raise ValueError(
-                        f"{parameter.name}: initial value is outside its bounds"
-                    )
+                parameter.initial = self._clamp_parameter_value(
+                    parameter.initial,
+                    parameter.lower,
+                    parameter.upper,
+                )
+            self.parameter_table.set_parameters(parameters)
         except ValueError as error:
             messagebox.showerror("Invalid value", str(error), parent=self.root)
             return False
@@ -2143,8 +2251,8 @@ class EISApplication:
                 and cycle.kk_residual_imag is not None
             ):
                 x_values = cycle.frequency_hz[cycle.included]
-                self.kk_real_artist.set_data(x_values, cycle.kk_residual_real)
-                self.kk_imag_artist.set_data(x_values, cycle.kk_residual_imag)
+                self.kk_real_artist.set_data(x_values, 100.0 * cycle.kk_residual_real)
+                self.kk_imag_artist.set_data(x_values, 100.0 * cycle.kk_residual_imag)
             else:
                 self.kk_real_artist.set_data([], [])
                 self.kk_imag_artist.set_data([], [])
@@ -2268,7 +2376,9 @@ class EISApplication:
             or not cycle.kk_cache_matches()
         ):
             return
-        y_values = np.concatenate((cycle.kk_residual_real, cycle.kk_residual_imag))
+        y_values = 100.0 * np.concatenate(
+            (cycle.kk_residual_real, cycle.kk_residual_imag)
+        )
         finite = np.isfinite(y_values)
         if not np.any(finite):
             return
@@ -3256,11 +3366,33 @@ class EISApplication:
         if self.state is None:
             return
         cycle = self.state.cycles[cycle_number]
-        cycle.parameters = analysis.parameters
+        existing_parameters = {parameter.name: parameter for parameter in cycle.parameters}
+        updated_parameters = []
+        for proposed in analysis.parameters:
+            existing = existing_parameters.get(proposed.name)
+            if existing is None:
+                updated_parameters.append(proposed)
+                continue
+            updated_parameters.append(
+                ParameterValue(
+                    proposed.name,
+                    proposed.unit,
+                    self._clamp_parameter_value(
+                        proposed.initial,
+                        existing.lower,
+                        existing.upper,
+                    ),
+                    existing.lower,
+                    existing.upper,
+                    existing.error_percent,
+                    existing.fixed,
+                )
+            )
+        cycle.parameters = updated_parameters
         cycle.store_ridge_analysis(
             self._require_threshold_value(),
             analysis.outlier_indices,
-            analysis.parameters,
+            updated_parameters,
             analysis.peak_count,
             analysis.ohmic_resistance,
             analysis.inductance,
@@ -3268,7 +3400,7 @@ class EISApplication:
             analysis.ridge_gamma_ohm,
         )
         if self.state.active_cycle == cycle_number:
-            self.parameter_table.set_parameters(analysis.parameters)
+            self.parameter_table.set_parameters(updated_parameters)
             self._refresh_plot(rescale=True)
             self._update_status(
                 f"initial values set from ridge: "
@@ -4098,6 +4230,7 @@ class EISApplication:
         chart_frame.columnconfigure(0, weight=1)
         chart_frame.rowconfigure(0, weight=1)
 
+        from matplotlib import colormaps
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
         from matplotlib.figure import Figure
 
@@ -4192,6 +4325,8 @@ class EISApplication:
         def refresh_plot(*_args) -> None:
             axes.clear()
             axes.grid(True, alpha=0.25)
+            axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
+            axes.axvline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
             x_field = x_var.get()
             y_field = y_var.get()
             split_field = split_var.get()
@@ -4229,10 +4364,18 @@ class EISApplication:
             for record, x_value, y_value in filtered:
                 group = record.get(split_field) if split_field != "None" else "All spectra"
                 groups.setdefault(group, []).append((x_value, y_value))
-            for group, points in groups.items():
+            color_scale = colormaps["rainbow"]
+            ordered_groups = sorted(groups.items(), key=lambda item: item[0])
+            for index, (group, points) in enumerate(ordered_groups):
                 points.sort(key=lambda point: point[0])
                 x_values, y_values = zip(*points)
-                axes.plot(x_values, y_values, "o-", label=str(group))
+                axes.plot(
+                    x_values,
+                    y_values,
+                    "o-",
+                    color=color_scale(index / max(len(groups) - 1, 1)),
+                    label=str(group),
+                )
             axes.set_xlabel(x_equation.get().strip() or x_field)
             axes.set_ylabel(y_equation.get().strip() or y_field)
             axes.set_xscale("log" if x_log.get() else "linear")
@@ -4573,7 +4716,7 @@ class EISApplication:
 
         def _render_popup() -> None:
             figure.clear()
-            color_scale = colormaps["tab20"]
+            color_scale = colormaps["rainbow"]
             if mode_state["value"] == "bode":
                 axes = figure.add_subplot(111)
                 phase_axes = axes.twinx()
@@ -4583,7 +4726,7 @@ class EISApplication:
                 phase_axes.set_ylabel("−Phase / °")
                 axes.grid(True, alpha=0.25)
                 for index, (loaded, cycle) in enumerate(plotted_cycles):
-                    color = color_scale(index % color_scale.N)
+                    color = color_scale(index / max(len(plotted_cycles) - 1, 1))
                     included = cycle.included
                     frequency = cycle.frequency_hz
                     magnitude = np.abs(cycle.impedance)
@@ -4649,8 +4792,10 @@ class EISApplication:
                 axes.set_ylabel("-Im(Z) / Ohm")
                 axes.set_aspect("equal", adjustable="box")
                 axes.grid(True, alpha=0.25)
+                axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
+                axes.axvline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
                 for index, (loaded, cycle) in enumerate(plotted_cycles):
-                    color = color_scale(index % color_scale.N)
+                    color = color_scale(index / max(len(plotted_cycles) - 1, 1))
                     included = cycle.included
                     label = f"{loaded.dataset_label} - cycle {cycle.cycle}"
                     axes.plot(
@@ -4798,9 +4943,10 @@ class EISApplication:
             axes.set_xlabel("Tau / s")
             axes.set_ylabel("Gamma / Ohm")
             axes.grid(True, alpha=0.25)
-            color_scale = colormaps["tab20"]
+            axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
+            color_scale = colormaps["rainbow"]
             for index, (loaded, cycle) in enumerate(plotted_cycles):
-                color = color_scale(index % color_scale.N)
+                color = color_scale(index / max(len(plotted_cycles) - 1, 1))
                 tau_values = (
                     cycle.saved_ridge_tau_s if mode_state["value"] == "ridge" else cycle.saved_hybrid_tau_s
                 )
@@ -5057,19 +5203,68 @@ class EISApplication:
             f"{len(self._explorer_rows)} spectra loaded"
         )
 
-    def save_project(self) -> None:
+    def _project_signature(self) -> str | None:
+        if self.state is None:
+            return None
+        datasets = []
+        for dataset_id in self._dataset_order:
+            loaded = self.loaded_projects.get(dataset_id)
+            if loaded is None:
+                continue
+            datasets.append(
+                {
+                    "dataset_id": dataset_id,
+                    "state": _state_to_payload(loaded.state),
+                    "dataframe": _dataframe_to_payload(loaded.dataframe),
+                }
+            )
+        if not datasets:
+            datasets.append(
+                {
+                    "dataset_id": self.current_dataset_id,
+                    "state": _state_to_payload(self.state),
+                    "dataframe": _dataframe_to_payload(self.loaded.dataframe),
+                }
+            )
+        return json.dumps(datasets, sort_keys=True, default=str)
+
+    def _project_has_unsaved_changes(self) -> bool:
+        if self.state is None:
+            return False
+        current_signature = self._project_signature()
+        return (
+            self._saved_project_signature is None
+            or current_signature != self._saved_project_signature
+        )
+
+    def _cancel_fit(self) -> None:
+        if not self.busy:
+            return
+        self._fit_cancel_requested = True
+        if self._fit_parameter_snapshot is not None and self.state is not None:
+            self.state = copy.deepcopy(self._fit_parameter_snapshot)
+            refresh = getattr(self, "_refresh_parameter_table", None)
+            if refresh is not None:
+                refresh()
+        self._update_status("fit cancellation requested")
+
+    def save_project(self, path: Path | None = None) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
-        selected = filedialog.asksaveasfilename(
-            parent=self.root,
-            title="Save EIS fitting project",
-            initialdir=str(self._current_directory()),
-            initialfile=f"{self._current_stem()}.eisfit.json",
-            defaultextension=".eisfit.json",
-            filetypes=[("EIS fitting project", "*.eisfit.json"), ("JSON", "*.json")],
-        )
-        if not selected:
-            return
+        if path is None:
+            selected = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="Save EIS fitting project",
+                initialdir=str(self._current_directory()),
+                initialfile=f"{self._current_stem()}.eisfit.json",
+                defaultextension=".eisfit.json",
+                filetypes=[("EIS fitting project", "*.eisfit.json"), ("JSON", "*.json")],
+            )
+            if not selected:
+                return
+            project_path = Path(selected)
+        else:
+            project_path = Path(path)
         try:
             ordered_dataset_ids = [
                 self.current_dataset_id,
@@ -5088,7 +5283,7 @@ class EISApplication:
                 for dataset_id in ordered_dataset_ids
                 if dataset_id is not None and dataset_id in self.loaded_projects
             ]
-            save_project_file(self.state, Path(selected), datasets=datasets)
+            save_project_file(self.state, project_path, datasets=datasets)
         except Exception as error:
             messagebox.showerror(
                 "Project save failed",
@@ -5096,7 +5291,26 @@ class EISApplication:
                 parent=self.root,
             )
             return
-        self._update_status(f"project saved as {Path(selected).name}")
+        self.project_path = project_path.resolve()
+        self._saved_project_signature = self._project_signature()
+        self._update_status(f"project saved as {project_path.name}")
+
+    def save_project_quick(self, _event=None):
+        if self.project_path is not None:
+            self.save_project(self.project_path)
+        else:
+            self.save_project()
+        return "break"
+
+    def save_project_as(self) -> None:
+        self.save_project(None)
+
+    def _on_control_s(self, event):
+        if event.state & 0x0001 or event.keysym == "S":
+            self.save_project_as()
+        else:
+            self.save_project_quick(event)
+        return "break"
 
     def load_project(self) -> None:
         if self.busy:
@@ -5192,6 +5406,7 @@ class EISApplication:
         result: list[tuple[str, LoadedProject, ProjectState]],
         path: Path,
     ) -> None:
+        self.project_path = path.resolve()
         self.loaded_projects.clear()
         self._dataset_order.clear()
         for dataset_id, loaded, _restored in result:
@@ -5200,6 +5415,7 @@ class EISApplication:
         self.current_dataset_id = dataset_id
         self.loaded = loaded
         self.state = restored
+        self._saved_project_signature = self._project_signature()
         self.control = restored.control
         self.circuit = restored.circuit
         self.model_var.set(restored.circuit)
@@ -5634,6 +5850,21 @@ class EISApplication:
         raise RuntimeError("No Python editor was found")
 
     def close(self) -> None:
+        if self._project_has_unsaved_changes():
+            decision = messagebox.askyesnocancel(
+                "Unsaved changes",
+                "The project has unsaved changes. Save before closing?",
+                parent=self.root,
+            )
+            if decision is None:
+                return
+            if decision:
+                if self.project_path is not None:
+                    self.save_project(self.project_path)
+                else:
+                    self.save_project()
+                if self._project_has_unsaved_changes():
+                    return
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
