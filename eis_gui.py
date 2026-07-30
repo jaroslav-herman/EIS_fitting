@@ -13,6 +13,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
 
 import numpy as np
+from natsort import natsort_keygen, ns
 from wepy.eis import tau as cpe_tau
 
 from eis_model import ParameterValue, ProjectState
@@ -888,6 +889,7 @@ class EISApplication:
         group = ttk.LabelFrame(parent, padding=6)
         explorer_header = ttk.Frame(group)
         ttk.Label(explorer_header, text="Spectra explorer").pack(side=tk.LEFT)
+        self.natural_sort_var = tk.BooleanVar(value=False)
         self.paste_metadata_button = ttk.Button(
             explorer_header,
             text="+",
@@ -895,6 +897,12 @@ class EISApplication:
             command=self.paste_metadata_column_from_clipboard,
         )
         self.paste_metadata_button.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Checkbutton(
+            explorer_header,
+            text="Natural sort",
+            variable=self.natural_sort_var,
+            command=self._toggle_natural_sort,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         group.configure(labelwidget=explorer_header)
         group.pack(fill=tk.BOTH, expand=True)
         group.columnconfigure(0, weight=1)
@@ -1258,6 +1266,20 @@ class EISApplication:
         self._explorer_sort_reverse[column] = not reverse
         return "break"
 
+    def _toggle_natural_sort(self) -> None:
+        if not self._explorer_rows:
+            return
+        if not self._explorer_sort_columns:
+            self._explorer_sort_columns = [
+                (
+                    self._explorer_selected_column,
+                    self._explorer_sort_reverse.get(
+                        self._explorer_selected_column, False
+                    ),
+                )
+            ]
+        self._apply_explorer_sort()
+
     def _apply_explorer_sort(self) -> None:
         ordered = list(self._explorer_rows.items())
         for column, reverse in reversed(self._explorer_sort_columns):
@@ -1324,9 +1346,13 @@ class EISApplication:
         try:
             number = float(text)
         except ValueError:
+            if self.natural_sort_var.get():
+                return (1, natsort_keygen(alg=ns.IGNORECASE)(text))
             return (1, text.casefold())
         if np.isfinite(number):
             return (0, number)
+        if self.natural_sort_var.get():
+            return (1, natsort_keygen(alg=ns.IGNORECASE)(text))
         return (2, "")
 
     def _refresh_explorer_values(self) -> None:
@@ -1608,6 +1634,22 @@ class EISApplication:
             command=self.sort_selected_parameters_by_tau,
         )
         self.sort_tau_selected_button.grid(row=1, column=1, columnspan=2, padx=(3, 0), pady=(5, 0), sticky="ew")
+        self.switch_blocks_button = ttk.Button(
+            model_group,
+            text="Switch blocks: current",
+            command=self.switch_parameter_blocks,
+        )
+        self.switch_blocks_button.grid(
+            row=2, column=0, padx=(0, 3), pady=(5, 0), sticky="ew"
+        )
+        self.switch_blocks_selected_button = ttk.Button(
+            model_group,
+            text="Switch blocks: selected",
+            command=self.switch_selected_parameter_blocks,
+        )
+        self.switch_blocks_selected_button.grid(
+            row=2, column=1, columnspan=2, padx=(3, 0), pady=(5, 0), sticky="ew"
+        )
 
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
         parameters_group.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
@@ -1725,27 +1767,31 @@ class EISApplication:
         actions.columnconfigure(1, weight=1)
         self.fit_button = ttk.Button(actions, text="Fit spectrum", command=self.fit)
         self.fit_button.grid(row=0, column=0, padx=(0, 4), pady=3, sticky="ew")
+        self.fit_selected_button = ttk.Button(
+            actions, text="Fit selected", command=self.fit_selected
+        )
+        self.fit_selected_button.grid(row=0, column=1, padx=(4, 0), pady=3, sticky="ew")
         self.initial_values_button = ttk.Button(
             actions, text="Initial values", command=self.initialize_from_ridge
         )
         self.initial_values_button.grid(
-            row=0, column=1, padx=(4, 0), pady=3, sticky="ew"
+            row=1, column=0, columnspan=2, pady=3, sticky="ew"
         )
         self.ridge_drt_button = ttk.Button(
             actions, text="Ridge DRT", command=self.calculate_ridge_drt
         )
-        self.ridge_drt_button.grid(row=1, column=0, padx=(0, 4), pady=3, sticky="ew")
+        self.ridge_drt_button.grid(row=2, column=0, padx=(0, 4), pady=3, sticky="ew")
         self.hybrid_drt_button = ttk.Button(
             actions, text="Hybrid DRT", command=self.calculate_hybrid_drt
         )
-        self.hybrid_drt_button.grid(row=1, column=1, padx=(4, 0), pady=3, sticky="ew")
+        self.hybrid_drt_button.grid(row=2, column=1, padx=(4, 0), pady=3, sticky="ew")
         self.ridge_drt_selected_button = ttk.Button(
             actions,
             text="Ridge DRT: selected",
             command=self.calculate_selected_ridge_drts,
         )
         self.ridge_drt_selected_button.grid(
-            row=2, column=0, padx=(0, 4), pady=3, sticky="ew"
+            row=3, column=0, padx=(0, 4), pady=3, sticky="ew"
         )
         self.hybrid_drt_selected_button = ttk.Button(
             actions,
@@ -1753,28 +1799,29 @@ class EISApplication:
             command=self.calculate_selected_hybrid_drts,
         )
         self.hybrid_drt_selected_button.grid(
-            row=2, column=1, padx=(4, 0), pady=3, sticky="ew"
+            row=3, column=1, padx=(4, 0), pady=3, sticky="ew"
         )
         self.batch_fit_button = ttk.Button(
             actions,
             text="Batch fit from current",
             command=self.batch_fit,
         )
-        self.batch_fit_button.grid(row=3, column=0, columnspan=2, pady=3, sticky="ew")
+        self.batch_fit_button.grid(row=4, column=0, columnspan=2, pady=3, sticky="ew")
         self.python_export_button = ttk.Button(
             actions,
             text="Export to Python",
             command=self.export_python_workspace,
         )
         self.python_export_button.grid(
-            row=4, column=0, columnspan=2, pady=3, sticky="ew"
+            row=5, column=0, columnspan=2, pady=3, sticky="ew"
         )
         self.stop_fit_button = ttk.Button(
             actions, text="Stop fit", command=self._cancel_fit, state="disabled"
         )
-        self.stop_fit_button.grid(row=5, column=0, columnspan=2, pady=3, sticky="ew")
+        self.stop_fit_button.grid(row=6, column=0, columnspan=2, pady=3, sticky="ew")
         self.action_buttons = (
             self.fit_button,
+            self.fit_selected_button,
             self.initial_values_button,
             self.ridge_drt_button,
             self.hybrid_drt_button,
@@ -1800,6 +1847,8 @@ class EISApplication:
             self.model_selected_button,
             self.sort_tau_button,
             self.sort_tau_selected_button,
+            self.switch_blocks_button,
+            self.switch_blocks_selected_button,
             self.parameters_selected_button,
             self.apply_fix_selected_button,
             self.apply_initial_selected_button,
@@ -2997,6 +3046,90 @@ class EISApplication:
         self._refresh_plot(rescale=True)
         self._update_status(f"model applied to {updated} selected spectra")
 
+    @staticmethod
+    def _switch_parameter_blocks(state: ProjectState, cycle) -> bool:
+        circuit = re.sub(r"\s+", "", cycle.model(state.circuit))
+        if circuit != "R0-L0-p(R1,CPE1)-p(R2,CPE2)":
+            return False
+        parameters = {parameter.name: parameter for parameter in cycle.parameters}
+        names = (
+            "R1",
+            "R2",
+            "CPE1_0",
+            "CPE2_0",
+            "CPE1_1",
+            "CPE2_1",
+        )
+        if any(name not in parameters for name in names):
+            return False
+        for first_name, second_name in (
+            ("R1", "R2"),
+            ("CPE1_0", "CPE2_0"),
+            ("CPE1_1", "CPE2_1"),
+        ):
+            first = parameters[first_name]
+            second = parameters[second_name]
+            first.initial, second.initial = second.initial, first.initial
+            first.error_percent, second.error_percent = (
+                second.error_percent,
+                first.error_percent,
+            )
+            first.fixed, second.fixed = second.fixed, first.fixed
+        if cycle.fit_parameters is not None:
+            fitted = {
+                parameter.name: float(value)
+                for parameter, value in zip(cycle.parameters, cycle.fit_parameters)
+            }
+            for first_name, second_name in (
+                ("R1", "R2"),
+                ("CPE1_0", "CPE2_0"),
+                ("CPE1_1", "CPE2_1"),
+            ):
+                fitted[first_name], fitted[second_name] = (
+                    fitted[second_name],
+                    fitted[first_name],
+                )
+            cycle.fit_parameters = np.asarray(
+                [fitted[parameter.name] for parameter in cycle.parameters],
+                dtype=float,
+            )
+        cycle.invalidate_drt_cache()
+        return True
+
+    def switch_parameter_blocks(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        changed = self._switch_parameter_blocks(self.state, self.state.active)
+        self._restore_controls()
+        self._refresh_explorer_values()
+        self._refresh_plot(rescale=True)
+        self._update_status(
+            "parameter blocks switched"
+            if changed
+            else "switch blocks requires R0-L0-p(R1,CPE1)-p(R2,CPE2)"
+        )
+
+    def switch_selected_parameter_blocks(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        changed = 0
+        for _dataset_id, loaded, spectrum in selected_rows:
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            if self._switch_parameter_blocks(loaded.state, cycle):
+                changed += 1
+        self._restore_controls()
+        self._refresh_explorer_values()
+        self._refresh_plot(rescale=True)
+        self._update_status(
+            f"parameter blocks switched for {changed} selected spectra"
+            if changed
+            else "switch blocks requires R0-L0-p(R1,CPE1)-p(R2,CPE2)"
+        )
+
     def _sort_cycle_parameters_by_tau(
         self,
         state: ProjectState,
@@ -3729,6 +3862,33 @@ class EISApplication:
             self.parameter_table.set_parameters(parameters)
             self._refresh_plot(rescale=True)
             self._update_status("fit complete")
+
+    def fit_selected(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        targets = [
+            SpectrumFitTarget(
+                loaded=loaded,
+                cycle=spectrum.cycle,
+                label=f"{loaded.dataset_label}, cycle {spectrum.cycle}",
+            )
+            for _dataset_id, loaded, spectrum in selected_rows
+        ]
+        parameters = self.state.parameters_for(self.state.active_cycle)
+        self.status_var.set(f"Fitting {len(targets)} selected spectra…")
+        self._submit(
+            lambda: batch_fit_spectra(
+                targets,
+                parameters,
+                use_target_initial_parameters=True,
+            ),
+            self._finish_explorer_batch_fit,
+            "Selected fit failed",
+        )
 
     def batch_fit(self) -> None:
         if self.state is None or self.loaded is None or not self._capture_controls():

@@ -849,6 +849,8 @@ def batch_fit_from_cycle(
 def batch_fit_spectra(
     targets: list[SpectrumFitTarget],
     initial_parameters: list[ParameterValue],
+    *,
+    use_target_initial_parameters: bool = False,
 ) -> SpectrumBatchReport:
     if not targets:
         return SpectrumBatchReport([])
@@ -889,11 +891,12 @@ def batch_fit_spectra(
                 target.label,
                 "The spectrum has incompatible fitting parameters",
             )
+        fit_parameters = target_parameters if use_target_initial_parameters else next_parameters
         try:
             fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
                 cycle,
                 expected_circuit,
-                next_parameters,
+                fit_parameters,
             )
         except Exception as error:
             return SpectrumBatchReport(
@@ -912,7 +915,7 @@ def batch_fit_spectra(
                 parameter.fixed,
             )
             for parameter, value, error_percent in zip(
-                next_parameters, fitted, errors_percent
+                fit_parameters, fitted, errors_percent
             )
         ]
         completed.append(
@@ -929,5 +932,6 @@ def batch_fit_spectra(
                 ),
             )
         )
-        next_parameters = fitted_parameters
+        if not use_target_initial_parameters:
+            next_parameters = fitted_parameters
     return SpectrumBatchReport(completed)
