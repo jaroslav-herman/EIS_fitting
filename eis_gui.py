@@ -5377,6 +5377,12 @@ class EISApplication:
     def _finish_imports(self, report: ProjectImportReport) -> None:
         for dataset_id, loaded in report.loaded:
             self._register_dataset(dataset_id, loaded)
+        skipped_messages = [
+            f"{loaded.dataset_label}: skipped cycles without impedance data: "
+            f"{', '.join(str(cycle) for cycle in loaded.skipped_cycles)}"
+            for _dataset_id, loaded in report.loaded
+            if loaded.skipped_cycles
+        ]
         self._populate_explorer()
         if report.loaded:
             dataset_id, loaded = report.loaded[0]
@@ -5386,12 +5392,14 @@ class EISApplication:
                 loaded.state.active_cycle,
                 capture_current=False,
             )
-        if report.errors:
-            details = "\n".join(
-                f"{path.name}: {error}" for path, error in report.errors
-            )
+        warning_details = [
+            f"{path.name}: {error}" for path, error in report.errors
+        ]
+        warning_details.extend(skipped_messages)
+        if warning_details:
+            details = "\n".join(warning_details)
             messagebox.showwarning(
-                "Some files were not imported",
+                "Some cycles were skipped" if skipped_messages and not report.errors else "Some data were not imported",
                 details,
                 parent=self.root,
             )

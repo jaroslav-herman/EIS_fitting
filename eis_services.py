@@ -47,6 +47,7 @@ class LoadedProject:
     spectra: list[SpectrumMetadata]
     dataset_id: str
     dataset_label: str
+    skipped_cycles: tuple[int, ...] = ()
 
 
 @dataclass
@@ -130,6 +131,38 @@ def _safe_unique_ints(values: Iterable[object]) -> list[int]:
             result.append(integer)
             seen.add(integer)
     return sorted(result)
+
+
+def _cycles_with_impedance(
+    dataframe,
+    cycles: list[int],
+    control: str,
+) -> tuple[list[int], list[int]]:
+    spectrum_kind = _normalize_spectrum_kind(control)
+    real_column, imaginary_column, _potential_column = SPECTRUM_KIND_COLUMN_MAP[
+        spectrum_kind
+    ]
+    valid_cycles: list[int] = []
+    skipped_cycles: list[int] = []
+    for cycle in cycles:
+        rows = dataframe["cycle_number"] == cycle if "cycle_number" in dataframe.columns else np.ones(len(dataframe), dtype=bool)
+        try:
+            frequency = np.asarray(dataframe.loc[rows, "freq_hz"], dtype=float)
+            real = np.asarray(dataframe.loc[rows, real_column], dtype=float)
+            imaginary = np.asarray(dataframe.loc[rows, imaginary_column], dtype=float)
+            valid = (
+                np.isfinite(frequency)
+                & (frequency != 0)
+                & np.isfinite(real)
+                & np.isfinite(imaginary)
+            )
+        except (KeyError, TypeError, ValueError):
+            valid = np.empty(0, dtype=bool)
+        if np.any(valid):
+            valid_cycles.append(cycle)
+        else:
+            skipped_cycles.append(cycle)
+    return valid_cycles, skipped_cycles
 
 
 def infer_initial(name: str) -> float:
@@ -351,7 +384,6 @@ def load_projects_for_file(
     )
     if not cycles:
         raise ValueError("No cycles were found in the file")
-    active_cycle = cycle if cycle in cycles else cycles[0]
     parameters = circuit_parameters(circuit)
     projects: list[LoadedProject] = []
     spectrum_kinds = _order_spectrum_kinds(
@@ -359,6 +391,12 @@ def load_projects_for_file(
         control,
     )
     for spectrum_kind in spectrum_kinds:
+        valid_cycles, skipped_cycles = _cycles_with_impedance(
+            dataframe, cycles, spectrum_kind
+        )
+        if not valid_cycles:
+            continue
+        active_cycle = cycle if cycle in valid_cycles else valid_cycles[0]
         active = load_cycle(dataframe, active_cycle, spectrum_kind)
         active.parameters = [
         ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper, None, p.fixed)
@@ -368,13 +406,13 @@ def load_projects_for_file(
             source_path=path,
             circuit=circuit,
             control=spectrum_kind,
-            available_cycles=cycles.copy(),
+            available_cycles=valid_cycles.copy(),
             active_cycle=active_cycle,
             default_parameters=parameters,
             cycles={active_cycle: active},
         )
         active.circuit = circuit
-        spectra = catalog_spectra(dataframe, cycles, spectrum_kind)
+        spectra = catalog_spectra(dataframe, valid_cycles, spectrum_kind)
         label = f"{path.name} [{SPECTRUM_KIND_LABELS.get(spectrum_kind, spectrum_kind.title())}]"
         projects.append(
             LoadedProject(
@@ -384,6 +422,7 @@ def load_projects_for_file(
                 spectra=spectra,
                 dataset_id=_dataset_id(path, spectrum_kind),
                 dataset_label=label,
+                skipped_cycles=tuple(skipped_cycles),
             )
         )
     return projects
@@ -407,8 +446,11 @@ def load_project_from_dataframe(
     )
     if not cycles:
         raise ValueError("No cycles were found in the saved data")
-    active_cycle = cycle if cycle in cycles else cycles[0]
     parameters = circuit_parameters(circuit)
+    cycles, skipped_cycles = _cycles_with_impedance(dataframe, cycles, spectrum_kind)
+    if not cycles:
+        raise ValueError("No cycles with impedance data were found in the saved data")
+    active_cycle = cycle if cycle in cycles else cycles[0]
     active = load_cycle(dataframe, active_cycle, spectrum_kind)
     active.parameters = [
         ParameterValue(p.name, p.unit, p.initial, p.lower, p.upper, None, p.fixed)
@@ -432,6 +474,7 @@ def load_project_from_dataframe(
         spectra=catalog_spectra(dataframe, cycles, spectrum_kind),
         dataset_id=dataset_id,
         dataset_label=f"{source_path.name} [{SPECTRUM_KIND_LABELS.get(spectrum_kind, spectrum_kind.title())}]",
+        skipped_cycles=tuple(skipped_cycles),
     )
 
 
