@@ -306,6 +306,9 @@ class EISApplication:
         self.show_drt_var = tk.BooleanVar(value=False)
         self.show_kk_var = tk.BooleanVar(value=False)
         self.show_spectrum_var = tk.BooleanVar(value=True)
+        self.show_eec_fit_var = tk.BooleanVar(value=True)
+        self.show_drt_fit_var = tk.BooleanVar(value=False)
+        self.show_drt_recovered_var = tk.BooleanVar(value=False)
         self.hide_legends_var = tk.BooleanVar(value=False)
         self.minimum_frequency_var = tk.StringVar()
         self.maximum_frequency_var = tk.StringVar()
@@ -315,6 +318,8 @@ class EISApplication:
         self._configure_window()
         self._build_menu()
         self._build_interface()
+        self._base_refresh_plot = self._refresh_plot
+        self._refresh_plot = self._refresh_plot_with_drt_recovery
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Up>", lambda _event: self.change_cycle(-1))
         self.root.bind("<Down>", lambda _event: self.change_cycle(1))
@@ -568,6 +573,24 @@ class EISApplication:
             variable=self.show_kk_var,
             command=self.toggle_kk_view,
         ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            self.plot_controls,
+            text="Show EEC fit",
+            variable=self.show_eec_fit_var,
+            command=self.toggle_fit_visibility,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            self.plot_controls,
+            text="Show DRT fit",
+            variable=self.show_drt_fit_var,
+            command=self.toggle_drt_fit_visibility,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            self.plot_controls,
+            text="Show DRT recovered",
+            variable=self.show_drt_recovered_var,
+            command=self.toggle_drt_recovered_visibility,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         self.figure = Figure(figsize=(7.5, 6.5), dpi=100, constrained_layout=True)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
         self.canvas.draw()
@@ -615,6 +638,359 @@ class EISApplication:
     @staticmethod
     def _phase_degrees(values: np.ndarray) -> np.ndarray:
         return -np.degrees(np.angle(values))
+
+    def _refresh_plot_with_drt_recovery(self, *args, **kwargs) -> None:
+        self._base_refresh_plot(*args, **kwargs)
+        self._update_drt_recovered_plot()
+
+    def _drt_recovered_impedance(self, cycle) -> np.ndarray | None:
+        mode = self._selected_drt_mode()
+        if mode == "hybrid":
+            tau_values = cycle.saved_hybrid_tau_s
+            gamma_values = cycle.saved_hybrid_gamma_ohm
+            resistance = cycle.saved_hybrid_ohmic_resistance
+        else:
+            tau_values = cycle.saved_ridge_tau_s
+            gamma_values = cycle.saved_ridge_gamma_ohm
+            resistance = cycle.saved_ridge_ohmic_resistance
+        if tau_values is None or gamma_values is None:
+            return None
+        tau_values = np.asarray(tau_values, dtype=float)
+        gamma_values = np.asarray(gamma_values, dtype=float)
+        valid = (
+            np.isfinite(tau_values)
+            & np.isfinite(gamma_values)
+            & (tau_values > 0.0)
+        )
+        if np.count_nonzero(valid) < 2:
+            return None
+        tau_values = tau_values[valid]
+        gamma_values = gamma_values[valid]
+        order = np.argsort(tau_values)
+        tau_values = tau_values[order]
+        gamma_values = gamma_values[order]
+        frequencies = np.asarray(cycle.frequency_hz, dtype=float)
+        angular_frequency = 2.0 * np.pi * frequencies
+        integrand = gamma_values[None, :] / (
+            1.0 + 1j * angular_frequency[:, None] * tau_values[None, :]
+        )
+        impedance = np.trapezoid(
+            integrand,
+            x=np.log(tau_values),
+            axis=1,
+        )
+        if resistance is not None:
+            impedance = impedance + float(resistance)
+        inductance = cycle.saved_ridge_inductance
+        if inductance is not None:
+            impedance = impedance + 1j * angular_frequency * float(inductance)
+        return impedance
+
+    def _drt_peak_impedance(
+        self,
+        cycle,
+        frequencies: np.ndarray | None = None,
+    ) -> np.ndarray | None:
+        if not self.drt_peak_parameters:
+            return None
+        if frequencies is None:
+            frequencies = cycle.frequency_hz
+        frequencies = np.asarray(frequencies, dtype=float)
+        angular_frequency = 2.0 * np.pi * frequencies
+        peaks = []
+        for peak in self.drt_peak_parameters:
+            try:
+                center = float(peak["center_log10"])
+                sigma = max(float(peak["sigma_log10"]), 1e-8)
+                height = max(float(peak["height"]), 0.0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            peaks.append((center, sigma, height))
+        if not peaks:
+            return None
+        lower = min(center - 6.0 * sigma for center, sigma, _height in peaks)
+        upper = max(center + 6.0 * sigma for center, sigma, _height in peaks)
+        tau_values = np.logspace(lower, upper, 1200)
+        gamma_values = np.zeros_like(tau_values)
+        log_tau = np.log10(tau_values)
+        for center, sigma, height in peaks:
+            gamma_values += height * np.exp(-0.5 * ((log_tau - center) / sigma) ** 2)
+        impedance = np.trapezoid(
+            gamma_values[None, :] / (
+                1.0 + 1j * angular_frequency[:, None] * tau_values[None, :]
+            ),
+            x=np.log(tau_values),
+            axis=1,
+        )
+        mode = self._selected_drt_mode()
+        resistance = (
+            cycle.saved_hybrid_ohmic_resistance
+            if mode == "hybrid"
+            else cycle.saved_ridge_ohmic_resistance
+        )
+        if resistance is not None:
+            impedance = impedance + float(resistance)
+        if cycle.saved_ridge_inductance is not None:
+            impedance = impedance + 1j * angular_frequency * float(
+                cycle.saved_ridge_inductance
+            )
+        return impedance
+
+    def _update_drt_fit_curve(self, cycle, impedance: np.ndarray | None) -> None:
+        if not hasattr(self, "drt_fit_artist"):
+            return
+        if not self.show_drt_fit_var.get() or impedance is None:
+            self.drt_fit_artist.set_data([], [])
+            if getattr(self, "drt_phase_fit_artist", None) is not None:
+                self.drt_phase_fit_artist.set_data([], [])
+            return
+        active_frequency = np.asarray(cycle.frequency_hz[cycle.included], dtype=float)
+        active_frequency = active_frequency[np.isfinite(active_frequency) & (active_frequency > 0)]
+        if active_frequency.size < 2:
+            self.drt_fit_artist.set_data([], [])
+            return
+        curve_frequency = np.unique(
+            np.concatenate(
+                (
+                    np.geomspace(
+                        float(np.min(active_frequency)),
+                        float(np.max(active_frequency)),
+                        500,
+                    ),
+                    active_frequency,
+                )
+            )
+        )
+        curve_impedance = self._drt_peak_impedance(cycle, curve_frequency)
+        if curve_impedance is None:
+            self.drt_fit_artist.set_data([], [])
+            return
+        if self.plot_mode == "nyquist":
+            self.drt_fit_artist.set_data(
+                curve_impedance.real, -curve_impedance.imag
+            )
+        else:
+            self.drt_fit_artist.set_data(
+                curve_frequency, np.abs(curve_impedance)
+            )
+            if getattr(self, "drt_phase_fit_artist", None) is not None:
+                self.drt_phase_fit_artist.set_data(
+                    curve_frequency, self._phase_degrees(curve_impedance)
+                )
+
+    def _update_drt_curve_comparison(
+        self,
+        prefix: str,
+        impedance: np.ndarray | None,
+        color: str,
+        label: str,
+    ) -> None:
+        cycle = self.state.active if self.state is not None else None
+        if cycle is None or impedance is None:
+            impedance = np.asarray([], dtype=complex)
+        frequency = np.asarray(cycle.frequency_hz, dtype=float) if cycle is not None else np.asarray([])
+        measured = np.asarray(cycle.impedance, dtype=complex) if cycle is not None else np.asarray([])
+        included = np.asarray(cycle.included, dtype=bool) if cycle is not None else np.asarray([], dtype=bool)
+        names = (
+            "points_included",
+            "points_excluded",
+            "residual",
+            "excluded_residual",
+            "phase_points_included",
+            "phase_points_excluded",
+            "phase_residual",
+            "phase_excluded_residual",
+        )
+        artists = {name: f"{prefix}_{name}" for name in names}
+        if not hasattr(self, artists["points_included"]) or getattr(
+            self, artists["points_included"]
+        ).axes is not self.axes:
+            setattr(self, artists["points_included"], self.axes.plot(
+                [], [], "o", color=color, markersize=3, alpha=0.55,
+                label=f"{label} at measured frequencies",
+            )[0])
+            setattr(self, artists["points_excluded"], self.axes.plot(
+                [], [], "o", color=color, markersize=2, alpha=0.18,
+                label="_nolegend_",
+            )[0])
+            setattr(self, artists["residual"], self._line_collection_class(
+                [], colors="#777777", linewidths=0.8, linestyles="dashed",
+                alpha=0.3, label=f"Measured-to-{label.lower()} difference",
+            ))
+            setattr(self, artists["excluded_residual"], self._line_collection_class(
+                [], colors="#777777", linewidths=0.7, linestyles="dashed",
+                alpha=0.1, label="_nolegend_",
+            ))
+            self.axes.add_collection(getattr(self, artists["residual"]))
+            self.axes.add_collection(getattr(self, artists["excluded_residual"]))
+        if self.plot_mode == "bode" and self.phase_axes is not None:
+            phase_artist = getattr(self, artists["phase_points_included"], None)
+            if phase_artist is None or phase_artist.axes is not self.phase_axes:
+                setattr(self, artists["phase_points_included"], self.phase_axes.plot(
+                    [], [], "o", color=color, markersize=2.5, alpha=0.5,
+                    label=f"{label} phase at measured frequencies",
+                )[0])
+                setattr(self, artists["phase_points_excluded"], self.phase_axes.plot(
+                    [], [], "o", color=color, markersize=2, alpha=0.16,
+                    label="_nolegend_",
+                )[0])
+                setattr(self, artists["phase_residual"], self._line_collection_class(
+                    [], colors="#777777", linewidths=0.7, linestyles="dashed",
+                    alpha=0.3, label=f"Measured-to-{label.lower()} phase difference",
+                ))
+                setattr(self, artists["phase_excluded_residual"], self._line_collection_class(
+                    [], colors="#777777", linewidths=0.6, linestyles="dashed",
+                    alpha=0.1, label="_nolegend_",
+                ))
+                self.phase_axes.add_collection(getattr(self, artists["phase_residual"]))
+                self.phase_axes.add_collection(getattr(self, artists["phase_excluded_residual"]))
+        visible = (
+            self.show_drt_recovered_var.get()
+            if prefix == "drt_recovered"
+            else self.show_drt_fit_var.get()
+        )
+        if not visible or impedance.size != frequency.size or measured.size != frequency.size:
+            for name in (
+                "points_included",
+                "points_excluded",
+                "phase_points_included",
+                "phase_points_excluded",
+            ):
+                artist = getattr(self, artists[name], None)
+                if artist is not None:
+                    artist.set_data([], [])
+            for name in (
+                "residual",
+                "excluded_residual",
+                "phase_residual",
+                "phase_excluded_residual",
+            ):
+                artist = getattr(self, artists[name], None)
+                if artist is not None:
+                    artist.set_segments([])
+            return
+        calculated = impedance
+        if self.plot_mode == "nyquist":
+            x_measured, y_measured = measured.real, -measured.imag
+            x_calculated, y_calculated = calculated.real, -calculated.imag
+            getattr(self, artists["points_included"]).set_data(x_calculated[included], y_calculated[included])
+            getattr(self, artists["points_excluded"]).set_data(x_calculated[~included], y_calculated[~included])
+            getattr(self, artists["residual"]).set_segments([
+                [(x_measured[index], y_measured[index]), (x_calculated[index], y_calculated[index])]
+                for index in np.flatnonzero(included)
+            ])
+            getattr(self, artists["excluded_residual"]).set_segments([
+                [(x_measured[index], y_measured[index]), (x_calculated[index], y_calculated[index])]
+                for index in np.flatnonzero(~included)
+            ])
+        elif self.phase_axes is not None:
+            magnitude_measured = np.abs(measured)
+            magnitude_calculated = np.abs(calculated)
+            phase_measured = self._phase_degrees(measured)
+            phase_calculated = self._phase_degrees(calculated)
+            getattr(self, artists["points_included"]).set_data(frequency[included], magnitude_calculated[included])
+            getattr(self, artists["points_excluded"]).set_data(frequency[~included], magnitude_calculated[~included])
+            getattr(self, artists["residual"]).set_segments([
+                [(frequency[index], magnitude_measured[index]), (frequency[index], magnitude_calculated[index])]
+                for index in np.flatnonzero(included)
+            ])
+            getattr(self, artists["excluded_residual"]).set_segments([
+                [(frequency[index], magnitude_measured[index]), (frequency[index], magnitude_calculated[index])]
+                for index in np.flatnonzero(~included)
+            ])
+            getattr(self, artists["phase_points_included"]).set_data(frequency[included], phase_calculated[included])
+            getattr(self, artists["phase_points_excluded"]).set_data(frequency[~included], phase_calculated[~included])
+            getattr(self, artists["phase_residual"]).set_segments([
+                [(frequency[index], phase_measured[index]), (frequency[index], phase_calculated[index])]
+                for index in np.flatnonzero(included)
+            ])
+            getattr(self, artists["phase_excluded_residual"]).set_segments([
+                [(frequency[index], phase_measured[index]), (frequency[index], phase_calculated[index])]
+                for index in np.flatnonzero(~included)
+            ])
+
+    def _update_drt_recovered_plot(self) -> None:
+        if not hasattr(self, "axes"):
+            return
+        recovered = None
+        if self.show_drt_recovered_var.get() and self.state is not None:
+            recovered = self._drt_recovered_impedance(self.state.active)
+        if recovered is None:
+            if hasattr(self, "drt_recovered_artist"):
+                self.drt_recovered_artist.set_data([], [])
+            if hasattr(self, "phase_drt_recovered_artist"):
+                self.phase_drt_recovered_artist.set_data([], [])
+            peak_impedance = (
+                self._drt_peak_impedance(self.state.active)
+                if self.state is not None and self.show_drt_fit_var.get()
+                else None
+            )
+            self._update_drt_fit_curve(self.state.active, peak_impedance) if self.state is not None else None
+            self._update_drt_curve_comparison(
+                "drt_recovered", None, "#00838f", "DRT recovered"
+            )
+            self._update_drt_curve_comparison(
+                "drt_fit",
+                peak_impedance,
+                "#6a1b9a",
+                "DRT fit",
+            )
+            if hasattr(self, "canvas"):
+                self.canvas.draw_idle()
+            return
+        frequency = np.asarray(self.state.active.frequency_hz, dtype=float)
+        included = self.state.active.included
+        if (
+            not hasattr(self, "drt_recovered_artist")
+            or self.drt_recovered_artist.axes is not self.axes
+        ):
+            (self.drt_recovered_artist,) = self.axes.plot(
+                [], [], "-", color="#00838f", linewidth=1.8,
+                alpha=0.85, label="DRT recovered",
+            )
+        if self.plot_mode == "nyquist":
+            self.drt_recovered_artist.set_data(
+                recovered.real[included], -recovered.imag[included]
+            )
+            if hasattr(self, "phase_drt_recovered_artist"):
+                self.phase_drt_recovered_artist.set_data([], [])
+        else:
+            self.drt_recovered_artist.set_data(
+                frequency[included], np.abs(recovered[included])
+            )
+            if (
+                not hasattr(self, "phase_drt_recovered_artist")
+                or self.phase_drt_recovered_artist.axes is not self.phase_axes
+            ):
+                if self.phase_axes is None:
+                    return
+                (self.phase_drt_recovered_artist,) = self.phase_axes.plot(
+                    [], [], "-", color="#00695c", linewidth=1.5,
+                    alpha=0.85, label="DRT recovered phase",
+                )
+            self.phase_drt_recovered_artist.set_data(
+                frequency[included], self._phase_degrees(recovered[included])
+            )
+        peak_impedance = (
+            self._drt_peak_impedance(self.state.active)
+            if self.show_drt_fit_var.get() and self.state is not None
+            else None
+        )
+        self._update_drt_fit_curve(self.state.active, peak_impedance) if self.state is not None else None
+        self._update_drt_curve_comparison(
+            "drt_recovered", recovered, "#00838f", "DRT recovered"
+        )
+        self._update_drt_curve_comparison(
+            "drt_fit",
+            peak_impedance,
+            "#6a1b9a",
+            "DRT fit",
+        )
+        self._update_legend_visibility()
+        self.canvas.draw_idle()
+
+    def toggle_drt_recovered_visibility(self) -> None:
+        self._refresh_plot(rescale=False)
 
     def _update_plot_mode_button(self) -> None:
         if not hasattr(self, "toggle_plot_mode_button"):
@@ -864,6 +1240,17 @@ class EISApplication:
             self._configure_nyquist_plot()
         if not show_spectrum:
             self.axes.set_visible(False)
+        (self.drt_fit_artist,) = self.axes.plot(
+            [], [], "-", color="#00897b", linewidth=1.8, alpha=0.9, label="DRT fit"
+        )
+        self.drt_phase_fit_artist = None
+        if self.phase_axes is not None:
+            (self.drt_phase_fit_artist,) = self.phase_axes.plot(
+                [], [], "-", color="#00897b", linewidth=1.6, alpha=0.9, label="−Phase DRT fit"
+            )
+        self.axes.legend(loc="best")
+        if self.phase_axes is not None:
+            self.phase_axes.legend(loc="best")
         self.axes.axhline(
             0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0
         )
@@ -1072,7 +1459,15 @@ class EISApplication:
             command=self.open_fit_parameters_explorer,
         )
         self.plot_fit_parameters_button.grid(
-            row=1, column=0, columnspan=4, pady=(6, 0), sticky="ew"
+            row=1, column=0, columnspan=2, padx=(0, 3), pady=(6, 0), sticky="ew"
+        )
+        self.plot_drt_parameters_button = ttk.Button(
+            explorer_actions,
+            text="DRT parameters explorer",
+            command=self.open_drt_parameters_explorer,
+        )
+        self.plot_drt_parameters_button.grid(
+            row=1, column=2, columnspan=2, padx=(3, 0), pady=(6, 0), sticky="ew"
         )
         self.explorer_selection_var = tk.StringVar(value="0 spectra selected")
         ttk.Label(
@@ -1955,6 +2350,7 @@ class EISApplication:
             self.plot_selected_button,
             self.plot_three_electrode_button,
             self.plot_fit_parameters_button,
+            self.plot_drt_parameters_button,
             self.paste_metadata_button,
             self.frequency_button,
             self.frequency_selected_button,
@@ -2453,6 +2849,38 @@ class EISApplication:
                 residuals = np.stack((measured_points, fitted_points), axis=1)
                 self.residual_artist.set_segments(residuals[included])
                 self.excluded_residual_artist.set_segments(residuals[~included])
+        if not self.show_eec_fit_var.get():
+            self.fit_artist.set_data([], [])
+            self.fit_points_included_artist.set_data([], [])
+            self.fit_points_excluded_artist.set_data([], [])
+            self.residual_artist.set_segments([])
+            self.excluded_residual_artist.set_segments([])
+            if self.phase_fit_artist is not None:
+                self.phase_fit_artist.set_data([], [])
+            if self.phase_fit_points_included_artist is not None:
+                self.phase_fit_points_included_artist.set_data([], [])
+            if self.phase_fit_points_excluded_artist is not None:
+                self.phase_fit_points_excluded_artist.set_data([], [])
+            if self.phase_residual_artist is not None:
+                self.phase_residual_artist.set_segments([])
+            if self.phase_excluded_residual_artist is not None:
+                self.phase_excluded_residual_artist.set_segments([])
+        eec_visible = self.show_eec_fit_var.get()
+        for artist in (
+            self.fit_artist,
+            self.fit_points_included_artist,
+            self.fit_points_excluded_artist,
+            self.residual_artist,
+            self.excluded_residual_artist,
+            self.phase_fit_artist,
+            self.phase_fit_points_included_artist,
+            self.phase_fit_points_excluded_artist,
+            self.phase_residual_artist,
+            self.phase_excluded_residual_artist,
+        ):
+            if artist is not None:
+                artist.set_visible(eec_visible)
+        self._refresh_drt_fit_artists(cycle)
         if self.kk_axes is not None and self.kk_real_artist is not None and self.kk_imag_artist is not None:
             if (
                 cycle.kk_cache_matches()
@@ -2619,35 +3047,6 @@ class EISApplication:
         if not hasattr(self, "drt_peak_table"):
             return
         parameters = []
-        for index, peak in enumerate(self.drt_peak_parameters, 1):
-            tau, area, fwhm = self._peak_summary(peak)
-            for suffix, value, error_key in (
-                ("tau", tau, "tau_error_percent"),
-                ("area", area, "area_error_percent"),
-                ("fwhm", fwhm, "fwhm_error_percent"),
-            ):
-                lower_key = f"{suffix}_lower"
-                upper_key = f"{suffix}_upper"
-                magnitude = max(abs(value), np.finfo(float).eps)
-                default_limits = {
-                    "tau": (1e-5, 10.0),
-                    "area": (0.0, 1e3),
-                    "fwhm": (0.0, 1.0),
-                }
-                default_lower, default_upper = default_limits[suffix]
-                lower = peak.get(lower_key, default_lower)
-                upper = peak.get(upper_key, default_upper)
-                parameters.append(
-                    ParameterValue(
-                        f"Peak{index}_{suffix}",
-                        "s" if suffix == "tau" else "Ohm",
-                        value,
-                        lower,
-                        upper,
-                        peak.get(error_key),
-                        bool(peak.get(f"{suffix}_fixed", False)),
-                    )
-                )
         if self.state is not None:
             mode = self.analysis_drt_mode_var.get()
             cycle = self.state.active
@@ -2672,6 +3071,36 @@ class EISApplication:
                 )
                 parameters.append(
                     ParameterValue(name, unit, value, lower, upper, None)
+                )
+
+        for index, peak in enumerate(self.drt_peak_parameters, 1):
+            tau, area, fwhm = self._peak_summary(peak)
+            for suffix, value, error_key in (
+                ("area", area, "area_error_percent"),
+                ("tau", tau, "tau_error_percent"),
+                ("fwhm", fwhm, "fwhm_error_percent"),
+            ):
+                lower_key = f"{suffix}_lower"
+                upper_key = f"{suffix}_upper"
+                magnitude = max(abs(value), np.finfo(float).eps)
+                default_limits = {
+                    "tau": (1e-5, 10.0),
+                    "area": (0.0, 1e3),
+                    "fwhm": (0.0, 1.0),
+                }
+                default_lower, default_upper = default_limits[suffix]
+                lower = peak.get(lower_key, default_lower)
+                upper = peak.get(upper_key, default_upper)
+                parameters.append(
+                    ParameterValue(
+                        f"Peak{index}_{suffix}",
+                        "s" if suffix == "tau" else "Ohm",
+                        value,
+                        lower,
+                        upper,
+                        peak.get(error_key),
+                        bool(peak.get(f"{suffix}_fixed", False)),
+                    )
                 )
         self.drt_peak_table.set_parameters(parameters)
 
@@ -3179,6 +3608,80 @@ class EISApplication:
             self._refresh_plot(rescale=True)
         self.canvas.draw_idle()
 
+    def _calculate_drt_fit_impedance(self, cycle):
+        if not self.drt_peak_parameters:
+            return None, None
+        frequency = np.asarray(cycle.frequency_hz, dtype=float)
+        finite = np.isfinite(frequency) & (frequency > 0)
+        if not np.any(finite):
+            return None, None
+        frequency = np.geomspace(
+            float(np.min(frequency[finite])),
+            float(np.max(frequency[finite])),
+            300,
+        )
+        mode = self.analysis_drt_mode_var.get()
+        table_values = {
+            parameter.name: parameter
+            for parameter in self.drt_peak_table.values()
+        }
+        resistance = (
+            cycle.saved_hybrid_ohmic_resistance
+            if mode == "Hybrid DRT"
+            else cycle.saved_ridge_ohmic_resistance
+        )
+        inductance = (
+            cycle.saved_ridge_inductance if mode == "Ridge DRT" else None
+        )
+        if "R0" in table_values:
+            resistance = table_values["R0"].initial
+        if "L0" in table_values:
+            inductance = table_values["L0"].initial
+        impedance = np.full(frequency.size, float(resistance or 0.0), dtype=complex)
+        omega = 2.0 * np.pi * frequency
+        if inductance is not None:
+            impedance += 1j * omega * float(inductance)
+        for peak in self.drt_peak_parameters:
+            tau, area, _fwhm = self._peak_summary(peak)
+            impedance += area / (1.0 + 1j * omega * tau)
+        return frequency, impedance
+
+    def _refresh_drt_fit_artists(self, cycle) -> None:
+        if not hasattr(self, "drt_fit_artist"):
+            return
+        self.drt_fit_artist.set_visible(self.show_drt_fit_var.get())
+        if self.drt_phase_fit_artist is not None:
+            self.drt_phase_fit_artist.set_visible(self.show_drt_fit_var.get())
+        if not self.show_drt_fit_var.get():
+            self.drt_fit_artist.set_data([], [])
+            if self.drt_phase_fit_artist is not None:
+                self.drt_phase_fit_artist.set_data([], [])
+            return
+        frequency, impedance = self._calculate_drt_fit_impedance(cycle)
+        if frequency is None:
+            self.drt_fit_artist.set_data([], [])
+            if self.drt_phase_fit_artist is not None:
+                self.drt_phase_fit_artist.set_data([], [])
+            return
+        if self.plot_mode == "bode":
+            self.drt_fit_artist.set_data(frequency, np.abs(impedance))
+            if self.drt_phase_fit_artist is not None:
+                self.drt_phase_fit_artist.set_data(
+                    frequency, self._phase_degrees(impedance)
+                )
+        else:
+            self.drt_fit_artist.set_data(impedance.real, -impedance.imag)
+            if self.drt_phase_fit_artist is not None:
+                self.drt_phase_fit_artist.set_data([], [])
+
+    def toggle_fit_visibility(self) -> None:
+        self._refresh_plot(rescale=False)
+
+    def toggle_drt_fit_visibility(self) -> None:
+        if self.show_drt_fit_var.get() and not self._sync_drt_peak_parameters_from_table():
+            self.show_drt_fit_var.set(False)
+        self._refresh_plot(rescale=False)
+
     def toggle_kk_view(self) -> None:
         self._configure_plot_layout()
         if self.state is None:
@@ -3328,6 +3831,10 @@ class EISApplication:
         self.included_artist.set_data([], [])
         self.excluded_artist.set_data([], [])
         self.fit_artist.set_data([], [])
+        if hasattr(self, "drt_fit_artist"):
+            self.drt_fit_artist.set_data([], [])
+        if getattr(self, "drt_phase_fit_artist", None) is not None:
+            self.drt_phase_fit_artist.set_data([], [])
         self.fit_points_included_artist.set_data([], [])
         self.fit_points_excluded_artist.set_data([], [])
         self.residual_artist.set_segments([])
@@ -5027,6 +5534,319 @@ class EISApplication:
                         record[name] = numeric_value
                 records.append(record)
         return records
+
+    def _collect_drt_parameter_records(self, mode: str) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for dataset_id in self._dataset_order:
+            loaded = self.loaded_projects[dataset_id]
+            for spectrum in loaded.spectra:
+                cycle = loaded.state.cycles.get(spectrum.cycle)
+                if cycle is None:
+                    continue
+                if mode == "hybrid":
+                    saved_peaks = cycle.saved_hybrid_peak_parameters
+                    resistance = cycle.saved_hybrid_ohmic_resistance
+                else:
+                    saved_peaks = cycle.saved_ridge_peak_parameters
+                    resistance = cycle.saved_ridge_ohmic_resistance
+                if not saved_peaks and resistance is None:
+                    continue
+                record: dict[str, object] = {
+                    "source_file": loaded.state.source_path.name,
+                    "cycle": spectrum.cycle,
+                    "potential_V": cycle.potential_v,
+                    "current_mA": cycle.current_ma,
+                    "drt_mode": mode,
+                }
+                if resistance is not None:
+                    record["R0"] = float(resistance)
+                if cycle.saved_ridge_inductance is not None:
+                    record["L0"] = float(cycle.saved_ridge_inductance)
+                for index, peak in enumerate(saved_peaks, 1):
+                    try:
+                        tau, area, fwhm = self._peak_summary(peak)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    record[f"peak{index}_area"] = float(area)
+                    record[f"peak{index}_tau"] = float(tau)
+                    record[f"peak{index}_fwhm"] = float(fwhm)
+                metadata = dict(cycle.custom_metadata)
+                metadata.update(spectrum.custom_metadata)
+                for name, value in metadata.items():
+                    try:
+                        numeric_value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(numeric_value):
+                        record[name] = numeric_value
+                records.append(record)
+        return records
+
+    def open_drt_parameters_explorer(self) -> None:
+        if self.busy or self.state is None:
+            return
+        existing_popup = getattr(self, "drt_parameters_popup", None)
+        if existing_popup is not None and existing_popup.winfo_exists():
+            existing_popup.lift()
+            existing_popup.focus_force()
+            return
+        mode = self._selected_drt_mode()
+        records = self._collect_drt_parameter_records(mode)
+        if not records:
+            self._update_status(f"no {mode} parameters are available")
+            return
+
+        def numeric_fields() -> list[str]:
+            return [
+                field
+                for field in dict.fromkeys(
+                    key
+                    for record in records
+                    for key in record
+                    if key not in {"source_file", "drt_mode"}
+                )
+                if any(
+                    isinstance(record.get(field), (int, float, np.integer, np.floating))
+                    for record in records
+                )
+            ]
+
+        fields = numeric_fields()
+        parameter_fields = [
+            field
+            for field in fields
+            if field == "R0" or field == "L0" or field.startswith("peak")
+        ]
+        x_default = "current_mA" if "current_mA" in fields else fields[0]
+        y_default = parameter_fields[0] if parameter_fields else fields[0]
+
+        popup = tk.Toplevel(self.root)
+        self.drt_parameters_popup = popup
+        popup.title(f"DRT Parameters Explorer — {mode.title()}")
+        popup.geometry("1180x760")
+        popup.minsize(900, 600)
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+
+        def close_popup() -> None:
+            self.drt_parameters_popup = None
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        controls = ttk.Frame(popup, padding=8)
+        controls.grid(row=0, column=0, sticky="ew")
+        for column in range(5):
+            controls.columnconfigure(column, weight=1)
+        x_var = tk.StringVar(value=x_default)
+        y_var = tk.StringVar(value=y_default)
+        split_var = tk.StringVar(value="None")
+        x_equation = tk.StringVar(value="x")
+        y_equation = tk.StringVar(value="y")
+        x_log = tk.BooleanVar(value=False)
+        y_log = tk.BooleanVar(value=False)
+        ttk.Label(controls, text="X axis").grid(row=0, column=0, sticky="w")
+        ttk.Label(controls, text="Y axis").grid(row=0, column=1, sticky="w")
+        ttk.Label(controls, text="Split by").grid(row=0, column=2, sticky="w")
+        x_box = ttk.Combobox(controls, textvariable=x_var, state="readonly")
+        y_box = ttk.Combobox(controls, textvariable=y_var, state="readonly")
+        split_box = ttk.Combobox(controls, textvariable=split_var, state="readonly")
+        x_box.grid(row=1, column=0, padx=(0, 6), sticky="ew")
+        y_box.grid(row=1, column=1, padx=3, sticky="ew")
+        split_box.grid(row=1, column=2, padx=(6, 12), sticky="ew")
+        ttk.Checkbutton(controls, text="Log X", variable=x_log).grid(row=1, column=3, sticky="w")
+        ttk.Checkbutton(controls, text="Log Y", variable=y_log).grid(row=1, column=4, sticky="w")
+        ttk.Label(controls, text="X equation").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(controls, text="Y equation").grid(row=2, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(controls, textvariable=x_equation).grid(row=3, column=0, padx=(0, 6), sticky="ew")
+        ttk.Entry(controls, textvariable=y_equation).grid(row=3, column=1, padx=3, sticky="ew")
+        ttk.Label(
+            controls,
+            text="Use x, y, column names, and np functions",
+        ).grid(row=3, column=2, columnspan=3, padx=(6, 0), sticky="w")
+
+        range_frame = ttk.LabelFrame(popup, text="Displayed value ranges", padding=6)
+        range_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 6))
+        range_controls = ttk.Frame(range_frame)
+        range_controls.grid(row=0, column=0, columnspan=4, sticky="ew")
+        range_controls.columnconfigure(1, weight=1)
+        range_controls.columnconfigure(2, weight=1)
+        chart_frame = ttk.Frame(range_frame)
+        range_frame.rowconfigure(1, weight=1)
+        range_frame.columnconfigure(0, weight=1)
+        chart_frame.grid(row=1, column=0, columnspan=4, sticky="nsew")
+        chart_frame.columnconfigure(0, weight=1)
+        chart_frame.rowconfigure(0, weight=1)
+
+        from matplotlib import colormaps
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        from matplotlib.figure import Figure
+
+        figure = Figure(figsize=(8.5, 5.8), dpi=100, constrained_layout=True)
+        axes = figure.add_subplot(111)
+        canvas = FigureCanvasTkAgg(figure, master=chart_frame)
+        canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        toolbar = NavigationToolbar2Tk(canvas, chart_frame, pack_toolbar=False)
+        toolbar.update()
+        toolbar.grid(row=1, column=0, sticky="ew")
+
+        range_state: dict[str, tuple[tk.DoubleVar, tk.DoubleVar, float, float]] = {}
+        range_labels: dict[str, tk.StringVar] = {}
+        range_widgets: dict[str, list[tk.Widget]] = {}
+
+        def bounds(field: str) -> tuple[float, float]:
+            values = []
+            for record in records:
+                try:
+                    value = float(record[field])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if np.isfinite(value):
+                    values.append(value)
+            if not values:
+                return 0.0, 1.0
+            minimum, maximum = min(values), max(values)
+            return minimum, maximum if maximum > minimum else minimum + 1.0
+
+        def value_at(field: str, position: float) -> float:
+            _low, _high, minimum, maximum = range_state[field]
+            return minimum + (maximum - minimum) * position / 100.0
+
+        def range_text(field: str) -> str:
+            low, high, _minimum, _maximum = range_state[field]
+            return f"{value_at(field, low.get()):.5g} – {value_at(field, high.get()):.5g}"
+
+        def update_range_label(field: str) -> None:
+            low, high, _minimum, _maximum = range_state[field]
+            if low.get() > high.get():
+                high.set(low.get())
+            range_labels[field].set(range_text(field))
+            refresh_plot()
+
+        def refresh_ranges() -> None:
+            selected_fields = list(dict.fromkeys(
+                [x_var.get(), y_var.get()]
+                + ([] if split_var.get() == "None" else [split_var.get()])
+            ))
+            for widget_list in range_widgets.values():
+                for widget in widget_list:
+                    widget.grid_remove()
+            for row, field in enumerate(selected_fields):
+                if field not in range_state:
+                    low = tk.DoubleVar(value=0.0)
+                    high = tk.DoubleVar(value=100.0)
+                    range_state[field] = (low, high, *bounds(field))
+                    range_labels[field] = tk.StringVar(value=range_text(field))
+                    range_widgets[field] = []
+                    ttk.Label(range_controls, text=field).grid(row=row, column=0, sticky="w")
+                    low_scale = ttk.Scale(
+                        range_controls, from_=0, to=100, variable=low,
+                        command=lambda _value, selected=field: update_range_label(selected),
+                    )
+                    high_scale = ttk.Scale(
+                        range_controls, from_=0, to=100, variable=high,
+                        command=lambda _value, selected=field: update_range_label(selected),
+                    )
+                    low_scale.grid(row=row, column=1, padx=6, sticky="ew")
+                    high_scale.grid(row=row, column=2, padx=6, sticky="ew")
+                    ttk.Label(range_controls, textvariable=range_labels[field], width=24).grid(row=row, column=3, sticky="w")
+                    range_widgets[field].extend((low_scale, high_scale))
+                else:
+                    for widget in range_widgets[field]:
+                        widget.grid()
+                    range_controls.grid_slaves(row=row, column=0)[0].grid()
+                    range_controls.grid_slaves(row=row, column=3)[0].grid()
+            refresh_plot()
+
+        def evaluate(
+            record: dict[str, object],
+            expression: str,
+            fallback: str,
+            x_field: str,
+            y_field: str,
+        ) -> float:
+            variables = dict(record)
+            variables["x"] = float(record[x_field])
+            variables["y"] = float(record[y_field])
+            return float(eval(expression.strip() or fallback, {"__builtins__": {}, "np": np}, variables))
+
+        def refresh_plot(*_args) -> None:
+            axes.clear()
+            axes.grid(True, alpha=0.25)
+            axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
+            axes.axvline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
+            x_field, y_field, split_field = x_var.get(), y_var.get(), split_var.get()
+            filtered = []
+            selected_fields = [x_field, y_field] + ([] if split_field == "None" else [split_field])
+            for record in records:
+                try:
+                    if any(
+                        field not in record
+                        or not np.isfinite(float(record[field]))
+                        or not value_at(field, range_state[field][0].get()) <= float(record[field]) <= value_at(field, range_state[field][1].get())
+                        for field in selected_fields
+                    ):
+                        continue
+                    x_value = evaluate(record, x_equation.get(), "x", x_field, y_field)
+                    y_value = evaluate(record, y_equation.get(), "y", x_field, y_field)
+                    if np.isfinite(x_value) and np.isfinite(y_value):
+                        filtered.append((record, x_value, y_value))
+                except (KeyError, TypeError, ValueError, SyntaxError, ZeroDivisionError):
+                    continue
+            groups: dict[object, list[tuple[dict[str, object], float, float]]] = {}
+            if split_field == "None":
+                groups["DRT"] = filtered
+            else:
+                for row in filtered:
+                    groups.setdefault(row[0][split_field], []).append(row)
+            ordered_groups = sorted(groups.items(), key=lambda item: str(item[0]))
+            color_scale = colormaps["rainbow"]
+            for index, (group, values) in enumerate(ordered_groups):
+                if not values:
+                    continue
+                color = color_scale(index / max(len(ordered_groups) - 1, 1))
+                axes.plot(
+                    [value[1] for value in values],
+                    [value[2] for value in values],
+                    "o-",
+                    color=color,
+                    linewidth=1.1,
+                    markersize=4,
+                    label=str(group),
+                )
+            axes.set_xlabel(x_equation.get() or x_field)
+            axes.set_ylabel(y_equation.get() or y_field)
+            axes.set_xscale("log" if x_log.get() else "linear")
+            axes.set_yscale("log" if y_log.get() else "linear")
+            if ordered_groups:
+                axes.legend(loc="best", fontsize=8)
+            canvas.draw_idle()
+
+        def refresh_data() -> None:
+            nonlocal fields
+            records[:] = self._collect_drt_parameter_records(mode)
+            fields = numeric_fields()
+            x_values = [field for field in fields]
+            x_box.configure(values=x_values)
+            y_box.configure(values=x_values)
+            split_box.configure(values=["None", *x_values])
+            if x_var.get() not in x_values:
+                x_var.set(x_values[0])
+            if y_var.get() not in x_values:
+                y_var.set(x_values[0])
+            refresh_ranges()
+
+        x_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+        y_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+        split_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+        x_equation.trace_add("write", lambda *_args: refresh_plot())
+        y_equation.trace_add("write", lambda *_args: refresh_plot())
+        x_log.trace_add("write", lambda *_args: refresh_plot())
+        y_log.trace_add("write", lambda *_args: refresh_plot())
+        x_box.configure(values=fields)
+        y_box.configure(values=fields)
+        split_box.configure(values=["None", *fields])
+        ttk.Button(controls, text="Refresh", command=refresh_data).grid(row=4, column=0, pady=(6, 0), sticky="w")
+        refresh_ranges()
 
     def open_fit_parameters_explorer(self) -> None:
         if self.busy or self.state is None:
