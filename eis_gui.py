@@ -320,6 +320,9 @@ class EISApplication:
         self._build_interface()
         self._base_refresh_plot = self._refresh_plot
         self._refresh_plot = self._refresh_plot_with_drt_recovery
+        self._analysis_windows_cycle_key = None
+        self._analysis_windows_last_busy = False
+        self.root.after(300, self._poll_analysis_windows)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Up>", lambda _event: self.change_cycle(-1))
         self.root.bind("<Down>", lambda _event: self.change_cycle(1))
@@ -410,12 +413,16 @@ class EISApplication:
             command=lambda: self.batch_fit_explorer(1),
         )
         self.fit_menu.add_command(
-            label="Batch fit selected",
-            command=self.batch_fit_selected,
+            label="Batch fit selected down",
+            command=self.batch_fit_selected_down,
         )
         self.fit_menu.add_command(
             label="Batch fit selected up",
-            command=lambda: self.batch_fit_selected(-1),
+            command=lambda: self.batch_fit_selected_down(-1),
+        )
+        self.fit_menu.add_command(
+            label="Batch selected up and down",
+            command=self.batch_fit_selected_up_down,
         )
         self.fit_menu.add_command(
             label="Batch up",
@@ -463,8 +470,9 @@ class EISApplication:
         self._fit_menu_actions = (
             "Fit selected spectrum",
             "Batch down",
-            "Batch fit selected",
+            "Batch fit selected down",
             "Batch fit selected up",
+            "Batch selected up and down",
             "Batch up",
             "Batch down to metadata value…",
             "Batch up to metadata value…",
@@ -2167,6 +2175,14 @@ class EISApplication:
         self.switch_blocks_selected_button.grid(
             row=2, column=1, columnspan=2, padx=(3, 0), pady=(5, 0), sticky="ew"
         )
+        self.open_eec_analysis_button = ttk.Button(
+            model_group,
+            text="Open EEC analysis window",
+            command=self.open_eec_analysis_window,
+        )
+        self.open_eec_analysis_button.grid(
+            row=3, column=0, columnspan=3, pady=(6, 0), sticky="ew"
+        )
 
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
         self.parameters_group = parameters_group
@@ -2376,6 +2392,14 @@ class EISApplication:
         self.send_drt_initials_button.grid(
             row=4, column=0, columnspan=2, pady=(6, 0), sticky="ew"
         )
+        self.open_drt_analysis_button = ttk.Button(
+            self.drt_tools_group,
+            text="Open DRT analysis window",
+            command=self.open_drt_analysis_window,
+        )
+        self.open_drt_analysis_button.grid(
+            row=5, column=0, columnspan=2, pady=(6, 0), sticky="ew"
+        )
         self.drt_peak_table = ParameterTable(self.drt_tools_group)
         self.drt_peak_table.grid(
             row=3, column=0, columnspan=2, pady=(6, 0), sticky="ew"
@@ -2414,6 +2438,8 @@ class EISApplication:
             self.sort_tau_selected_button,
             self.switch_blocks_button,
             self.switch_blocks_selected_button,
+            self.open_eec_analysis_button,
+            self.open_drt_analysis_button,
             self.parameters_selected_button,
             self.apply_fix_selected_button,
             self.apply_initial_selected_button,
@@ -2433,6 +2459,217 @@ class EISApplication:
             self.parameters_group.grid()
             self.drt_tools_group.grid_remove()
             self._update_status("EEC fitting mode")
+
+    def _capture_detached_eec_parameters(self) -> bool:
+        table = getattr(self, "detached_eec_parameter_table", None)
+        if table is None or self.state is None:
+            return self.state is not None
+        try:
+            detached = {parameter.name: parameter for parameter in table.values()}
+        except (TypeError, ValueError):
+            return False
+        current = self.state.parameters_for(self.state.active_cycle)
+        for parameter in current:
+            source = detached.get(parameter.name)
+            if source is None:
+                continue
+            parameter.initial = source.initial
+            parameter.lower = source.lower
+            parameter.upper = source.upper
+            parameter.fixed = source.fixed
+        self.state.active.parameters = current
+        self.parameter_table.set_parameters(current)
+        return True
+
+    def _capture_detached_drt_parameters(self) -> bool:
+        table = getattr(self, "detached_drt_peak_table", None)
+        if table is None:
+            return True
+        try:
+            parameters = table.values()
+        except (TypeError, ValueError):
+            return False
+        self.drt_peak_table.set_parameters(parameters)
+        return self._sync_drt_peak_parameters_from_table()
+
+    def open_eec_analysis_window(self) -> None:
+        if self.state is None or self.busy:
+            return
+        existing = getattr(self, "eec_analysis_popup", None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        popup = tk.Toplevel(self.root)
+        self.eec_analysis_popup = popup
+        popup.title("EEC Analysis")
+        popup.geometry("430x650")
+        popup.minsize(360, 420)
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(2, weight=1)
+
+        def close_popup() -> None:
+            self.eec_analysis_popup = None
+            self.detached_eec_parameter_table = None
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        body = ttk.Frame(popup, padding=10)
+        body.grid(row=0, column=0, rowspan=3, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+        ttk.Label(body, text="Fitting model").grid(row=0, column=0, sticky="w")
+        model_var = tk.StringVar(value=self.model_var.get())
+        model_box = ttk.Combobox(
+            body,
+            textvariable=model_var,
+            values=MODEL_PRESETS,
+            state="normal",
+        )
+        model_box.grid(row=1, column=0, sticky="ew", pady=(3, 8))
+        table_group = ttk.LabelFrame(body, text="Circuit parameters", padding=6)
+        table_group.grid(row=2, column=0, sticky="nsew")
+        table_group.columnconfigure(0, weight=1)
+        table_group.rowconfigure(0, weight=1)
+        table = ParameterTable(table_group)
+        table.grid(row=0, column=0, sticky="nsew")
+        self.detached_eec_parameter_table = table
+        table.set_parameters(self.state.parameters_for(self.state.active_cycle))
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+
+        def apply_model() -> None:
+            if not self._capture_detached_eec_parameters():
+                return
+            self.model_var.set(model_var.get())
+            self.apply_model()
+
+        def fit_current() -> None:
+            if self._capture_detached_eec_parameters():
+                self.fit()
+
+        ttk.Button(buttons, text="Apply model", command=apply_model).grid(
+            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4)
+        )
+        ttk.Button(buttons, text="Fit spectrum", command=fit_current).grid(
+            row=1, column=0, padx=(0, 3), sticky="ew"
+        )
+        ttk.Button(
+            buttons,
+            text="Initial values",
+            command=lambda: self.initialize_from_ridge(),
+        ).grid(row=1, column=1, padx=(3, 0), sticky="ew")
+
+    def open_drt_analysis_window(self) -> None:
+        if self.state is None or self.busy:
+            return
+        existing = getattr(self, "drt_analysis_popup", None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+        popup = tk.Toplevel(self.root)
+        self.drt_analysis_popup = popup
+        popup.title("DRT Analysis")
+        popup.geometry("430x650")
+        popup.minsize(360, 420)
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+
+        def close_popup() -> None:
+            self.drt_analysis_popup = None
+            self.detached_drt_peak_table = None
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        body = ttk.Frame(popup, padding=10)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text="Method").grid(row=0, column=0, sticky="w")
+        mode_var = tk.StringVar(value=self.analysis_drt_mode_var.get())
+        mode_box = ttk.Combobox(
+            body,
+            textvariable=mode_var,
+            values=("Ridge DRT", "Hybrid DRT"),
+            state="readonly",
+        )
+        mode_box.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        table_group = ttk.LabelFrame(body, text="Peak parameters", padding=6)
+        table_group.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
+        table_group.columnconfigure(0, weight=1)
+        table_group.rowconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+        table = ParameterTable(table_group)
+        table.grid(row=0, column=0, sticky="nsew")
+        self.detached_drt_peak_table = table
+        self._update_drt_peak_table()
+        table.set_parameters(self.drt_peak_table.values())
+
+        def change_mode(_event=None) -> None:
+            self.analysis_drt_mode_var.set(mode_var.get())
+            self.drt_mode_var.set(mode_var.get())
+            self._refresh_plot(rescale=True)
+            self._update_drt_peak_table()
+            table.set_parameters(self.drt_peak_table.values())
+
+        mode_box.bind("<<ComboboxSelected>>", change_mode)
+        buttons = ttk.Frame(popup, padding=(10, 0, 10, 10))
+        buttons.grid(row=1, column=0, sticky="ew")
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+        buttons.columnconfigure(2, weight=1)
+
+        def run_action(action: Callable[[], object]) -> None:
+            if self._capture_detached_drt_parameters():
+                action()
+
+        ttk.Button(
+            buttons,
+            text="Fit DRT",
+            command=lambda: run_action(self._fit_selected_drts),
+        ).grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 4))
+        ttk.Button(
+            buttons,
+            text="Add Gaussian peak",
+            command=lambda: run_action(self.add_gaussian_peak),
+        ).grid(row=1, column=0, padx=(0, 3), sticky="ew")
+        ttk.Button(
+            buttons,
+            text="Fit peaks",
+            command=lambda: run_action(self.fit_drt_peaks),
+        ).grid(row=1, column=1, padx=3, sticky="ew")
+        ttk.Button(
+            buttons,
+            text="Send initials",
+            command=lambda: run_action(self.send_drt_initials),
+        ).grid(row=1, column=2, padx=(3, 0), sticky="ew")
+
+    def _poll_analysis_windows(self) -> None:
+        if not self.root.winfo_exists():
+            return
+        current_key = (
+            self.current_dataset_id,
+            self.state.active_cycle if self.state is not None else None,
+        )
+        previous_busy = getattr(self, "_analysis_windows_last_busy", False)
+        needs_refresh = current_key != getattr(self, "_analysis_windows_cycle_key", None)
+        needs_refresh |= previous_busy and not self.busy
+        if self.state is not None and needs_refresh:
+            table = getattr(self, "detached_eec_parameter_table", None)
+            if table is not None and self.eec_analysis_popup.winfo_exists():
+                table.set_parameters(self.state.parameters_for(self.state.active_cycle))
+            table = getattr(self, "detached_drt_peak_table", None)
+            if table is not None and self.drt_analysis_popup.winfo_exists():
+                self._update_drt_peak_table()
+                table.set_parameters(self.drt_peak_table.values())
+            self._analysis_windows_cycle_key = current_key
+        self._analysis_windows_last_busy = self.busy
+        self.root.after(300, self._poll_analysis_windows)
 
     def _fit_selected_drts(self) -> None:
         if self.analysis_drt_mode_var.get() == "Hybrid DRT":
@@ -5351,7 +5588,7 @@ class EISApplication:
             "Explorer batch fit failed",
         )
 
-    def batch_fit_selected(self, direction: int = 1) -> None:
+    def batch_fit_selected_down(self, direction: int = 1) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
         visible_items = list(self.explorer.get_children(""))
@@ -5440,6 +5677,29 @@ class EISApplication:
             f"The {len(report.fits)} successful fits were retained.",
             parent=self.root,
         )
+
+    def batch_fit_selected_up_down(self) -> None:
+        if self.busy or self.state is None:
+            return
+        selected = self._selected_spectrum_rows()
+        if not selected:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        self._batch_fit_both_pending = True
+        self.batch_fit_selected_down(1)
+        if not self.busy:
+            self._batch_fit_both_pending = False
+            return
+        self.root.after(100, self._continue_batch_fit_selected_up_down)
+
+    def _continue_batch_fit_selected_up_down(self) -> None:
+        if not getattr(self, "_batch_fit_both_pending", False):
+            return
+        if self.busy:
+            self.root.after(100, self._continue_batch_fit_selected_up_down)
+            return
+        self._batch_fit_both_pending = False
+        self.batch_fit_selected_down(-1)
 
     def copy_neighbor_fit(self, direction: int) -> None:
         if self.state is None or self.busy or not self._capture_controls():

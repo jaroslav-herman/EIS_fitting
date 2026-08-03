@@ -814,6 +814,29 @@ def fit_cycle(
     )
 
 
+def _batch_parameters_with_initials(
+    target_parameters: list[ParameterValue],
+    source_parameters: list[ParameterValue],
+) -> list[ParameterValue]:
+    source_by_name = {parameter.name: parameter for parameter in source_parameters}
+    copied = []
+    for target in target_parameters:
+        source = source_by_name.get(target.name)
+        initial = target.initial if source is None else source.initial
+        copied.append(
+            ParameterValue(
+                target.name,
+                target.unit,
+                _clamp_initial(initial, target),
+                target.lower,
+                target.upper,
+                target.error_percent,
+                target.fixed,
+            )
+        )
+    return copied
+
+
 def batch_fit_from_cycle(
     dataframe,
     project: ProjectState,
@@ -848,11 +871,15 @@ def batch_fit_from_cycle(
                 failed_cycle=cycle_number,
                 error="The spectrum uses a different fitting model",
             )
+        fit_parameters = _batch_parameters_with_initials(
+            cycle_parameters,
+            next_parameters,
+        )
         try:
             fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
                 cycle,
                 cycle_circuit,
-                next_parameters,
+                fit_parameters,
             )
         except Exception as error:
             return BatchFitReport(
@@ -870,8 +897,8 @@ def batch_fit_from_cycle(
                 float(error_percent),
                 parameter.fixed,
             )
-            for parameter, value, error_percent in zip(
-                next_parameters, fitted, errors_percent
+              for parameter, value, error_percent in zip(
+                  fit_parameters, fitted, errors_percent
             )
         ]
         completed.append(
@@ -934,7 +961,11 @@ def batch_fit_spectra(
                 target.label,
                 "The spectrum has incompatible fitting parameters",
             )
-        fit_parameters = target_parameters if use_target_initial_parameters else next_parameters
+        fit_parameters = (
+            target_parameters
+            if use_target_initial_parameters
+            else _batch_parameters_with_initials(target_parameters, next_parameters)
+        )
         try:
             fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
                 cycle,
