@@ -639,6 +639,60 @@ class EISApplication:
     def _phase_degrees(values: np.ndarray) -> np.ndarray:
         return -np.degrees(np.angle(values))
 
+    def _update_point_hover(self, event) -> None:
+        if self.state is None or self.plot_mode != "nyquist":
+            return self._hide_point_hover()
+        if event.inaxes is not self.axes or event.x is None or event.y is None:
+            return self._hide_point_hover()
+        cycle = self.state.active
+        if cycle.impedance.size == 0:
+            return self._hide_point_hover()
+        display_points = self.axes.transData.transform(
+            np.column_stack((cycle.impedance.real, -cycle.impedance.imag))
+        )
+        distances = np.hypot(
+            display_points[:, 0] - event.x,
+            display_points[:, 1] - event.y,
+        )
+        if distances.size == 0:
+            return self._hide_point_hover()
+        index = int(np.argmin(distances))
+        if distances[index] > 9.0:
+            return self._hide_point_hover()
+        annotation = getattr(self, "point_hover_annotation", None)
+        if annotation is None or annotation.axes is not self.axes:
+            annotation = self.axes.annotate(
+                "",
+                xy=(0.0, 0.0),
+                xytext=(10, 10),
+                textcoords="offset points",
+                ha="left",
+                va="bottom",
+                bbox={
+                    "boxstyle": "round,pad=0.3",
+                    "facecolor": "white",
+                    "edgecolor": "#777777",
+                    "alpha": 0.9,
+                },
+                zorder=20,
+            )
+            self.point_hover_annotation = annotation
+        frequency = float(cycle.frequency_hz[index])
+        annotation.xy = (
+            float(cycle.impedance.real[index]),
+            float(-cycle.impedance.imag[index]),
+        )
+        annotation.set_text(f"f = {frequency:.6g} Hz")
+        annotation.set_visible(True)
+        self.canvas.draw_idle()
+
+    def _hide_point_hover(self) -> None:
+        annotation = getattr(self, "point_hover_annotation", None)
+        if annotation is not None and annotation.get_visible():
+            annotation.set_visible(False)
+            if hasattr(self, "canvas"):
+                self.canvas.draw_idle()
+
     def _refresh_plot_with_drt_recovery(self, *args, **kwargs) -> None:
         self._base_refresh_plot(*args, **kwargs)
         self._update_drt_recovered_plot()
@@ -3999,7 +4053,9 @@ class EISApplication:
             self.canvas.draw_idle()
             return
         if self._pan_state is None:
+            self._update_point_hover(event)
             return
+        self._hide_point_hover()
         axes = self._pan_state["axes"]
         if event.inaxes is not axes or event.xdata is None or event.ydata is None:
             return
