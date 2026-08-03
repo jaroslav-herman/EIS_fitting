@@ -13,7 +13,51 @@ from wepy.eis import capacitance as cpe_capacitance
 from wepy.eis import tau as cpe_tau
 
 PROJECT_FORMAT = "eis-fitting-project"
-PROJECT_VERSION = 3
+PROJECT_VERSION = 4
+
+
+def _external_parameter_name(name: str) -> str:
+    match = re.fullmatch(r"CPE(\d+)_(0|1)", name)
+    if match:
+        suffix = "Q" if match.group(2) == "0" else "a"
+        return f"{suffix}{match.group(1)}"
+    return name
+
+
+def _external_column_name(name: str) -> str:
+    direct = {
+        "potential_V": "Ecell_V",
+        "current_mA": "I_mA",
+        "minimum_frequency_Hz": "fmin_Hz",
+        "maximum_frequency_Hz": "fmax_Hz",
+        "active_minimum_frequency_Hz": "fmin_act_Hz",
+        "active_maximum_frequency_Hz": "fmax_act_Hz",
+        "Cell voltage (V)": "Ecell_V",
+    }
+    if name in direct:
+        return direct[name]
+    if name.endswith("_error_percent"):
+        return f"{_external_parameter_name(name[:-14])}_e"
+    match = re.fullmatch(r"p_R(\d+)_CPE\1_(tau_s|capacitance_F)", name)
+    if match:
+        return f"{('tau' if match.group(2) == 'tau_s' else 'C')}{match.group(1)}"
+    return _external_parameter_name(name)
+
+
+def _externalize_record(record: dict[str, object]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for name, value in record.items():
+        result[_external_column_name(name)] = value
+    return result
+
+
+def _migrate_metadata(metadata: dict[str, object]) -> dict[str, object]:
+    migrated: dict[str, object] = {}
+    for name, value in metadata.items():
+        external_name = _external_column_name(str(name))
+        if external_name not in migrated or str(name) == external_name:
+            migrated[external_name] = value
+    return migrated
 
 
 def _parameter_to_dict(parameter: ParameterValue) -> dict[str, object]:
@@ -105,8 +149,18 @@ def _derived_block_values(
 def _custom_metadata_columns(cycles: list[CycleState]) -> list[str]:
     columns: list[str] = []
     seen: set[str] = set()
+    reserved = {
+        "Ecell_V",
+        "I_mA",
+        "fmin_Hz",
+        "fmax_Hz",
+        "fmin_act_Hz",
+        "fmax_act_Hz",
+    }
     for cycle in cycles:
         for name in cycle.custom_metadata:
+            if name in reserved:
+                continue
             if name not in seen:
                 seen.add(name)
                 columns.append(name)
@@ -128,6 +182,8 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
         }
     return {
         "circuit": cycle.circuit,
+        "potential_v": cycle.potential_v,
+        "current_ma": cycle.current_ma,
         "frequency_window": (
             list(cycle.frequency_window) if cycle.frequency_window is not None else None
         ),
@@ -202,7 +258,7 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
         "saved_hybrid_peak_parameters": [
             dict(peak) for peak in cycle.saved_hybrid_peak_parameters
         ],
-        "custom_metadata": dict(cycle.custom_metadata),
+        "custom_metadata": _migrate_metadata(dict(cycle.custom_metadata)),
     }
 
 
@@ -272,7 +328,7 @@ def load_project_file(
     if payload.get("format") != PROJECT_FORMAT:
         raise ValueError("This is not an EIS fitting project file")
     version = int(payload.get("version", 0))
-    if version not in {1, 2, PROJECT_VERSION}:
+    if version not in {1, 2, 3, PROJECT_VERSION}:
         raise ValueError(f"Unsupported project version: {payload.get('version')}")
 
     circuit = str(payload["circuit"])
@@ -286,6 +342,10 @@ def load_project_file(
             continue
         cycle = load_cycle(dataframe, cycle_number, control)
         cycle.circuit = str(saved.get("circuit") or circuit)
+        if saved.get("potential_v") is not None:
+            cycle.potential_v = float(saved["potential_v"])
+        if saved.get("current_ma") is not None:
+            cycle.current_ma = float(saved["current_ma"])
         included = as_1d_array(saved["manually_included"]).astype(bool)
         outliers = as_1d_array(saved.get("outliers", [])).astype(bool)
         if included.size != cycle.frequency_hz.size:
@@ -404,7 +464,9 @@ def load_project_file(
             cycle.show_hybrid_drt()
         elif cycle.drt_label == "Ridge DRT" and cycle.saved_ridge_tau_s is not None:
             cycle.show_ridge_drt()
-        cycle.custom_metadata = dict(saved.get("custom_metadata", {}))
+        cycle.custom_metadata = _migrate_metadata(
+            dict(saved.get("custom_metadata", {}))
+        )
         restored_cycles[cycle_number] = cycle
 
     requested_active = int(payload.get("active_cycle", current.active_cycle))
@@ -484,7 +546,7 @@ def export_fit_parameters_for_states(
             )
         )
     )
-    fieldnames = [
+    internal_fieldnames = [
         "source_file",
         "source_path",
         "cycle",
@@ -501,6 +563,7 @@ def export_fit_parameters_for_states(
         *parameter_columns,
         *derived_columns,
     ]
+    fieldnames = [_external_column_name(name) for name in internal_fieldnames]
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
@@ -547,7 +610,7 @@ def export_fit_parameters_for_states(
                 }
             )
             row.update(_derived_block_values(cycle.model(state.circuit), cycle_names, values))
-            writer.writerow(row)
+            writer.writerow(_externalize_record(row))
     return len(fitted)
 
 
@@ -601,10 +664,23 @@ def export_python_workspace(
     parameter_columns = [
         column for name in parameter_names for column in (name, f"{name}_error_percent")
     ]
+    external_metadata_columns = [
+        _external_column_name(column) for column in metadata_columns
+    ]
+    external_parameter_columns = [
+        _external_column_name(column) for column in parameter_columns
+    ]
+    external_derived_columns = [
+        _external_column_name(column) for column in derived_columns
+    ]
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(
             stream,
-            fieldnames=[*metadata_columns, *parameter_columns, *derived_columns],
+            fieldnames=[
+                *external_metadata_columns,
+                *external_parameter_columns,
+                *external_derived_columns,
+            ],
         )
         writer.writeheader()
         for state, cycle in fitted:
@@ -650,7 +726,7 @@ def export_python_workspace(
                     values,
                 )
             )
-            writer.writerow(row)
+            writer.writerow(_externalize_record(row))
 
     script_path = path.with_suffix(".py")
     script = f"""
@@ -667,7 +743,7 @@ DATA_FILE = Path(__file__).with_name({path.name!r})
 fit_data = pd.read_csv(DATA_FILE)
 
 # Metadata describing each fitted spectrum.
-metadata_columns = {metadata_columns!r}
+metadata_columns = {external_metadata_columns!r}
 metadata = fit_data.loc[:, metadata_columns].copy()
 
 # Custom metadata imported from the clipboard.
@@ -679,7 +755,7 @@ custom_metadata = (
 )
 
 # Fitted values and their percentage errors.
-parameter_columns = {parameter_columns!r}
+parameter_columns = {external_parameter_columns!r}
 fit_parameters = fit_data.loc[:, parameter_columns].copy()
 
 # Convenient spectrum-indexed tables for analysis and plotting.
@@ -689,13 +765,13 @@ if "Spectrum" in fit_data.columns:
 indexed_fit_data = fit_data.set_index(index_columns).sort_index()
 parameter_values = indexed_fit_data.loc[:, [
     column for column in parameter_columns
-    if not column.endswith("_error_percent")
+    if not column.endswith("_e")
 ]]
 parameter_errors_percent = indexed_fit_data.loc[:, [
     column for column in parameter_columns
-    if column.endswith("_error_percent")
+    if column.endswith("_e")
 ]]
-derived_columns = {derived_columns!r}
+derived_columns = {external_derived_columns!r}
 derived_values = indexed_fit_data.loc[:, derived_columns].copy()
 
 print(f"Loaded {{len(fit_data)}} fitted spectra from {{DATA_FILE.name}}")
@@ -711,7 +787,7 @@ def export_drts_for_states(
     states: list[ProjectState],
     path: Path,
 ) -> int:
-    fieldnames = [
+    internal_fieldnames = [
         "source_file",
         "source_path",
         "cycle",
@@ -725,6 +801,7 @@ def export_drts_for_states(
         "ohmic_resistance_ohm",
         "ridge_threshold",
     ]
+    fieldnames = [_external_column_name(name) for name in internal_fieldnames]
     rows: list[dict[str, object]] = []
     for state in states:
         for cycle_number, cycle in sorted(state.cycles.items()):
@@ -778,5 +855,5 @@ def export_drts_for_states(
     with path.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(_externalize_record(row) for row in rows)
     return len(rows)

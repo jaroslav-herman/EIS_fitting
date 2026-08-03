@@ -22,6 +22,9 @@ from eis_project import (
     _dataframe_to_payload,
     _state_to_payload,
     _derived_block_values,
+    _external_column_name,
+    _external_parameter_name,
+    _externalize_record,
     _dataframe_to_payload,
     _state_to_payload,
     dataframe_from_payload,
@@ -101,7 +104,9 @@ class ParameterTable(ttk.Frame):
             initial = tk.StringVar(value=f"{parameter.initial:g}")
             lower = tk.StringVar(value=f"{parameter.lower:g}")
             upper = tk.StringVar(value=f"{parameter.upper:g}")
-            ttk.Label(self, text=parameter.name).grid(row=row, column=0, padx=3, pady=2)
+            ttk.Label(self, text=_external_parameter_name(parameter.name)).grid(
+                row=row, column=0, padx=3, pady=2
+            )
             ttk.Checkbutton(self, variable=fixed).grid(
                 row=row, column=1, padx=3, pady=2
             )
@@ -252,6 +257,93 @@ class MetadataColumnDialog(tk.Toplevel):
             values.append(value if value else None)
 
         self.result = (name, values)
+        self.destroy()
+
+
+class MetadataEditDialog(tk.Toplevel):
+    def __init__(
+        self,
+        parent: tk.Tk,
+        spectrum_count: int,
+        columns: list[str],
+    ) -> None:
+        super().__init__(parent)
+        self.result: tuple[str, list[str | None]] | None = None
+        self.spectrum_count = spectrum_count
+        self.title("Edit metadata column")
+        self.geometry("520x430")
+        self.minsize(420, 320)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(4, weight=1)
+        ttk.Label(body, text="Metadata column").grid(row=0, column=0, sticky="w")
+        self.column_var = tk.StringVar(value=columns[0])
+        ttk.Combobox(
+            body,
+            textvariable=self.column_var,
+            values=columns,
+            state="readonly",
+        ).grid(row=1, column=0, sticky="ew", pady=(3, 10))
+        ttk.Label(
+            body,
+            text=(
+                f"Paste one value per line for the {spectrum_count} spectra shown "
+                "in the explorer."
+            ),
+            wraplength=470,
+            justify=tk.LEFT,
+        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        text_frame = ttk.Frame(body)
+        text_frame.grid(row=4, column=0, sticky="nsew")
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
+        self.values_text = tk.Text(text_frame, wrap="none", undo=True)
+        scrollbar = ttk.Scrollbar(
+            text_frame, orient=tk.VERTICAL, command=self.values_text.yview
+        )
+        self.values_text.configure(yscrollcommand=scrollbar.set)
+        self.values_text.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        buttons = ttk.Frame(body)
+        buttons.grid(row=5, column=0, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+        ttk.Button(buttons, text="Apply changes", command=self._accept).pack(
+            side=tk.RIGHT
+        )
+        self.bind("<Control-Return>", lambda _event: self._accept())
+        self.grab_set()
+
+    def _accept(self) -> None:
+        raw = self.values_text.get("1.0", "end-1c").replace("\r\n", "\n")
+        lines = raw.split("\n")
+        while len(lines) > self.spectrum_count and lines[-1] == "":
+            lines.pop()
+        if len(lines) != self.spectrum_count:
+            messagebox.showerror(
+                "Wrong number of values",
+                f"Paste exactly {self.spectrum_count} values; {len(lines)} were found.",
+                parent=self,
+            )
+            return
+        values: list[str | None] = []
+        for line_number, line in enumerate(lines, start=1):
+            cells = line.split("\t")
+            if len(cells) > 1 and any(cell.strip() for cell in cells[1:]):
+                messagebox.showerror(
+                    "Multiple columns pasted",
+                    f"Line {line_number} contains more than one value.",
+                    parent=self,
+                )
+                return
+            value = cells[0].strip()
+            values.append(value if value else None)
+        self.result = (self.column_var.get(), values)
         self.destroy()
 
 
@@ -648,7 +740,12 @@ class EISApplication:
         return -np.degrees(np.angle(values))
 
     def _update_point_hover(self, event) -> None:
-        if self.state is None or self.plot_mode != "nyquist":
+        if (
+            self.state is None
+            or self.plot_mode != "nyquist"
+            or self.point_toggle_mode
+            or self.point_auto_fit
+        ):
             return self._hide_point_hover()
         if event.inaxes is not self.axes or event.x is None or event.y is None:
             return self._hide_point_hover()
@@ -1390,6 +1487,12 @@ class EISApplication:
             command=self.paste_metadata_column_from_clipboard,
         )
         self.paste_metadata_button.pack(side=tk.LEFT, padx=(6, 0))
+        self.edit_metadata_button = ttk.Button(
+            explorer_header,
+            text="Edit metadata",
+            command=self.edit_metadata_column_from_clipboard,
+        )
+        self.edit_metadata_button.pack(side=tk.LEFT, padx=(6, 0))
         ttk.Checkbutton(
             explorer_header,
             text="Natural sort",
@@ -1422,11 +1525,11 @@ class EISApplication:
             "drt": "DRT",
             "source": "Source file",
             "cycle": "Cycle",
-            "potential": "Voltage (V)",
-            "current": "Current (mA)",
+            "potential": "Ecell_V",
+            "current": "I_mA",
             "points": "Points",
-            "f_min": "Min frequency (Hz)",
-            "f_max": "Max frequency (Hz)",
+            "f_min": "fmin_act_Hz",
+            "f_max": "fmax_act_Hz",
         }
         self._explorer_attributes = {
             "fitted": None,
@@ -1569,6 +1672,15 @@ class EISApplication:
                         COUNTER_POTENTIAL_COLUMN,
                     }:
                         continue
+                    if name in {
+                        "Ecell_V",
+                        "I_mA",
+                        "fmin_Hz",
+                        "fmax_Hz",
+                        "fmin_act_Hz",
+                        "fmax_act_Hz",
+                    }:
+                        continue
                     if name not in columns:
                         columns.append(name)
         self._custom_metadata_columns = columns
@@ -1665,9 +1777,11 @@ class EISApplication:
         if column == "cycle":
             return spectrum.cycle
         if column == "potential":
-            return spectrum.potential_v
+            cycle = loaded.state.cycles.get(spectrum.cycle)
+            return cycle.potential_v if cycle is not None else spectrum.potential_v
         if column == "current":
-            return spectrum.current_ma
+            cycle = loaded.state.cycles.get(spectrum.cycle)
+            return cycle.current_ma if cycle is not None else spectrum.current_ma
         if column == "points":
             return spectrum.point_count
         if column == "f_min":
@@ -2430,6 +2544,7 @@ class EISApplication:
             self.plot_fit_parameters_button,
             self.plot_drt_parameters_button,
             self.paste_metadata_button,
+            self.edit_metadata_button,
             self.frequency_button,
             self.frequency_selected_button,
             self.model_button,
@@ -4391,6 +4506,8 @@ class EISApplication:
 
     def toggle_point_edit_mode(self, _event=None) -> str | None:
         self.point_toggle_mode = not self.point_toggle_mode
+        if self.point_toggle_mode:
+            self._hide_point_hover()
         self.toggle_points_button.configure(
             text=f"Edit points: {'On' if self.point_toggle_mode else 'Off'}"
         )
@@ -4403,6 +4520,8 @@ class EISApplication:
 
     def toggle_auto_fit_points(self) -> None:
         self.point_auto_fit = not self.point_auto_fit
+        if self.point_auto_fit:
+            self._hide_point_hover()
         if self.point_auto_fit and not self.point_toggle_mode:
             self.point_toggle_mode = True
             self.toggle_points_button.configure(text="Edit points: On")
@@ -5848,7 +5967,7 @@ class EISApplication:
                         continue
                     if np.isfinite(numeric_value):
                         record[name] = numeric_value
-                records.append(record)
+                records.append(_externalize_record(record))
         return records
 
     def _collect_drt_parameter_records(self, mode: str) -> list[dict[str, object]]:
@@ -5895,7 +6014,7 @@ class EISApplication:
                         continue
                     if np.isfinite(numeric_value):
                         record[name] = numeric_value
-                records.append(record)
+                records.append(_externalize_record(record))
         return records
 
     def open_drt_parameters_explorer(self) -> None:
@@ -5933,7 +6052,7 @@ class EISApplication:
             for field in fields
             if field == "R0" or field == "L0" or field.startswith("peak")
         ]
-        x_default = "current_mA" if "current_mA" in fields else fields[0]
+        x_default = "I_mA" if "I_mA" in fields else fields[0]
         y_default = parameter_fields[0] if parameter_fields else fields[0]
 
         popup = tk.Toplevel(self.root)
@@ -6211,7 +6330,7 @@ class EISApplication:
                         continue
                     if np.isfinite(numeric_value):
                         record[name] = numeric_value
-                records.append(record)
+                records.append(_externalize_record(record))
         if not records:
             self._update_status("no fitted spectra are available")
             return
@@ -6226,9 +6345,12 @@ class EISApplication:
         parameter_fields = [
             field
             for field in numeric_fields
-            if any(field.startswith(prefix) for prefix in ("R", "C", "L", "W"))
+            if any(
+                field.startswith(prefix)
+                for prefix in ("R", "Q", "a", "C", "L", "W", "tau")
+            )
         ]
-        x_default = "current_mA" if "current_mA" in numeric_fields else numeric_fields[0]
+        x_default = "I_mA" if "I_mA" in numeric_fields else numeric_fields[0]
         y_default = parameter_fields[0] if parameter_fields else numeric_fields[0]
 
         popup = tk.Toplevel(self.root)
@@ -6276,7 +6398,7 @@ class EISApplication:
         ttk.Entry(controls, textvariable=y_equation).grid(row=3, column=1, padx=3, sticky="ew")
         ttk.Label(
             controls,
-            text="Use column names and np functions, e.g. 1/R1 or np.log10(current_mA)",
+            text="Use column names and np functions, e.g. 1/R1 or np.log10(I_mA)",
         ).grid(row=3, column=2, columnspan=3, padx=(6, 0), sticky="w")
         ttk.Button(
             controls,
@@ -6512,6 +6634,86 @@ class EISApplication:
             popup.destroy()
         self.open_fit_parameters_explorer()
 
+    def edit_metadata_column_from_clipboard(self) -> None:
+        if self.busy or self.state is None:
+            return
+        visible_items = list(self.explorer.get_children(""))
+        if not visible_items:
+            self._update_status("no spectra are available")
+            return
+        self._sync_custom_metadata_columns()
+        editable_columns = ["Ecell_V", "I_mA", *self._custom_metadata_columns]
+        if not editable_columns:
+            self._update_status("no editable metadata columns are available")
+            return
+        dialog = MetadataEditDialog(
+            self.root,
+            len(visible_items),
+            editable_columns,
+        )
+        self.root.wait_window(dialog)
+        if dialog.result is None:
+            return
+        column_name, values = dialog.result
+        for item, value in zip(visible_items, values):
+            _dataset_id, loaded, spectrum = self._explorer_rows[item]
+            cycle = loaded.state.cycles.get(spectrum.cycle)
+            if cycle is None:
+                cycle = load_cycle(
+                    loaded.dataframe,
+                    spectrum.cycle,
+                    loaded.state.control,
+                )
+                if loaded.state.all_frequency_window is not None:
+                    cycle.frequency_window = loaded.state.all_frequency_window
+                cycle.circuit = loaded.state.circuit
+                loaded.state.cycles[spectrum.cycle] = cycle
+            if column_name in {"Ecell_V", "I_mA"}:
+                try:
+                    numeric_value = float(value) if value is not None else np.nan
+                except (TypeError, ValueError):
+                    messagebox.showerror(
+                        "Invalid metadata value",
+                        f"{column_name} must contain numeric values.",
+                        parent=self.root,
+                    )
+                    return
+                if not np.isfinite(numeric_value):
+                    messagebox.showerror(
+                        "Invalid metadata value",
+                        f"{column_name} must contain finite numeric values.",
+                        parent=self.root,
+                    )
+                    return
+                if column_name == "Ecell_V":
+                    cycle.potential_v = numeric_value
+                    raw_column = {
+                        "working": "ewe_v",
+                        "cell": "ewe_ece_v",
+                        "counter": "ece_v",
+                    }.get(loaded.state.control)
+                else:
+                    cycle.current_ma = numeric_value
+                    raw_column = "i_ma"
+                cycle.custom_metadata[column_name] = numeric_value
+                if raw_column is not None and raw_column in loaded.dataframe.columns:
+                    rows = (
+                        loaded.dataframe["cycle_number"] == spectrum.cycle
+                        if "cycle_number" in loaded.dataframe.columns
+                        else np.ones(len(loaded.dataframe), dtype=bool)
+                    )
+                    loaded.dataframe.loc[rows, raw_column] = numeric_value
+            else:
+                cycle.custom_metadata[column_name] = value
+                spectrum.custom_metadata[column_name] = value
+                if "cycle_number" in loaded.dataframe.columns:
+                    rows = loaded.dataframe["cycle_number"] == spectrum.cycle
+                    loaded.dataframe.loc[rows, column_name] = value
+                else:
+                    loaded.dataframe[column_name] = value
+        self._populate_explorer()
+        self._update_status(f"metadata column '{column_name}' updated")
+
     def paste_metadata_column_from_clipboard(self) -> None:
         if self.busy or self.state is None:
             return
@@ -6530,15 +6732,15 @@ class EISApplication:
             "source_file",
             "source_path",
             "circuit",
-            "potential_V",
-            "current_mA",
+            "Ecell_V",
+            "I_mA",
             "included_points",
             "total_points",
             "outlier_points",
-            "minimum_frequency_Hz",
-            "maximum_frequency_Hz",
-            "active_minimum_frequency_Hz",
-            "active_maximum_frequency_Hz",
+            "fmin_Hz",
+            "fmax_Hz",
+            "fmin_act_Hz",
+            "fmax_act_Hz",
         }
         known_names = [
             *self._explorer_base_columns(),
@@ -6550,7 +6752,10 @@ class EISApplication:
             known_names.extend(str(name) for name in loaded.dataframe.columns)
             for parameter in loaded.state.default_parameters:
                 known_names.extend(
-                    (parameter.name, f"{parameter.name}_error_percent")
+                    (
+                        _external_parameter_name(parameter.name),
+                        f"{_external_parameter_name(parameter.name)}_e",
+                    )
                 )
         existing_names = {
             name.casefold(): name for name in known_names

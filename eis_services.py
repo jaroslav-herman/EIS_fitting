@@ -25,7 +25,7 @@ SPECTRUM_KIND_LABELS = {
 SPECTRUM_METADATA_COLUMN = "Spectrum"
 WORKING_POTENTIAL_COLUMN = "Working electrode potential (V)"
 COUNTER_POTENTIAL_COLUMN = "Counter electrode potential (V)"
-CELL_POTENTIAL_COLUMN = "Cell voltage (V)"
+CELL_POTENTIAL_COLUMN = "Ecell_V"
 
 
 @dataclass(frozen=True)
