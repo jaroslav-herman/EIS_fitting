@@ -14,6 +14,7 @@ from typing import Callable
 
 import numpy as np
 from natsort import natsort_keygen, ns
+from scipy.optimize import curve_fit
 from wepy.eis import tau as cpe_tau
 
 from eis_model import ParameterValue, ProjectState
@@ -272,6 +273,7 @@ class EISApplication:
         self.requested_cycle = cycle
         self.control = control
         self.circuit = circuit
+        self.analysis_mode_var = tk.StringVar(value="EEC")
         self.loaded: LoadedProject | None = None
         self.state: ProjectState | None = None
         self.loaded_projects: dict[str, LoadedProject] = {}
@@ -290,6 +292,12 @@ class EISApplication:
         self.busy = False
         self._fit_cancel_requested = False
         self._fit_parameter_snapshot = None
+        self.drt_peak_parameters: list[dict[str, float]] = []
+        self._drt_peak_cycle_key = None
+        self._drt_peak_artists = []
+        self._drt_peak_sum_artist = None
+        self._drt_peak_drag = None
+        self._drt_aux_parameter_limits = {}
         self._plot_imports = None
         self.plot_mode = "nyquist"
 
@@ -297,6 +305,7 @@ class EISApplication:
         self.model_var = tk.StringVar(value=circuit)
         self.show_drt_var = tk.BooleanVar(value=False)
         self.show_kk_var = tk.BooleanVar(value=False)
+        self.show_spectrum_var = tk.BooleanVar(value=True)
         self.hide_legends_var = tk.BooleanVar(value=False)
         self.minimum_frequency_var = tk.StringVar()
         self.maximum_frequency_var = tk.StringVar()
@@ -541,6 +550,24 @@ class EISApplication:
         )
         self.drt_mode_box.pack(side=tk.LEFT)
         self.drt_mode_box.bind("<<ComboboxSelected>>", self._on_drt_mode_selected)
+        ttk.Checkbutton(
+            self.plot_controls,
+            text="Show spectrum",
+            variable=self.show_spectrum_var,
+            command=self.toggle_spectrum_view,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Checkbutton(
+            self.plot_controls,
+            text="Show DRT",
+            variable=self.show_drt_var,
+            command=self.toggle_drt_view,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            self.plot_controls,
+            text="Show KK residuals",
+            variable=self.show_kk_var,
+            command=self.toggle_kk_view,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         self.figure = Figure(figsize=(7.5, 6.5), dpi=100, constrained_layout=True)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
         self.canvas.draw()
@@ -793,8 +820,13 @@ class EISApplication:
         self.figure.clear()
         self.phase_axes = None
         self.kk_axes = None
+        self._drt_peak_artists = []
+        self._drt_peak_sum_artist = None
         self._update_plot_mode_button()
-        if self.show_drt_var.get() and self.show_kk_var.get():
+        show_spectrum = self.show_spectrum_var.get()
+        if not show_spectrum:
+            self.axes = self.figure.add_axes([0.0, 0.0, 0.0, 0.0])
+        if show_spectrum and self.show_drt_var.get() and self.show_kk_var.get():
             grid = self.figure.add_gridspec(
                 2,
                 2,
@@ -804,22 +836,34 @@ class EISApplication:
             self.axes = self.figure.add_subplot(grid[0, 0])
             self.kk_axes = self.figure.add_subplot(grid[1, 0])
             self.drt_axes = self.figure.add_subplot(grid[:, 1])
-        elif self.show_drt_var.get():
+        elif show_spectrum and self.show_drt_var.get():
             grid = self.figure.add_gridspec(1, 2, width_ratios=[1.55, 1.0])
             self.axes = self.figure.add_subplot(grid[0, 0])
             self.drt_axes = self.figure.add_subplot(grid[0, 1])
-        elif self.show_kk_var.get():
+        elif show_spectrum and self.show_kk_var.get():
             grid = self.figure.add_gridspec(2, 1, height_ratios=[1.0, 0.42])
             self.axes = self.figure.add_subplot(grid[0, 0])
             self.kk_axes = self.figure.add_subplot(grid[1, 0])
             self.drt_axes = None
-        else:
+        elif show_spectrum:
             self.axes = self.figure.add_subplot(111)
+            self.drt_axes = None
+        elif self.show_drt_var.get() and self.show_kk_var.get():
+            grid = self.figure.add_gridspec(2, 1, height_ratios=[0.42, 1.0])
+            self.kk_axes = self.figure.add_subplot(grid[0, 0])
+            self.drt_axes = self.figure.add_subplot(grid[1, 0])
+        elif self.show_drt_var.get():
+            self.drt_axes = self.figure.add_subplot(111)
+        elif self.show_kk_var.get():
+            self.kk_axes = self.figure.add_subplot(111)
+        else:
             self.drt_axes = None
         if self.plot_mode == "bode":
             self._configure_bode_plot()
         else:
             self._configure_nyquist_plot()
+        if not show_spectrum:
+            self.axes.set_visible(False)
         self.axes.axhline(
             0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0
         )
@@ -1198,6 +1242,10 @@ class EISApplication:
         self._explorer_lookup.clear()
         self._explorer_anchor_item = None
         self._explorer_primary_item = None
+        self.drt_peak_parameters = []
+        self._drt_peak_cycle_key = None
+        self._drt_peak_drag = None
+        self._drt_aux_parameter_limits = {}
         for dataset_index, dataset_id in enumerate(self._dataset_order):
             loaded = self.loaded_projects[dataset_id]
             for spectrum in loaded.spectra:
@@ -1444,6 +1492,8 @@ class EISApplication:
         return "break"
 
     def _on_drt_mode_selected(self, _event=None):
+        if hasattr(self, "analysis_drt_mode_var"):
+            self.analysis_drt_mode_var.set(self.drt_mode_var.get())
         if self.state is None:
             return
         self._ensure_current_drt_mode()
@@ -1599,8 +1649,26 @@ class EISApplication:
 
     def _build_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
+        mode_frame = ttk.Frame(parent)
+        mode_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        mode_frame.columnconfigure(1, weight=1)
+        ttk.Label(mode_frame, text="Analysis mode").grid(
+            row=0, column=0, padx=(0, 8), sticky="w"
+        )
+        self.analysis_mode_box = ttk.Combobox(
+            mode_frame,
+            textvariable=self.analysis_mode_var,
+            values=("EEC", "DRT"),
+            state="readonly",
+            width=12,
+        )
+        self.analysis_mode_box.grid(row=0, column=1, sticky="ew")
+        self.analysis_mode_box.bind(
+            "<<ComboboxSelected>>", self._on_analysis_mode_selected
+        )
         model_group = ttk.LabelFrame(parent, text="Fitting model", padding=8)
-        model_group.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.model_group = model_group
+        model_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         model_group.columnconfigure(0, weight=1)
         model_group.columnconfigure(1, weight=1)
         model_group.columnconfigure(2, weight=1)
@@ -1652,8 +1720,9 @@ class EISApplication:
         )
 
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
-        parameters_group.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
-        parent.rowconfigure(1, weight=1)
+        self.parameters_group = parameters_group
+        parameters_group.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        parent.rowconfigure(2, weight=1)
         self.parameter_table = ParameterTable(parameters_group)
         self.parameter_table.pack(fill=tk.BOTH, expand=True)
         parameter_actions = ttk.Frame(parameters_group)
@@ -1692,7 +1761,8 @@ class EISApplication:
         self.apply_upper_selected_button.grid(row=2, column=1, padx=(3, 0), pady=(4, 0), sticky="ew")
 
         options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
-        options_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self.options_group = options_group
+        options_group.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         options_group.columnconfigure(1, weight=1)
         ttk.Label(options_group, text="Min frequency (Hz)").grid(
             row=0, column=0, sticky="w"
@@ -1728,18 +1798,6 @@ class EISApplication:
         ttk.Entry(options_group, textvariable=self.threshold_var).grid(
             row=3, column=1, padx=(8, 0), pady=(8, 2), sticky="ew"
         )
-        ttk.Checkbutton(
-            options_group,
-            text="Show DRT next to Nyquist",
-            variable=self.show_drt_var,
-            command=self.toggle_drt_view,
-        ).grid(row=6, column=0, columnspan=2, pady=(8, 0), sticky="w")
-        ttk.Checkbutton(
-            options_group,
-            text="Show KK residuals",
-            variable=self.show_kk_var,
-            command=self.toggle_kk_view,
-        ).grid(row=7, column=0, columnspan=2, pady=(6, 0), sticky="w")
         self.outlier_button = ttk.Button(
             options_group, text="Outliers: current", command=self.find_outliers
         )
@@ -1762,7 +1820,8 @@ class EISApplication:
         )
 
         actions = ttk.LabelFrame(parent, text="Actions", padding=8)
-        actions.grid(row=3, column=0, sticky="ew")
+        self.actions_group = actions
+        actions.grid(row=4, column=0, sticky="ew")
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         self.fit_button = ttk.Button(actions, text="Fit spectrum", command=self.fit)
@@ -1819,9 +1878,65 @@ class EISApplication:
             actions, text="Stop fit", command=self._cancel_fit, state="disabled"
         )
         self.stop_fit_button.grid(row=6, column=0, columnspan=2, pady=3, sticky="ew")
+        self.drt_tools_group = ttk.LabelFrame(parent, text="DRT analysis", padding=8)
+        self.drt_tools_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.drt_tools_group.columnconfigure(1, weight=1)
+        ttk.Label(self.drt_tools_group, text="Method").grid(
+            row=0, column=0, padx=(0, 8), sticky="w"
+        )
+        self.analysis_drt_mode_var = tk.StringVar(value="Ridge DRT")
+        self.analysis_drt_mode_box = ttk.Combobox(
+            self.drt_tools_group,
+            textvariable=self.analysis_drt_mode_var,
+            values=("Ridge DRT", "Hybrid DRT"),
+            state="readonly",
+        )
+        self.analysis_drt_mode_box.grid(row=0, column=1, sticky="ew")
+        self.analysis_drt_mode_box.bind(
+            "<<ComboboxSelected>>", self._on_analysis_drt_mode_selected
+        )
+        self.drt_fit_button = ttk.Button(
+            self.drt_tools_group,
+            text="Fit selected",
+            command=self._fit_selected_drts,
+        )
+        self.drt_fit_button.grid(
+            row=1, column=0, columnspan=2, pady=(8, 0), sticky="ew"
+        )
+        self.add_gaussian_peak_button = ttk.Button(
+            self.drt_tools_group,
+            text="Add Gaussian peak",
+            command=self.add_gaussian_peak,
+        )
+        self.add_gaussian_peak_button.grid(
+            row=2, column=0, padx=(0, 3), pady=(6, 0), sticky="ew"
+        )
+        self.fit_peaks_button = ttk.Button(
+            self.drt_tools_group,
+            text="Fit peaks",
+            command=self.fit_drt_peaks,
+        )
+        self.fit_peaks_button.grid(
+            row=2, column=1, padx=(3, 0), pady=(6, 0), sticky="ew"
+        )
+        self.send_drt_initials_button = ttk.Button(
+            self.drt_tools_group,
+            text="Send initials",
+            command=self.send_drt_initials,
+        )
+        self.send_drt_initials_button.grid(
+            row=4, column=0, columnspan=2, pady=(6, 0), sticky="ew"
+        )
+        self.drt_peak_table = ParameterTable(self.drt_tools_group)
+        self.drt_peak_table.grid(
+            row=3, column=0, columnspan=2, pady=(6, 0), sticky="ew"
+        )
+        self.drt_tools_group.grid_remove()
         self.action_buttons = (
             self.fit_button,
             self.fit_selected_button,
+            self.drt_fit_button,
+            self.send_drt_initials_button,
             self.initial_values_button,
             self.ridge_drt_button,
             self.hybrid_drt_button,
@@ -1855,7 +1970,32 @@ class EISApplication:
             self.apply_lower_selected_button,
             self.apply_upper_selected_button,
         )
+
+    def _on_analysis_mode_selected(self, _event=None) -> None:
+        drt_mode = self.analysis_mode_var.get() == "DRT"
+        if drt_mode:
+            self.model_group.grid_remove()
+            self.parameters_group.grid_remove()
+            self.drt_tools_group.grid()
+            self._update_status("DRT analysis mode")
+        else:
+            self.model_group.grid()
+            self.parameters_group.grid()
+            self.drt_tools_group.grid_remove()
+            self._update_status("EEC fitting mode")
+
+    def _fit_selected_drts(self) -> None:
+        if self.analysis_drt_mode_var.get() == "Hybrid DRT":
+            self.calculate_selected_hybrid_drts()
+        else:
+            self.calculate_selected_ridge_drts()
         self._set_controls_enabled(False)
+
+    def _on_analysis_drt_mode_selected(self, _event=None) -> None:
+        if hasattr(self, "drt_mode_var"):
+            self.drt_mode_var.set(self.analysis_drt_mode_var.get())
+        if self.state is not None:
+            self._refresh_plot(rescale=True)
 
     def _begin_loading(self) -> None:
         if self.path is None:
@@ -2193,6 +2333,26 @@ class EISApplication:
         if self.state is None:
             return
         cycle = self.state.active
+        drt_key = (
+            self.current_dataset_id,
+            cycle.cycle,
+            self.analysis_drt_mode_var.get()
+            if hasattr(self, "analysis_drt_mode_var")
+            else "Ridge DRT",
+        )
+        if drt_key != self._drt_peak_cycle_key:
+            saved_name = (
+                "saved_hybrid_peak_parameters"
+                if drt_key[2] == "Hybrid DRT"
+                else "saved_ridge_peak_parameters"
+            )
+            self.drt_peak_parameters = [
+                dict(peak)
+                for peak in getattr(cycle, saved_name, [])
+            ]
+            self._drt_aux_parameter_limits = {}
+            self._clamp_drt_peak_parameters_to_limits()
+            self._drt_peak_cycle_key = drt_key
         included = cycle.included
         if self.plot_mode == "bode":
             frequency = cycle.frequency_hz
@@ -2318,6 +2478,7 @@ class EISApplication:
             else:
                 self.drt_artist.set_data(drt_tau_s, drt_gamma_ohm)
             self.drt_axes.set_title(drt_label)
+            self._refresh_drt_peak_artists()
         if rescale:
             self._autoscale_to_included(cycle)
             if self.kk_axes is not None:
@@ -2417,6 +2578,543 @@ class EISApplication:
         self.drt_axes.set_xlim(x_min, x_max)
         self.drt_axes.set_ylim(y_min - y_padding, y_max + y_padding)
 
+    def _current_drt_arrays(self):
+        if self.state is None:
+            return None, None
+        cycle = self.state.active
+        if self.analysis_drt_mode_var.get() == "Hybrid DRT":
+            tau = cycle.saved_hybrid_tau_s
+            gamma = cycle.saved_hybrid_gamma_ohm
+        else:
+            tau = cycle.saved_ridge_tau_s
+            gamma = cycle.saved_ridge_gamma_ohm
+        if tau is None or gamma is None:
+            return None, None
+        tau = np.asarray(tau, dtype=float)
+        gamma = np.asarray(gamma, dtype=float)
+        finite = np.isfinite(tau) & np.isfinite(gamma) & (tau > 0)
+        if not np.any(finite):
+            return None, None
+        order = np.argsort(tau[finite])
+        return tau[finite][order], gamma[finite][order]
+
+    @staticmethod
+    def _gaussian_peak_values(log_tau, peak):
+        return peak["height"] * np.exp(
+            -0.5
+            * ((log_tau - peak["center_log10"]) / max(peak["sigma_log10"], 1e-6))
+            ** 2
+        )
+
+    @staticmethod
+    def _peak_summary(peak):
+        tau = 10.0 ** peak["center_log10"]
+        sigma = max(peak["sigma_log10"], 1e-6)
+        area = peak["height"] * sigma * np.sqrt(2.0 * np.pi) * np.log(10.0)
+        half_width = np.sqrt(2.0 * np.log(2.0)) * sigma
+        fwhm = tau * (10.0**half_width - 10.0 ** (-half_width))
+        return tau, area, fwhm
+
+    def _update_drt_peak_table(self) -> None:
+        if not hasattr(self, "drt_peak_table"):
+            return
+        parameters = []
+        for index, peak in enumerate(self.drt_peak_parameters, 1):
+            tau, area, fwhm = self._peak_summary(peak)
+            for suffix, value, error_key in (
+                ("tau", tau, "tau_error_percent"),
+                ("area", area, "area_error_percent"),
+                ("fwhm", fwhm, "fwhm_error_percent"),
+            ):
+                lower_key = f"{suffix}_lower"
+                upper_key = f"{suffix}_upper"
+                magnitude = max(abs(value), np.finfo(float).eps)
+                default_limits = {
+                    "tau": (1e-5, 10.0),
+                    "area": (0.0, 1e3),
+                    "fwhm": (0.0, 1.0),
+                }
+                default_lower, default_upper = default_limits[suffix]
+                lower = peak.get(lower_key, default_lower)
+                upper = peak.get(upper_key, default_upper)
+                parameters.append(
+                    ParameterValue(
+                        f"Peak{index}_{suffix}",
+                        "s" if suffix == "tau" else "Ohm",
+                        value,
+                        lower,
+                        upper,
+                        peak.get(error_key),
+                        bool(peak.get(f"{suffix}_fixed", False)),
+                    )
+                )
+        if self.state is not None:
+            mode = self.analysis_drt_mode_var.get()
+            cycle = self.state.active
+            resistance = (
+                cycle.saved_hybrid_ohmic_resistance
+                if mode == "Hybrid DRT"
+                else cycle.saved_ridge_ohmic_resistance
+            )
+            inductance = (
+                cycle.saved_ridge_inductance if mode == "Ridge DRT" else None
+            )
+            for name, value, unit in (
+                ("R0", resistance, "Ohm"),
+                ("L0", inductance, "H"),
+            ):
+                if value is None:
+                    continue
+                value = float(value)
+                lower, upper = self._drt_aux_parameter_limits.get(
+                    name,
+                    (0.0, max(abs(value) * 10.0, 1.0 if name == "R0" else 1e-6)),
+                )
+                parameters.append(
+                    ParameterValue(name, unit, value, lower, upper, None)
+                )
+        self.drt_peak_table.set_parameters(parameters)
+
+    def _clamp_drt_peak_parameters_to_limits(self) -> None:
+        for peak in self.drt_peak_parameters:
+            tau, area, fwhm = self._peak_summary(peak)
+            values = {"tau": tau, "area": area, "fwhm": fwhm}
+            for suffix, value in values.items():
+                defaults = {"tau": (1e-5, 10.0), "area": (0.0, 1e3), "fwhm": (0.0, 1.0)}
+                lower = peak.get(f"{suffix}_lower", defaults[suffix][0])
+                upper = peak.get(f"{suffix}_upper", defaults[suffix][1])
+                values[suffix] = self._clamp_parameter_value(value, lower, upper)
+            tau = max(values["tau"], 1e-300)
+            fwhm = max(values["fwhm"], 1e-300)
+            ratio = max(fwhm / tau, 1e-12)
+            peak["center_log10"] = float(np.log10(tau))
+            peak["sigma_log10"] = float(
+                np.arcsinh(ratio / 2.0)
+                / (np.log(10.0) * np.sqrt(2.0 * np.log(2.0)))
+            )
+            peak["height"] = float(
+                values["area"]
+                / (peak["sigma_log10"] * np.log(10.0) * np.sqrt(2.0 * np.pi))
+            )
+        self._store_current_drt_peaks()
+
+    def _sync_drt_peak_parameters_from_table(self) -> bool:
+        if not hasattr(self, "drt_peak_table"):
+            return True
+        try:
+            values = self.drt_peak_table.values()
+            for parameter in values:
+                if parameter.lower > parameter.upper:
+                    raise ValueError(f"{parameter.name}: lower bound exceeds upper bound")
+                parameter.initial = self._clamp_parameter_value(
+                    parameter.initial,
+                    parameter.lower,
+                    parameter.upper,
+                )
+            self.drt_peak_table.set_parameters(values)
+            by_name = {parameter.name: parameter for parameter in values}
+            for index, peak in enumerate(self.drt_peak_parameters, 1):
+                tau = by_name[f"Peak{index}_tau"]
+                area = by_name[f"Peak{index}_area"]
+                fwhm = by_name[f"Peak{index}_fwhm"]
+                if tau.initial <= 0 or fwhm.initial <= 0:
+                    raise ValueError(f"Peak {index}: tau and FWHM must be positive")
+                peak["center_log10"] = float(np.log10(tau.initial))
+                ratio = max(fwhm.initial / tau.initial, 1e-12)
+                peak["sigma_log10"] = float(
+                    np.arcsinh(ratio / 2.0)
+                    / (np.log(10.0) * np.sqrt(2.0 * np.log(2.0)))
+                )
+                peak["height"] = float(
+                    area.initial
+                    / (peak["sigma_log10"] * np.log(10.0) * np.sqrt(2.0 * np.pi))
+                )
+                for source, target in (
+                    (tau, "tau"),
+                    (area, "area"),
+                    (fwhm, "fwhm"),
+                ):
+                    peak[f"{target}_lower"] = source.lower
+                    peak[f"{target}_upper"] = source.upper
+                    peak[f"{target}_fixed"] = source.fixed
+            self._drt_aux_parameter_limits = {
+                parameter.name: (parameter.lower, parameter.upper)
+                for parameter in values
+                if parameter.name in {"R0", "L0"}
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            messagebox.showerror("Invalid DRT peak parameter", str(error), parent=self.root)
+            return False
+        self._store_current_drt_peaks()
+        return True
+
+    def _store_current_drt_peaks(self) -> None:
+        if self.state is None:
+            return
+        self.state.active.store_drt_peak_parameters(
+            self.analysis_drt_mode_var.get(), self.drt_peak_parameters
+        )
+
+    def _refresh_drt_peak_artists(self) -> None:
+        if self.drt_axes is None:
+            return
+        for artist in self._drt_peak_artists:
+            artist.remove()
+        self._drt_peak_artists = []
+        if self._drt_peak_sum_artist is not None:
+            self._drt_peak_sum_artist.remove()
+            self._drt_peak_sum_artist = None
+        tau, _gamma = self._current_drt_arrays()
+        if tau is None or not self.drt_peak_parameters:
+            self._update_drt_peak_table()
+            return
+        tau_grid = np.geomspace(float(np.min(tau)), float(np.max(tau)), 300)
+        log_tau_grid = np.log10(tau_grid)
+        total = np.zeros_like(tau_grid)
+        for index, peak in enumerate(self.drt_peak_parameters):
+            values = self._gaussian_peak_values(log_tau_grid, peak)
+            total += values
+            line, = self.drt_axes.plot(
+                tau_grid,
+                values,
+                "--",
+                linewidth=1.2,
+                alpha=0.85,
+                label=f"Gaussian {index + 1}",
+            )
+            center_tau = 10.0 ** peak["center_log10"]
+            half_width = np.sqrt(2.0 * np.log(2.0)) * peak["sigma_log10"]
+            left_tau = 10.0 ** (peak["center_log10"] - half_width)
+            right_tau = 10.0 ** (peak["center_log10"] + half_width)
+            top, = self.drt_axes.plot(
+                [center_tau], [peak["height"]], "o", color=line.get_color(), ms=6
+            )
+            left, = self.drt_axes.plot(
+                [left_tau], [peak["height"] / 2.0], "s", color=line.get_color(), ms=5
+            )
+            right, = self.drt_axes.plot(
+                [right_tau], [peak["height"] / 2.0], "s", color=line.get_color(), ms=5
+            )
+            self._drt_peak_artists.extend((line, top, left, right))
+        self._drt_peak_sum_artist, = self.drt_axes.plot(
+            tau_grid,
+            total,
+            "-",
+            color="#222222",
+            linewidth=1.8,
+            alpha=0.95,
+            zorder=4,
+            label="Peak sum",
+        )
+        self._update_drt_peak_table()
+        self.drt_axes.legend(loc="best", fontsize=8)
+
+    def add_gaussian_peak(self) -> None:
+        tau, gamma = self._current_drt_arrays()
+        if tau is None:
+            self._update_status("calculate a DRT before adding Gaussian peaks")
+            return
+        peak_index = int(np.nanargmax(gamma))
+        center = float(np.log10(tau[peak_index]))
+        if self.drt_peak_parameters:
+            center = float(np.mean(np.log10(tau)))
+        height = max(float(gamma[peak_index]), 0.0)
+        if height == 0.0:
+            height = float(np.nanmax(np.abs(gamma)))
+        self.drt_peak_parameters.append(
+            {"center_log10": center, "height": height, "sigma_log10": 0.12}
+        )
+        self._store_current_drt_peaks()
+        self._refresh_drt_peak_artists()
+        self.canvas.draw_idle()
+
+    def fit_drt_peaks(self) -> None:
+        if self.busy or self.state is None:
+            return
+        tau, gamma = self._current_drt_arrays()
+        if tau is None or not self.drt_peak_parameters:
+            self._update_status("add at least one Gaussian peak first")
+            return
+        if not self._sync_drt_peak_parameters_from_table():
+            return
+        log_tau = np.log10(tau)
+        count = len(self.drt_peak_parameters)
+        initial = []
+        lower = []
+        upper = []
+        fixed = []
+        for index, peak in enumerate(self.drt_peak_parameters, 1):
+            peak_tau, peak_area, peak_fwhm = self._peak_summary(peak)
+            initial.extend((peak_tau, peak_area, peak_fwhm))
+            lower.extend(
+                (
+                    peak.get("tau_lower", peak_tau / 10.0),
+                    peak.get("area_lower", min(0.0, peak_area)),
+                    peak.get("fwhm_lower", peak_fwhm / 10.0),
+                )
+            )
+            upper.extend(
+                (
+                    peak.get("tau_upper", peak_tau * 10.0),
+                    peak.get("area_upper", max(abs(peak_area) * 10.0, 1e-12)),
+                    peak.get("fwhm_upper", peak_fwhm * 10.0),
+                )
+            )
+            fixed.extend(
+                (
+                    bool(peak.get("tau_fixed", False)),
+                    bool(peak.get("area_fixed", False)),
+                    bool(peak.get("fwhm_fixed", False)),
+                )
+            )
+
+        initial = np.asarray(initial, dtype=float)
+        lower = np.asarray(lower, dtype=float)
+        upper = np.asarray(upper, dtype=float)
+        if np.any(upper <= lower):
+            messagebox.showerror(
+                "Invalid DRT peak limits",
+                "Every lower limit must be smaller than its upper limit.",
+                parent=self.root,
+            )
+            return
+        free_indices = [index for index, is_fixed in enumerate(fixed) if not is_fixed]
+
+        def model(values, *parameters):
+            all_parameters = initial.copy()
+            all_parameters[free_indices] = parameters
+            result = np.zeros_like(values, dtype=float)
+            for index in range(count):
+                peak_tau, area, fwhm = all_parameters[index * 3 : index * 3 + 3]
+                ratio = max(fwhm / max(peak_tau, 1e-300), 1e-12)
+                sigma = np.arcsinh(ratio / 2.0) / (
+                    np.log(10.0) * np.sqrt(2.0 * np.log(2.0))
+                )
+                height = area / (sigma * np.log(10.0) * np.sqrt(2.0 * np.pi))
+                result += height * np.exp(
+                    -0.5 * ((values - np.log10(peak_tau)) / sigma) ** 2
+                )
+            return result
+        fit_initial = initial[free_indices]
+        fit_lower = lower[free_indices].copy()
+        fit_upper = upper[free_indices].copy()
+        for index in range(fit_initial.size):
+            parameter_index = free_indices[index]
+            if fit_lower[index] <= 0 and parameter_index % 3 in {0, 2}:
+                fit_lower[index] = 1e-12
+            margin = max(abs(fit_initial[index]) * 1e-9, 1e-12)
+            fit_initial[index] = np.clip(
+                fit_initial[index],
+                fit_lower[index] + margin,
+                fit_upper[index] - margin,
+            )
+        if not free_indices:
+            fitted = initial.copy()
+            errors = np.zeros_like(initial)
+        else:
+            try:
+                fitted_free, covariance = curve_fit(
+                    model,
+                    log_tau,
+                    gamma,
+                    p0=fit_initial,
+                    bounds=(fit_lower, fit_upper),
+                    maxfev=50000,
+                )
+            except (RuntimeError, ValueError) as error:
+                messagebox.showerror("DRT peak fit failed", str(error), parent=self.root)
+                return
+            fitted = initial.copy()
+            fitted[free_indices] = fitted_free
+            errors = np.zeros_like(initial)
+            errors[free_indices] = np.sqrt(
+                np.maximum(np.diag(covariance), 0.0)
+            )
+        for index, peak in enumerate(self.drt_peak_parameters):
+            peak_tau, peak_area, peak_fwhm = fitted[index * 3 : index * 3 + 3]
+            peak["center_log10"] = float(np.log10(peak_tau))
+            ratio = max(peak_fwhm / max(peak_tau, 1e-300), 1e-12)
+            peak["sigma_log10"] = float(
+                np.arcsinh(ratio / 2.0)
+                / (np.log(10.0) * np.sqrt(2.0 * np.log(2.0)))
+            )
+            peak["height"] = float(
+                peak_area
+                / (peak["sigma_log10"] * np.log(10.0) * np.sqrt(2.0 * np.pi))
+            )
+            for offset, key, value in (
+                (0, "tau", peak_tau),
+                (1, "area", peak_area),
+                (2, "fwhm", peak_fwhm),
+            ):
+                peak[f"{key}_error_percent"] = float(
+                    100.0 * errors[index * 3 + offset] / max(abs(value), 1e-300)
+                )
+        self._store_current_drt_peaks()
+        self._refresh_drt_peak_artists()
+        self.canvas.draw_idle()
+        self._update_status(f"fitted {count} Gaussian DRT peaks")
+
+    def _select_drt_peaks_for_eec(self, peaks, maximum: int):
+        window = tk.Toplevel(self.root)
+        window.title("Select DRT peaks")
+        window.transient(self.root)
+        window.grab_set()
+        ttk.Label(
+            window,
+            text=f"Select up to {maximum} DRT peaks to send to the EEC model:",
+            padding=8,
+        ).pack(anchor="w")
+        variables = []
+        for index, peak in enumerate(peaks):
+            tau, area, fwhm = self._peak_summary(peak)
+            variable = tk.BooleanVar(value=index < maximum)
+            variables.append(variable)
+            ttk.Checkbutton(
+                window,
+                text=f"Peak {index + 1}: tau={tau:.5g}, area={area:.5g}, FWHM={fwhm:.5g}",
+                variable=variable,
+            ).pack(anchor="w", padx=8, pady=2)
+        result = [None]
+
+        def accept() -> None:
+            selected = [
+                index for index, variable in enumerate(variables) if variable.get()
+            ]
+            if len(selected) > maximum:
+                messagebox.showerror(
+                    "Too many peaks",
+                    f"Select no more than {maximum} peaks.",
+                    parent=window,
+                )
+                return
+            result[0] = selected
+            window.destroy()
+
+        buttons = ttk.Frame(window, padding=8)
+        buttons.pack(fill=tk.X)
+        ttk.Button(buttons, text="OK", command=accept).pack(side=tk.RIGHT)
+        ttk.Button(
+            buttons, text="Cancel", command=window.destroy
+        ).pack(side=tk.RIGHT, padx=(0, 6))
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        self.root.wait_window(window)
+        return result[0]
+
+    def send_drt_initials(self) -> None:
+        if self.busy or self.state is None:
+            return
+        cycle = self.state.active
+        mode = self.analysis_drt_mode_var.get()
+        peaks = [dict(peak) for peak in self.drt_peak_parameters]
+        if not peaks:
+            saved_name = (
+                "saved_hybrid_peak_parameters"
+                if mode == "Hybrid DRT"
+                else "saved_ridge_peak_parameters"
+            )
+            peaks = [dict(peak) for peak in getattr(cycle, saved_name, [])]
+        if not peaks:
+            self._update_status("add and fit at least one DRT peak first")
+            return
+        if not self._sync_drt_peak_parameters_from_table():
+            return
+        peaks = [dict(peak) for peak in self.drt_peak_parameters]
+        table_parameters = {
+            parameter.name: parameter
+            for parameter in self.drt_peak_table.values()
+        }
+
+        circuit = re.sub(r"\s+", "", cycle.model(self.state.circuit))
+        branch_ids = sorted(
+            {
+                match.group(1)
+                for match in re.finditer(r"p\(R(\d+),CPE\1\)", circuit)
+            },
+            key=int,
+        )
+        selected_indices = list(range(len(peaks)))
+        if len(peaks) > len(branch_ids) and branch_ids:
+            selected_indices = self._select_drt_peaks_for_eec(peaks, len(branch_ids))
+            if selected_indices is None:
+                return
+        elif not branch_ids:
+            selected_indices = []
+        selected_peaks = [peaks[index] for index in selected_indices]
+
+        parameters = [
+            ParameterValue(
+                parameter.name,
+                parameter.unit,
+                parameter.initial,
+                parameter.lower,
+                parameter.upper,
+                parameter.error_percent,
+                parameter.fixed,
+            )
+            for parameter in cycle.parameters
+        ]
+        by_name = {parameter.name: parameter for parameter in parameters}
+        if "R0" in by_name:
+            resistance = table_parameters.get("R0")
+            resistance = resistance.initial if resistance is not None else None
+            if resistance is not None:
+                by_name["R0"].initial = self._clamp_parameter_value(
+                    resistance, by_name["R0"].lower, by_name["R0"].upper
+                )
+        inductance_value = table_parameters.get("L0")
+        if inductance_value is not None:
+            inductance_value = inductance_value.initial
+        elif mode == "Ridge DRT":
+            inductance_value = cycle.saved_ridge_inductance
+        if inductance_value is not None:
+            for parameter in parameters:
+                if re.fullmatch(r"L\d+", parameter.name):
+                    parameter.initial = self._clamp_parameter_value(
+                        inductance_value,
+                        parameter.lower,
+                        parameter.upper,
+                    )
+
+        for branch_id, peak in zip(branch_ids, selected_peaks):
+            tau, area, _fwhm = self._peak_summary(peak)
+            resistance = max(abs(area), np.finfo(float).eps)
+            resistance_parameter = by_name.get(f"R{branch_id}")
+            if resistance_parameter is not None:
+                resistance_parameter.initial = self._clamp_parameter_value(
+                    resistance,
+                    resistance_parameter.lower,
+                    resistance_parameter.upper,
+                )
+            exponent_parameter = by_name.get(f"CPE{branch_id}_1")
+            exponent = (
+                exponent_parameter.initial if exponent_parameter is not None else 1.0
+            )
+            exponent = float(np.clip(exponent, 0.05, 1.0))
+            q_parameter = by_name.get(f"CPE{branch_id}_0")
+            if q_parameter is not None:
+                q_value = tau**exponent / resistance
+                q_parameter.initial = self._clamp_parameter_value(
+                    q_value, q_parameter.lower, q_parameter.upper
+                )
+            capacitance_parameter = by_name.get(f"C{branch_id}")
+            if capacitance_parameter is not None:
+                capacitance_parameter.initial = self._clamp_parameter_value(
+                    tau / resistance,
+                    capacitance_parameter.lower,
+                    capacitance_parameter.upper,
+                )
+
+        cycle.parameters = parameters
+        self.parameter_table.set_parameters(parameters)
+        self.analysis_mode_var.set("EEC")
+        self._on_analysis_mode_selected()
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        self._update_status(
+            f"sent {len(selected_peaks)} DRT peak initials to the EEC model"
+        )
+
     def _autoscale_kk(self, cycle) -> None:
         if (
             self.kk_axes is None
@@ -2462,6 +3160,16 @@ class EISApplication:
         self._update_status(f"{self.plot_mode.title()} view")
 
     def toggle_drt_view(self) -> None:
+        self._configure_plot_layout()
+        if self.state is None:
+            self.axes.set_title("No spectrum loaded")
+            if self.drt_axes is not None:
+                self.drt_axes.set_title("Ridge DRT")
+        else:
+            self._refresh_plot(rescale=True)
+        self.canvas.draw_idle()
+
+    def toggle_spectrum_view(self) -> None:
         self._configure_plot_layout()
         if self.state is None:
             self.axes.set_title("No spectrum loaded")
@@ -2654,6 +3362,38 @@ class EISApplication:
         self.root.title("EIS Fitting")
         self._set_controls_enabled(False)
 
+    def _start_drt_peak_drag(self, event) -> bool:
+        if self.busy or self.state is None or not self.drt_peak_parameters:
+            return False
+        if event.x is None or event.y is None:
+            return False
+        best = None
+        for index, peak in enumerate(self.drt_peak_parameters):
+            center_tau = 10.0 ** peak["center_log10"]
+            half_width = np.sqrt(2.0 * np.log(2.0)) * peak["sigma_log10"]
+            points = (
+                ("top", center_tau, peak["height"]),
+                (
+                    "left",
+                    10.0 ** (peak["center_log10"] - half_width),
+                    peak["height"] / 2.0,
+                ),
+                (
+                    "right",
+                    10.0 ** (peak["center_log10"] + half_width),
+                    peak["height"] / 2.0,
+                ),
+            )
+            for action, x_value, y_value in points:
+                display = self.drt_axes.transData.transform((x_value, y_value))
+                distance = float(np.hypot(display[0] - event.x, display[1] - event.y))
+                if distance <= 12.0 and (best is None or distance < best[0]):
+                    best = (distance, index, action)
+        if best is None:
+            return False
+        self._drt_peak_drag = {"index": best[1], "action": best[2]}
+        return True
+
     def _on_plot_click(self, event) -> None:
         if (
             self.busy
@@ -2695,6 +3435,12 @@ class EISApplication:
         self._fit_after_point_edit()
 
     def _on_plot_button_press(self, event) -> None:
+        if (
+            event.button == 1
+            and event.inaxes is getattr(self, "drt_axes", None)
+            and self._start_drt_peak_drag(event)
+        ):
+            return
         if self.busy or self.state is None or event.button != 2 or event.inaxes is None:
             return
         axes = event.inaxes
@@ -2713,6 +3459,11 @@ class EISApplication:
             self.zoom_selector.set_active(False)
 
     def _on_plot_button_release(self, event) -> None:
+        if event.button == 1 and self._drt_peak_drag is not None:
+            self._drt_peak_drag = None
+            self._update_drt_peak_table()
+            self.canvas.draw_idle()
+            return
         if event.button != 2 or self._pan_state is None:
             return
         self._pan_state = None
@@ -2720,6 +3471,26 @@ class EISApplication:
             self.zoom_selector.set_active(not self.point_toggle_mode)
 
     def _on_plot_motion(self, event) -> None:
+        if self._drt_peak_drag is not None:
+            if event.inaxes is not self.drt_axes or event.xdata is None or event.ydata is None:
+                return
+            peak = self.drt_peak_parameters[self._drt_peak_drag["index"]]
+            action = self._drt_peak_drag["action"]
+            if action == "top":
+                peak["center_log10"] = float(np.log10(max(event.xdata, 1e-300)))
+                peak["height"] = float(event.ydata)
+            else:
+                distance = abs(
+                    float(np.log10(max(event.xdata, 1e-300)))
+                    - peak["center_log10"]
+                )
+                peak["sigma_log10"] = max(
+                    distance / np.sqrt(2.0 * np.log(2.0)), 1e-4
+                )
+            self._store_current_drt_peaks()
+            self._refresh_drt_peak_artists()
+            self.canvas.draw_idle()
+            return
         if self._pan_state is None:
             return
         axes = self._pan_state["axes"]

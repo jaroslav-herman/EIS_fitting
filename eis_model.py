@@ -71,10 +71,12 @@ class CycleState:
     saved_ridge_peak_count: int | None = None
     saved_ridge_ohmic_resistance: float | None = None
     saved_ridge_inductance: float | None = None
+    saved_ridge_peak_parameters: list[dict[str, float]] = field(default_factory=list)
     saved_hybrid_tau_s: np.ndarray | None = None
     saved_hybrid_gamma_ohm: np.ndarray | None = None
     saved_hybrid_included_mask: np.ndarray | None = None
     saved_hybrid_ohmic_resistance: float | None = None
+    saved_hybrid_peak_parameters: list[dict[str, float]] = field(default_factory=list)
     kk_fit_impedance: np.ndarray | None = None
     kk_residual_real: np.ndarray | None = None
     kk_residual_imag: np.ndarray | None = None
@@ -232,6 +234,7 @@ class CycleState:
         self.saved_ridge_peak_count = int(peak_count)
         self.saved_ridge_ohmic_resistance = float(ohmic_resistance)
         self.saved_ridge_inductance = float(inductance)
+        self.saved_ridge_peak_parameters = []
         self.saved_ridge_tau_s = as_1d_array(tau_s).astype(float)
         self.saved_ridge_gamma_ohm = as_1d_array(gamma_ohm).astype(float)
         self.show_ridge_drt()
@@ -248,7 +251,22 @@ class CycleState:
         self.saved_hybrid_ohmic_resistance = (
             float(ohmic_resistance) if ohmic_resistance is not None else None
         )
+        self.saved_hybrid_peak_parameters = []
         self.show_hybrid_drt()
+
+    def store_drt_peak_parameters(
+        self,
+        mode: str,
+        peaks: list[dict[str, float]],
+    ) -> None:
+        stored = [
+            {key: float(value) for key, value in peak.items()}
+            for peak in peaks
+        ]
+        if mode == "Hybrid DRT":
+            self.saved_hybrid_peak_parameters = stored
+        else:
+            self.saved_ridge_peak_parameters = stored
 
     def show_ridge_drt(self) -> None:
         self.ridge_tau_s = (

@@ -180,6 +180,9 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
         "saved_ridge_peak_count": cycle.saved_ridge_peak_count,
         "saved_ridge_ohmic_resistance": cycle.saved_ridge_ohmic_resistance,
         "saved_ridge_inductance": cycle.saved_ridge_inductance,
+        "saved_ridge_peak_parameters": [
+            dict(peak) for peak in cycle.saved_ridge_peak_parameters
+        ],
         "saved_hybrid_tau_s": (
             cycle.saved_hybrid_tau_s.tolist()
             if cycle.saved_hybrid_tau_s is not None
@@ -196,6 +199,9 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
             else None
         ),
         "saved_hybrid_ohmic_resistance": cycle.saved_hybrid_ohmic_resistance,
+        "saved_hybrid_peak_parameters": [
+            dict(peak) for peak in cycle.saved_hybrid_peak_parameters
+        ],
         "custom_metadata": dict(cycle.custom_metadata),
     }
 
@@ -374,6 +380,10 @@ def load_project_file(
             if saved.get("saved_ridge_inductance") is not None
             else None
         )
+        cycle.saved_ridge_peak_parameters = [
+            {key: float(value) for key, value in peak.items()}
+            for peak in saved.get("saved_ridge_peak_parameters", [])
+        ]
         cycle.saved_hybrid_tau_s = _optional_array(saved.get("saved_hybrid_tau_s"))
         cycle.saved_hybrid_gamma_ohm = _optional_array(
             saved.get("saved_hybrid_gamma_ohm")
@@ -386,6 +396,10 @@ def load_project_file(
             if saved.get("saved_hybrid_ohmic_resistance") is not None
             else None
         )
+        cycle.saved_hybrid_peak_parameters = [
+            {key: float(value) for key, value in peak.items()}
+            for peak in saved.get("saved_hybrid_peak_parameters", [])
+        ]
         if cycle.drt_label == "Hybrid DRT" and cycle.saved_hybrid_tau_s is not None:
             cycle.show_hybrid_drt()
         elif cycle.drt_label == "Ridge DRT" and cycle.saved_ridge_tau_s is not None:
