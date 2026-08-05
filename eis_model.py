@@ -71,12 +71,13 @@ class CycleState:
     saved_ridge_peak_count: int | None = None
     saved_ridge_ohmic_resistance: float | None = None
     saved_ridge_inductance: float | None = None
-    saved_ridge_peak_parameters: list[dict[str, float]] = field(default_factory=list)
+    saved_ridge_peak_parameters: list[dict[str, float | str]] = field(default_factory=list)
     saved_hybrid_tau_s: np.ndarray | None = None
     saved_hybrid_gamma_ohm: np.ndarray | None = None
     saved_hybrid_included_mask: np.ndarray | None = None
     saved_hybrid_ohmic_resistance: float | None = None
-    saved_hybrid_peak_parameters: list[dict[str, float]] = field(default_factory=list)
+    saved_hybrid_inductance: float | None = None
+    saved_hybrid_peak_parameters: list[dict[str, float | str]] = field(default_factory=list)
     kk_fit_impedance: np.ndarray | None = None
     kk_residual_real: np.ndarray | None = None
     kk_residual_imag: np.ndarray | None = None
@@ -244,6 +245,7 @@ class CycleState:
         tau_s: np.ndarray,
         gamma_ohm: np.ndarray,
         ohmic_resistance: float | None,
+        inductance: float | None = None,
     ) -> None:
         self.saved_hybrid_included_mask = self.included.copy()
         self.saved_hybrid_tau_s = as_1d_array(tau_s).astype(float)
@@ -251,18 +253,25 @@ class CycleState:
         self.saved_hybrid_ohmic_resistance = (
             float(ohmic_resistance) if ohmic_resistance is not None else None
         )
+        self.saved_hybrid_inductance = (
+            float(inductance) if inductance is not None else None
+        )
         self.saved_hybrid_peak_parameters = []
         self.show_hybrid_drt()
 
     def store_drt_peak_parameters(
         self,
         mode: str,
-        peaks: list[dict[str, float]],
+        peaks: list[dict[str, float | str]],
     ) -> None:
-        stored = [
-            {key: float(value) for key, value in peak.items()}
-            for peak in peaks
-        ]
+        stored = []
+        for peak in peaks:
+            stored.append(
+                {
+                    key: str(value) if key == "shape" else float(value)
+                    for key, value in peak.items()
+                }
+            )
         if mode == "Hybrid DRT":
             self.saved_hybrid_peak_parameters = stored
         else:

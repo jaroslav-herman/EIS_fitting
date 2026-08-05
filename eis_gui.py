@@ -15,6 +15,7 @@ from typing import Callable
 import numpy as np
 from natsort import natsort_keygen, ns
 from scipy.optimize import curve_fit
+from scipy.special import voigt_profile
 from wepy.eis import tau as cpe_tau
 
 from eis_model import ParameterValue, ProjectState
@@ -73,8 +74,12 @@ MODEL_PRESETS = (
 
 
 class ParameterTable(ttk.Frame):
-    def __init__(self, parent: tk.Misc) -> None:
+    def __init__(self, parent: tk.Misc, name_double_click=None, display_name=None) -> None:
         super().__init__(parent)
+        self._name_double_click = name_double_click
+        self._display_name = display_name or _external_parameter_name
+        self._name_labels = {}
+        self._highlighted_names: set[str] = set()
         self._rows: list[
             tuple[
                 str,
@@ -99,17 +104,31 @@ class ParameterTable(ttk.Frame):
             if int(child.grid_info()["row"]) > 0:
                 child.destroy()
         self._rows.clear()
+        self._name_labels.clear()
         for row, parameter in enumerate(parameters, start=1):
             fixed = tk.BooleanVar(value=parameter.fixed)
             initial = tk.StringVar(value=f"{parameter.initial:g}")
             lower = tk.StringVar(value=f"{parameter.lower:g}")
             upper = tk.StringVar(value=f"{parameter.upper:g}")
-            ttk.Label(self, text=_external_parameter_name(parameter.name)).grid(
+            label = tk.Label(
+                self,
+                text=self._display_name(parameter.name),
+                anchor="w",
+                background="#fff2a8" if parameter.name in self._highlighted_names else "#f0f0f0",
+            )
+            label.grid(
                 row=row, column=0, padx=3, pady=2
             )
+            self._name_labels[parameter.name] = label
+            if self._name_double_click is not None:
+                label.bind(
+                    "<Double-Button-1>",
+                    lambda _event, name=parameter.name: self._name_double_click(name),
+                )
             ttk.Checkbutton(self, variable=fixed).grid(
                 row=row, column=1, padx=3, pady=2
             )
+
             ttk.Entry(self, textvariable=initial, width=10).grid(
                 row=row, column=2, padx=3, pady=2, sticky="ew"
             )
@@ -136,6 +155,13 @@ class ParameterTable(ttk.Frame):
                     lower,
                     upper,
                 )
+            )
+
+    def set_highlighted_names(self, names: set[str]) -> None:
+        self._highlighted_names = set(names)
+        for name, label in self._name_labels.items():
+            label.configure(
+                background="#fff2a8" if name in self._highlighted_names else "#f0f0f0"
             )
 
     @staticmethod
@@ -389,6 +415,8 @@ class EISApplication:
         self._drt_peak_artists = []
         self._drt_peak_sum_artist = None
         self._drt_peak_drag = None
+        self._drt_peak_drag_moved = False
+        self._selected_drt_peak_index = None
         self._drt_aux_parameter_limits = {}
         self._plot_imports = None
         self.plot_mode = "nyquist"
@@ -423,6 +451,7 @@ class EISApplication:
         self.root.bind("<Control-Up>", lambda _event: self.change_cycle(-1, focus_only=True))
         self.root.bind("<Control-Down>", lambda _event: self.change_cycle(1, focus_only=True))
         self.root.bind("<Control-a>", self.select_all_spectra)
+        self.root.bind("<Delete>", self._on_delete_key)
         self.root.bind("<Control-e>", self.open_export_menu)
         self.root.bind("<Control-s>", self._on_control_s)
         self.root.bind("<Control-S>", self._on_control_s)
@@ -456,7 +485,7 @@ class EISApplication:
         return "No file loaded"
 
     def _configure_window(self) -> None:
-        self.root.title("EIS Fitting")
+        self._update_window_title()
         self.root.geometry("1220x760")
         self.root.minsize(940, 620)
         style = ttk.Style(self.root)
@@ -920,6 +949,7 @@ class EISApplication:
                 )
             )
         )
+
         curve_impedance = self._drt_peak_impedance(cycle, curve_frequency)
         if curve_impedance is None:
             self.drt_fit_artist.set_data([], [])
@@ -2460,6 +2490,7 @@ class EISApplication:
         self.drt_tools_group = ttk.LabelFrame(parent, text="DRT analysis", padding=8)
         self.drt_tools_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self.drt_tools_group.columnconfigure(1, weight=1)
+        self.drt_tools_group.columnconfigure(2, weight=1)
         ttk.Label(self.drt_tools_group, text="Method").grid(
             row=0, column=0, padx=(0, 8), sticky="w"
         )
@@ -2485,10 +2516,34 @@ class EISApplication:
         self.add_gaussian_peak_button = ttk.Button(
             self.drt_tools_group,
             text="Add Gaussian peak",
-            command=self.add_gaussian_peak,
+            command=lambda: self.add_drt_peak("gaussian"),
         )
         self.add_gaussian_peak_button.grid(
             row=2, column=0, padx=(0, 3), pady=(6, 0), sticky="ew"
+        )
+        self.add_lorentzian_peak_button = ttk.Button(
+            self.drt_tools_group,
+            text="Add Lorentzian peak",
+            command=lambda: self.add_drt_peak("lorentzian"),
+        )
+        self.add_lorentzian_peak_button.grid(
+            row=2, column=1, padx=3, pady=(6, 0), sticky="ew"
+        )
+        self.add_voigt_peak_button = ttk.Button(
+            self.drt_tools_group,
+            text="Add Voigt peak",
+            command=lambda: self.add_drt_peak("voigt"),
+        )
+        self.add_voigt_peak_button.grid(
+            row=2, column=2, padx=(3, 0), pady=(6, 0), sticky="ew"
+        )
+        self.add_hn_peak_button = ttk.Button(
+            self.drt_tools_group,
+            text="Add HN peak",
+            command=lambda: self.add_drt_peak("hn"),
+        )
+        self.add_hn_peak_button.grid(
+            row=3, column=0, columnspan=3, pady=(6, 0), sticky="ew"
         )
         self.fit_peaks_button = ttk.Button(
             self.drt_tools_group,
@@ -2496,7 +2551,7 @@ class EISApplication:
             command=self.fit_drt_peaks,
         )
         self.fit_peaks_button.grid(
-            row=2, column=1, padx=(3, 0), pady=(6, 0), sticky="ew"
+            row=4, column=0, columnspan=3, pady=(6, 0), sticky="ew"
         )
         self.send_drt_initials_button = ttk.Button(
             self.drt_tools_group,
@@ -2504,7 +2559,7 @@ class EISApplication:
             command=self.send_drt_initials,
         )
         self.send_drt_initials_button.grid(
-            row=4, column=0, columnspan=2, pady=(6, 0), sticky="ew"
+            row=7, column=0, columnspan=3, pady=(6, 0), sticky="ew"
         )
         self.open_drt_analysis_button = ttk.Button(
             self.drt_tools_group,
@@ -2512,17 +2567,35 @@ class EISApplication:
             command=self.open_drt_analysis_window,
         )
         self.open_drt_analysis_button.grid(
-            row=5, column=0, columnspan=2, pady=(6, 0), sticky="ew"
+            row=8, column=0, columnspan=3, pady=(6, 0), sticky="ew"
         )
-        self.drt_peak_table = ParameterTable(self.drt_tools_group)
+        self.remove_all_peaks_button = ttk.Button(
+            self.drt_tools_group,
+            text="Remove all peaks",
+            command=self.remove_all_drt_peaks,
+        )
+        self.remove_all_peaks_button.grid(
+            row=9, column=0, columnspan=3, pady=(6, 0), sticky="ew"
+        )
+        self.drt_peak_table = ParameterTable(
+            self.drt_tools_group,
+            name_double_click=self._on_drt_parameter_double_click,
+            display_name=self._drt_display_parameter_name,
+        )
         self.drt_peak_table.grid(
-            row=3, column=0, columnspan=2, pady=(6, 0), sticky="ew"
+            row=5, column=0, columnspan=3, pady=(6, 0), sticky="ew"
         )
         self.drt_tools_group.grid_remove()
         self.action_buttons = (
             self.fit_button,
             self.fit_selected_button,
             self.drt_fit_button,
+            self.add_gaussian_peak_button,
+            self.add_lorentzian_peak_button,
+            self.add_voigt_peak_button,
+            self.add_hn_peak_button,
+            self.fit_peaks_button,
+            self.remove_all_peaks_button,
             self.send_drt_initials_button,
             self.initial_values_button,
             self.ridge_drt_button,
@@ -2719,7 +2792,11 @@ class EISApplication:
         table_group.columnconfigure(0, weight=1)
         table_group.rowconfigure(0, weight=1)
         body.rowconfigure(1, weight=1)
-        table = ParameterTable(table_group)
+        table = ParameterTable(
+            table_group,
+            name_double_click=self._on_drt_parameter_double_click,
+            display_name=self._drt_display_parameter_name,
+        )
         table.grid(row=0, column=0, sticky="nsew")
         self.detached_drt_peak_table = table
         self._update_drt_peak_table()
@@ -2751,18 +2828,38 @@ class EISApplication:
         ttk.Button(
             buttons,
             text="Add Gaussian peak",
-            command=lambda: run_action(self.add_gaussian_peak),
+            command=lambda: run_action(lambda: self.add_drt_peak("gaussian")),
         ).grid(row=1, column=0, padx=(0, 3), sticky="ew")
+        ttk.Button(
+            buttons,
+            text="Add Lorentzian peak",
+            command=lambda: run_action(lambda: self.add_drt_peak("lorentzian")),
+        ).grid(row=1, column=1, padx=3, sticky="ew")
+        ttk.Button(
+            buttons,
+            text="Add Voigt peak",
+            command=lambda: run_action(lambda: self.add_drt_peak("voigt")),
+        ).grid(row=1, column=2, padx=(3, 0), sticky="ew")
+        ttk.Button(
+            buttons,
+            text="Add HN peak",
+            command=lambda: run_action(lambda: self.add_drt_peak("hn")),
+        ).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         ttk.Button(
             buttons,
             text="Fit peaks",
             command=lambda: run_action(self.fit_drt_peaks),
-        ).grid(row=1, column=1, padx=3, sticky="ew")
+        ).grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         ttk.Button(
             buttons,
             text="Send initials",
             command=lambda: run_action(self.send_drt_initials),
-        ).grid(row=1, column=2, padx=(3, 0), sticky="ew")
+        ).grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        ttk.Button(
+            buttons,
+            text="Remove all peaks",
+            command=lambda: run_action(self.remove_all_drt_peaks),
+        ).grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 0))
 
     def _poll_analysis_windows(self) -> None:
         if not self.root.winfo_exists():
@@ -2784,6 +2881,7 @@ class EISApplication:
                 table.set_parameters(self.drt_peak_table.values())
             self._analysis_windows_cycle_key = current_key
         self._analysis_windows_last_busy = self.busy
+        self._update_window_title()
         self.root.after(300, self._poll_analysis_windows)
 
     def _fit_selected_drts(self) -> None:
@@ -3131,6 +3229,25 @@ class EISApplication:
             )
         self._update_status(f"{action} applied to {updated} spectra{suffix}")
 
+    def _update_window_title(self) -> None:
+        project_path = next(
+            (
+                getattr(self, name, None)
+                for name in (
+                "project_path",
+                    "_project_title_path",
+                    "_project_path",
+                    "current_project_path",
+                    "loaded_project_path",
+                    "project_file",
+                )
+                if getattr(self, name, None)
+            ),
+            None,
+        )
+        project_name = Path(project_path).name if project_path else "Untitled"
+        self.root.title(f"EIS Fitting — {project_name}")
+
     def _refresh_plot(self, rescale: bool = False) -> None:
         if self.state is None:
             return
@@ -3142,6 +3259,12 @@ class EISApplication:
             if hasattr(self, "analysis_drt_mode_var")
             else "Ridge DRT",
         )
+        if (
+            drt_key[2] == "Hybrid DRT"
+            and cycle.saved_hybrid_tau_s is not None
+            and cycle.saved_hybrid_inductance is None
+        ):
+            cycle.saved_hybrid_inductance = self._estimate_drt_inductance(cycle)
         if drt_key != self._drt_peak_cycle_key:
             saved_name = (
                 "saved_hybrid_peak_parameters"
@@ -3152,7 +3275,14 @@ class EISApplication:
                 dict(peak)
                 for peak in getattr(cycle, saved_name, [])
             ]
+            if (
+                drt_key[2] == "Hybrid DRT"
+                and cycle.saved_hybrid_tau_s is not None
+                and cycle.saved_hybrid_inductance is None
+            ):
+                cycle.saved_hybrid_inductance = self._estimate_drt_inductance(cycle)
             self._drt_aux_parameter_limits = {}
+            self._selected_drt_peak_index = None
             self._clamp_drt_peak_parameters_to_limits()
             self._drt_peak_cycle_key = drt_key
         included = cycle.included
@@ -3433,21 +3563,255 @@ class EISApplication:
         return tau[finite][order], gamma[finite][order]
 
     @staticmethod
-    def _gaussian_peak_values(log_tau, peak):
-        return peak["height"] * np.exp(
-            -0.5
-            * ((log_tau - peak["center_log10"]) / max(peak["sigma_log10"], 1e-6))
-            ** 2
-        )
+    def _estimate_drt_inductance(cycle) -> float | None:
+        frequency = np.asarray(cycle.frequency_hz, dtype=float)
+        impedance = np.asarray(cycle.impedance, dtype=complex)
+        finite = np.isfinite(frequency) & (frequency > 0) & np.isfinite(impedance)
+        if not np.any(finite):
+            return None
+        frequency = frequency[finite]
+        impedance = impedance[finite]
+        order = np.argsort(frequency)[::-1]
+        count = max(3, min(20, frequency.size // 5 or frequency.size))
+        values = impedance[order[:count]].imag / (2.0 * np.pi * frequency[order[:count]])
+        values = values[np.isfinite(values) & (values >= 0)]
+        return float(np.median(values)) if values.size else None
+
+    @staticmethod
+    def _peak_shape(peak) -> str:
+        return str(peak.get("shape", "gaussian")).lower()
+
+    @classmethod
+    def _peak_values(cls, log_tau, peak):
+        shape = cls._peak_shape(peak)
+        distance = np.asarray(log_tau, dtype=float) - peak["center_log10"]
+        width = max(float(peak["sigma_log10"]), 1e-6)
+        if shape == "lorentzian":
+            return peak["height"] / (1.0 + (distance / width) ** 2)
+        if shape == "voigt":
+            gamma = max(float(peak.get("gamma_log10", width)), 1e-6)
+            values = voigt_profile(distance, width, gamma)
+            peak_value = float(voigt_profile(0.0, width, gamma))
+            return peak["height"] * values / max(peak_value, 1e-300)
+        if shape == "hn":
+            alpha = float(np.clip(peak.get("alpha", 0.8), 1e-3, 0.999))
+            beta = float(np.clip(peak.get("beta", 0.8), 1e-3, 0.999))
+            ratio = 10.0**distance
+            alpha_ratio = ratio**alpha
+            angle = np.arctan2(
+                np.sin(np.pi * alpha), alpha_ratio + np.cos(np.pi * alpha)
+            )
+            profile = (
+                alpha_ratio * np.sin(beta * angle)
+                / (alpha_ratio**2 + 2.0 * alpha_ratio * np.cos(np.pi * alpha) + 1.0)
+                ** (beta / 2.0)
+            )
+            center_profile = np.sin(beta * np.arctan2(
+                np.sin(np.pi * alpha), 1.0 + np.cos(np.pi * alpha)
+            )) / (2.0 + 2.0 * np.cos(np.pi * alpha)) ** (beta / 2.0)
+            return peak["height"] * profile / max(float(center_profile), 1e-300)
+        return peak["height"] * np.exp(-0.5 * (distance / width) ** 2)
+
+    @classmethod
+    def _gaussian_peak_values(cls, log_tau, peak):
+        return cls._peak_values(log_tau, {**peak, "shape": "gaussian"})
 
     @staticmethod
     def _peak_summary(peak):
         tau = 10.0 ** peak["center_log10"]
         sigma = max(peak["sigma_log10"], 1e-6)
-        area = peak["height"] * sigma * np.sqrt(2.0 * np.pi) * np.log(10.0)
-        half_width = np.sqrt(2.0 * np.log(2.0)) * sigma
+        shape = str(peak.get("shape", "gaussian")).lower()
+        if shape == "lorentzian":
+            area = peak["height"] * np.pi * sigma * np.log(10.0)
+            half_width = sigma
+        elif shape == "voigt":
+            gamma = max(float(peak.get("gamma_log10", sigma)), 1e-6)
+            area = peak["height"] / max(
+                float(voigt_profile(0.0, sigma, gamma)), 1e-300
+            ) * np.log(10.0)
+            fwhm_log10 = 0.5346 * 2.0 * gamma + np.sqrt(
+                0.2166 * (2.0 * gamma) ** 2 + (2.35482 * sigma) ** 2
+            )
+            half_width = fwhm_log10 / 2.0
+        elif shape == "hn":
+            alpha = float(np.clip(peak.get("alpha", 0.8), 1e-3, 0.999))
+            beta = float(np.clip(peak.get("beta", 0.8), 1e-3, 0.999))
+            grid = np.linspace(-5.0, 5.0, 2001)
+            profile = EISApplication._peak_values(
+                grid,
+                {**peak, "height": 1.0, "alpha": alpha, "beta": beta},
+            )
+            area = peak.get(
+                "area",
+                float(np.trapezoid(profile, grid) * np.log(10.0) * peak["height"]),
+            )
+            half = np.flatnonzero(profile >= 0.5 * np.max(profile))
+            if half.size:
+                half_width = max(
+                    abs(grid[half[-1]] - grid[half[0]]) / 2.0,
+                    1e-6,
+                )
+            else:
+                half_width = 0.1
+            return tau, area, tau * (10.0**half_width - 10.0 ** (-half_width))
+        else:
+            area = peak["height"] * sigma * np.sqrt(2.0 * np.pi) * np.log(10.0)
+            half_width = np.sqrt(2.0 * np.log(2.0)) * sigma
         fwhm = tau * (10.0**half_width - 10.0 ** (-half_width))
         return tau, area, fwhm
+
+    @staticmethod
+    def _peak_width_from_fwhm(shape, tau, fwhm):
+        ratio = max(float(fwhm) / max(float(tau), 1e-300), 1e-12)
+        half_width = np.arcsinh(ratio / 2.0) / np.log(10.0)
+        if shape == "lorentzian":
+            return max(half_width, 1e-6)
+        if shape == "voigt":
+            voigt_fwhm_factor = 0.5346 * 2.0 + np.sqrt(0.2166 * 4.0 + 2.35482**2)
+            return max(2.0 * half_width / voigt_fwhm_factor, 1e-6)
+        return max(
+            half_width / np.sqrt(2.0 * np.log(2.0)),
+            1e-6,
+        )
+
+    @staticmethod
+    def _peak_height_from_area(shape, area, sigma, gamma=None, alpha=None, beta=None):
+        if shape == "lorentzian":
+            normalization = np.pi * sigma * np.log(10.0)
+        elif shape == "voigt":
+            gamma = max(float(gamma if gamma is not None else sigma), 1e-6)
+            normalization = np.log(10.0) / max(
+                float(voigt_profile(0.0, sigma, gamma)), 1e-300
+            )
+        elif shape == "hn":
+            profile = EISApplication._peak_values(
+                np.linspace(-5.0, 5.0, 2001),
+                {
+                    "shape": "hn",
+                    "center_log10": 0.0,
+                    "height": 1.0,
+                    "sigma_log10": 0.12,
+                    "alpha": alpha if alpha is not None else 0.8,
+                    "beta": beta if beta is not None else 0.8,
+                },
+            )
+            normalization = float(np.trapezoid(profile, np.linspace(-5.0, 5.0, 2001)) * np.log(10.0))
+        else:
+            normalization = sigma * np.sqrt(2.0 * np.pi) * np.log(10.0)
+        return float(area) / max(normalization, 1e-300)
+
+    @classmethod
+    def _peak_half_width_log10(cls, peak):
+        shape = cls._peak_shape(peak)
+        sigma = max(float(peak["sigma_log10"]), 1e-6)
+        if shape == "lorentzian":
+            return sigma
+        if shape == "voigt":
+            gamma = max(float(peak.get("gamma_log10", sigma)), 1e-6)
+            return (0.5346 * 2.0 * gamma + np.sqrt(
+                0.2166 * (2.0 * gamma) ** 2 + (2.35482 * sigma) ** 2
+            )) / 2.0
+        if shape == "hn":
+            tau, _area, fwhm = cls._peak_summary(peak)
+            return max(np.arcsinh(fwhm / max(2.0 * tau, 1e-300)) / np.log(10.0), 1e-6)
+        return np.sqrt(2.0 * np.log(2.0)) * sigma
+
+    def _drt_display_parameter_name(self, name: str) -> str:
+        match = re.fullmatch(r"Peak(\d+)_(.+)", name)
+        if match is None:
+            return _external_parameter_name(name)
+        index = int(match.group(1)) - 1
+        shape = (
+            self._peak_shape(self.drt_peak_parameters[index]).title()
+            if 0 <= index < len(self.drt_peak_parameters)
+            else "Peak"
+        )
+        prefix = {"Gaussian": "Gauss", "Lorentzian": "Lor", "Voigt": "Voigt", "Hn": "HN"}.get(
+            shape, shape
+        )
+        return f"{prefix}_{match.group(1)}_{match.group(2)}"
+
+    def _drt_peak_parameter_names(self, index: int) -> set[str]:
+        prefix = f"Peak{index + 1}_"
+        return {
+            parameter.name
+            for parameter in self.drt_peak_table.values()
+            if parameter.name.startswith(prefix)
+        }
+
+    def _select_drt_peak(self, index: int | None) -> None:
+        if index is None or not (0 <= index < len(self.drt_peak_parameters)):
+            self._selected_drt_peak_index = None
+            names = set()
+        else:
+            self._selected_drt_peak_index = index
+            names = self._drt_peak_parameter_names(index)
+        if hasattr(self, "drt_peak_table"):
+            self.drt_peak_table.set_highlighted_names(names)
+        detached = getattr(self, "detached_drt_peak_table", None)
+        if detached is not None:
+            detached.set_highlighted_names(names)
+        self._refresh_drt_peak_artists()
+        self.canvas.draw_idle()
+
+    def _on_drt_parameter_double_click(self, name: str) -> None:
+        match = re.fullmatch(r"Peak(\d+)_.*", name)
+        if match is not None:
+            index = int(match.group(1)) - 1
+            self._select_drt_peak(
+                None if index == self._selected_drt_peak_index else index
+            )
+
+    def _select_drt_peak_from_event(self, event) -> bool:
+        if event.inaxes is not self.drt_axes or event.xdata is None or event.ydata is None:
+            return False
+        best = None
+        for index, peak in enumerate(self.drt_peak_parameters):
+            x_value = max(float(event.xdata), 1e-300)
+            y_value = float(self._peak_values([np.log10(x_value)], peak)[0])
+            display = self.drt_axes.transData.transform((x_value, y_value))
+            distance = float(np.hypot(display[0] - event.x, display[1] - event.y))
+            if best is None or distance < best[0]:
+                best = (distance, index)
+        if best is None or best[0] > 18.0:
+            return False
+        self._select_drt_peak(
+            None if best[1] == self._selected_drt_peak_index else best[1]
+        )
+        return True
+
+    def _on_delete_key(self, _event=None):
+        focus = self.root.focus_get()
+        if focus is not None and str(focus).startswith(str(self.explorer)):
+            return None
+        if self.analysis_mode_var.get() == "DRT" and self._selected_drt_peak_index is not None:
+            self.remove_selected_drt_peak()
+            return "break"
+        return None
+
+    def remove_selected_drt_peak(self) -> None:
+        index = self._selected_drt_peak_index
+        if index is None or not (0 <= index < len(self.drt_peak_parameters)):
+            return
+        self.drt_peak_parameters.pop(index)
+        self._selected_drt_peak_index = (
+            min(index, len(self.drt_peak_parameters) - 1)
+            if self.drt_peak_parameters
+            else None
+        )
+        self._store_current_drt_peaks()
+        self._refresh_drt_peak_artists()
+        self.canvas.draw_idle()
+
+    def remove_all_drt_peaks(self) -> None:
+        if not self.drt_peak_parameters:
+            return
+        self.drt_peak_parameters.clear()
+        self._selected_drt_peak_index = None
+        self._store_current_drt_peaks()
+        self._refresh_drt_peak_artists()
+        self.canvas.draw_idle()
+        self._update_status("removed all DRT peaks")
 
     def _update_drt_peak_table(self) -> None:
         if not hasattr(self, "drt_peak_table"):
@@ -3462,12 +3826,16 @@ class EISApplication:
                 else cycle.saved_ridge_ohmic_resistance
             )
             inductance = (
-                cycle.saved_ridge_inductance if mode == "Ridge DRT" else None
+                cycle.saved_ridge_inductance
+                if mode == "Ridge DRT"
+                else cycle.saved_hybrid_inductance
             )
-            for name, value, unit in (
-                ("R0", resistance, "Ohm"),
-                ("L0", inductance, "H"),
-            ):
+            auxiliary_parameters = (
+                (("R_inf", resistance, "Ohm"), ("inductance", inductance, "H"))
+                if mode == "Hybrid DRT"
+                else (("R0", resistance, "Ohm"), ("L0", inductance, "H"))
+            )
+            for name, value, unit in auxiliary_parameters:
                 if value is None:
                     continue
                 value = float(value)
@@ -3481,11 +3849,29 @@ class EISApplication:
 
         for index, peak in enumerate(self.drt_peak_parameters, 1):
             tau, area, fwhm = self._peak_summary(peak)
-            for suffix, value, error_key in (
-                ("area", area, "area_error_percent"),
-                ("tau", tau, "tau_error_percent"),
-                ("fwhm", fwhm, "fwhm_error_percent"),
-            ):
+            shape = self._peak_shape(peak)
+            if shape in {"voigt", "hn"}:
+                if shape == "hn":
+                    peak_parameters = (
+                        ("area", area, "area_error_percent", "Ohm"),
+                        ("tau", tau, "tau_error_percent", "s"),
+                        ("alpha", peak.get("alpha", 0.8), "alpha_error_percent", ""),
+                        ("beta", peak.get("beta", 0.8), "beta_error_percent", ""),
+                    )
+                else:
+                    peak_parameters = (
+                        ("area", area, "area_error_percent", "Ohm"),
+                        ("tau", tau, "tau_error_percent", "s"),
+                        ("sigma", peak.get("sigma_log10", 0.12), "sigma_error_percent", "log10(s)"),
+                        ("gamma", peak.get("gamma_log10", peak.get("sigma_log10", 0.12)), "gamma_error_percent", "log10(s)"),
+                    )
+            else:
+                peak_parameters = (
+                    ("area", area, "area_error_percent", "Ohm"),
+                    ("tau", tau, "tau_error_percent", "s"),
+                    ("fwhm", fwhm, "fwhm_error_percent", "s"),
+                )
+            for suffix, value, error_key, unit in peak_parameters:
                 lower_key = f"{suffix}_lower"
                 upper_key = f"{suffix}_upper"
                 magnitude = max(abs(value), np.finfo(float).eps)
@@ -3493,6 +3879,10 @@ class EISApplication:
                     "tau": (1e-5, 10.0),
                     "area": (0.0, 1e3),
                     "fwhm": (0.0, 1.0),
+                    "sigma": (1e-6, 1.0),
+                    "gamma": (1e-6, 1.0),
+                    "alpha": (1e-3, 1.0),
+                    "beta": (1e-3, 1.0),
                 }
                 default_lower, default_upper = default_limits[suffix]
                 lower = peak.get(lower_key, default_lower)
@@ -3500,7 +3890,7 @@ class EISApplication:
                 parameters.append(
                     ParameterValue(
                         f"Peak{index}_{suffix}",
-                        "s" if suffix == "tau" else "Ohm",
+                        unit,
                         value,
                         lower,
                         upper,
@@ -3509,28 +3899,61 @@ class EISApplication:
                     )
                 )
         self.drt_peak_table.set_parameters(parameters)
+        self.drt_peak_table.set_highlighted_names(
+            self._drt_peak_parameter_names(self._selected_drt_peak_index)
+            if self._selected_drt_peak_index is not None
+            else set()
+        )
 
     def _clamp_drt_peak_parameters_to_limits(self) -> None:
         for peak in self.drt_peak_parameters:
             tau, area, fwhm = self._peak_summary(peak)
-            values = {"tau": tau, "area": area, "fwhm": fwhm}
+            shape = self._peak_shape(peak)
+            values = {"tau": tau, "area": area}
+            if shape == "voigt":
+                values.update({
+                    "sigma": peak.get("sigma_log10", 0.12),
+                    "gamma": peak.get("gamma_log10", peak.get("sigma_log10", 0.12)),
+                })
+            elif shape == "hn":
+                values.update({
+                    "alpha": peak.get("alpha", 0.8),
+                    "beta": peak.get("beta", 0.8),
+                })
+            else:
+                values["fwhm"] = fwhm
             for suffix, value in values.items():
-                defaults = {"tau": (1e-5, 10.0), "area": (0.0, 1e3), "fwhm": (0.0, 1.0)}
+                defaults = {
+                    "tau": (1e-5, 10.0), "area": (0.0, 1e3),
+                    "fwhm": (0.0, 1.0), "sigma": (1e-6, 1.0),
+                    "gamma": (1e-6, 1.0),
+                    "alpha": (1e-3, 1.0), "beta": (1e-3, 1.0),
+                }
                 lower = peak.get(f"{suffix}_lower", defaults[suffix][0])
                 upper = peak.get(f"{suffix}_upper", defaults[suffix][1])
                 values[suffix] = self._clamp_parameter_value(value, lower, upper)
             tau = max(values["tau"], 1e-300)
-            fwhm = max(values["fwhm"], 1e-300)
-            ratio = max(fwhm / tau, 1e-12)
             peak["center_log10"] = float(np.log10(tau))
-            peak["sigma_log10"] = float(
-                np.arcsinh(ratio / 2.0)
-                / (np.log(10.0) * np.sqrt(2.0 * np.log(2.0)))
+            if shape == "voigt":
+                peak["sigma_log10"] = values["sigma"]
+                peak["gamma_log10"] = values["gamma"]
+            elif shape == "hn":
+                peak["alpha"] = values["alpha"]
+                peak["beta"] = values["beta"]
+                peak["area"] = values["area"]
+            else:
+                peak["sigma_log10"] = self._peak_width_from_fwhm(
+                    shape, tau, max(values["fwhm"], 1e-300)
+                )
+            peak["height"] = self._peak_height_from_area(
+                shape, values["area"], peak["sigma_log10"],
+                peak.get("gamma_log10"),
+                peak.get("alpha"), peak.get("beta"),
             )
-            peak["height"] = float(
-                values["area"]
-                / (peak["sigma_log10"] * np.log(10.0) * np.sqrt(2.0 * np.pi))
-            )
+            if shape == "hn":
+                peak["area"] = values["area"]
+            if self._peak_shape(peak) == "hn":
+                peak["area"] = peak_area
         self._store_current_drt_peaks()
 
     def _sync_drt_peak_parameters_from_table(self) -> bool:
@@ -3551,24 +3974,34 @@ class EISApplication:
             for index, peak in enumerate(self.drt_peak_parameters, 1):
                 tau = by_name[f"Peak{index}_tau"]
                 area = by_name[f"Peak{index}_area"]
-                fwhm = by_name[f"Peak{index}_fwhm"]
-                if tau.initial <= 0 or fwhm.initial <= 0:
-                    raise ValueError(f"Peak {index}: tau and FWHM must be positive")
+                shape = self._peak_shape(peak)
+                width_names = (
+                    ("sigma", "gamma") if shape == "voigt"
+                    else ("alpha", "beta") if shape == "hn"
+                    else ("fwhm",)
+                )
+                widths = [by_name[f"Peak{index}_{name}"] for name in width_names]
+                if tau.initial <= 0 or any(width.initial <= 0 for width in widths):
+                    raise ValueError(f"Peak {index}: tau and width parameters must be positive")
                 peak["center_log10"] = float(np.log10(tau.initial))
-                ratio = max(fwhm.initial / tau.initial, 1e-12)
-                peak["sigma_log10"] = float(
-                    np.arcsinh(ratio / 2.0)
-                    / (np.log(10.0) * np.sqrt(2.0 * np.log(2.0)))
+                if shape == "voigt":
+                    peak["sigma_log10"] = widths[0].initial
+                    peak["gamma_log10"] = widths[1].initial
+                elif shape == "hn":
+                    peak["alpha"] = widths[0].initial
+                    peak["beta"] = widths[1].initial
+                else:
+                    peak["sigma_log10"] = self._peak_width_from_fwhm(
+                        shape, tau.initial, widths[0].initial
+                    )
+                peak["height"] = self._peak_height_from_area(
+                    shape, area.initial, peak.get("sigma_log10", 0.12),
+                    peak.get("gamma_log10"),
+                    peak.get("alpha"), peak.get("beta"),
                 )
-                peak["height"] = float(
-                    area.initial
-                    / (peak["sigma_log10"] * np.log(10.0) * np.sqrt(2.0 * np.pi))
-                )
-                for source, target in (
-                    (tau, "tau"),
-                    (area, "area"),
-                    (fwhm, "fwhm"),
-                ):
+                sources = [(tau, "tau"), (area, "area")]
+                sources.extend(zip(widths, width_names))
+                for source, target in sources:
                     peak[f"{target}_lower"] = source.lower
                     peak[f"{target}_upper"] = source.upper
                     peak[f"{target}_fixed"] = source.fixed
@@ -3607,30 +4040,41 @@ class EISApplication:
         log_tau_grid = np.log10(tau_grid)
         total = np.zeros_like(tau_grid)
         for index, peak in enumerate(self.drt_peak_parameters):
-            values = self._gaussian_peak_values(log_tau_grid, peak)
+            values = self._peak_values(log_tau_grid, peak)
             total += values
+            selected = index == self._selected_drt_peak_index
             line, = self.drt_axes.plot(
                 tau_grid,
                 values,
                 "--",
-                linewidth=1.2,
-                alpha=0.85,
-                label=f"Gaussian {index + 1}",
+                linewidth=2.6 if selected else 1.2,
+                alpha=1.0 if selected else 0.85,
+                label=f"{self._peak_shape(peak).title()} {index + 1}",
             )
             center_tau = 10.0 ** peak["center_log10"]
-            half_width = np.sqrt(2.0 * np.log(2.0)) * peak["sigma_log10"]
+            _tau, _area, fwhm = self._peak_summary(peak)
+            half_width = np.log10(
+                (fwhm + np.sqrt(fwhm**2 + 4.0 * center_tau**2))
+                / (2.0 * center_tau)
+            )
             left_tau = 10.0 ** (peak["center_log10"] - half_width)
             right_tau = 10.0 ** (peak["center_log10"] + half_width)
             top, = self.drt_axes.plot(
-                [center_tau], [peak["height"]], "o", color=line.get_color(), ms=6
+                [center_tau], [peak["height"]], "o", color=line.get_color(),
+                ms=9 if selected else 6,
+                markeredgewidth=2.0 if selected else 0.8,
             )
-            left, = self.drt_axes.plot(
-                [left_tau], [peak["height"] / 2.0], "s", color=line.get_color(), ms=5
-            )
-            right, = self.drt_axes.plot(
-                [right_tau], [peak["height"] / 2.0], "s", color=line.get_color(), ms=5
-            )
-            self._drt_peak_artists.extend((line, top, left, right))
+            self._drt_peak_artists.extend((line, top))
+            if self._peak_shape(peak) != "hn":
+                left, = self.drt_axes.plot(
+                    [left_tau], [peak["height"] / 2.0], "s", color=line.get_color(),
+                    ms=7 if selected else 5,
+                )
+                right, = self.drt_axes.plot(
+                    [right_tau], [peak["height"] / 2.0], "s", color=line.get_color(),
+                    ms=7 if selected else 5,
+                )
+                self._drt_peak_artists.extend((left, right))
         self._drt_peak_sum_artist, = self.drt_axes.plot(
             tau_grid,
             total,
@@ -3644,10 +4088,10 @@ class EISApplication:
         self._update_drt_peak_table()
         self.drt_axes.legend(loc="best", fontsize=8)
 
-    def add_gaussian_peak(self) -> None:
+    def add_drt_peak(self, shape: str = "gaussian") -> None:
         tau, gamma = self._current_drt_arrays()
         if tau is None:
-            self._update_status("calculate a DRT before adding Gaussian peaks")
+            self._update_status("calculate a DRT before adding peaks")
             return
         peak_index = int(np.nanargmax(gamma))
         center = float(np.log10(tau[peak_index]))
@@ -3657,11 +4101,22 @@ class EISApplication:
         if height == 0.0:
             height = float(np.nanmax(np.abs(gamma)))
         self.drt_peak_parameters.append(
-            {"center_log10": center, "height": height, "sigma_log10": 0.12}
+            {
+                "shape": shape,
+                "center_log10": center,
+                "height": height,
+                "sigma_log10": 0.12,
+                **({"gamma_log10": 0.12} if shape == "voigt" else {}),
+                **({"alpha": 0.8, "beta": 0.8} if shape == "hn" else {}),
+            }
         )
+        self._selected_drt_peak_index = len(self.drt_peak_parameters) - 1
         self._store_current_drt_peaks()
         self._refresh_drt_peak_artists()
         self.canvas.draw_idle()
+
+    def add_gaussian_peak(self) -> None:
+        self.add_drt_peak("gaussian")
 
     def fit_drt_peaks(self) -> None:
         if self.busy or self.state is None:
@@ -3674,34 +4129,39 @@ class EISApplication:
             return
         log_tau = np.log10(tau)
         count = len(self.drt_peak_parameters)
+        specs = []
         initial = []
         lower = []
         upper = []
         fixed = []
         for index, peak in enumerate(self.drt_peak_parameters, 1):
             peak_tau, peak_area, peak_fwhm = self._peak_summary(peak)
-            initial.extend((peak_tau, peak_area, peak_fwhm))
-            lower.extend(
-                (
-                    peak.get("tau_lower", peak_tau / 10.0),
-                    peak.get("area_lower", min(0.0, peak_area)),
-                    peak.get("fwhm_lower", peak_fwhm / 10.0),
+            if self._peak_shape(peak) == "voigt":
+                names_values = (
+                    ("tau", peak_tau, peak_tau / 10.0, peak_tau * 10.0),
+                    ("area", peak_area, min(0.0, peak_area), max(abs(peak_area) * 10.0, 1e-12)),
+                    ("sigma", peak.get("sigma_log10", 0.12), peak.get("sigma_lower", 1e-6), peak.get("sigma_upper", 1.0)),
+                    ("gamma", peak.get("gamma_log10", 0.12), peak.get("gamma_lower", 1e-6), peak.get("gamma_upper", 1.0)),
                 )
-            )
-            upper.extend(
-                (
-                    peak.get("tau_upper", peak_tau * 10.0),
-                    peak.get("area_upper", max(abs(peak_area) * 10.0, 1e-12)),
-                    peak.get("fwhm_upper", peak_fwhm * 10.0),
+            elif self._peak_shape(peak) == "hn":
+                names_values = (
+                    ("tau", peak_tau, peak_tau / 10.0, peak_tau * 10.0),
+                    ("area", peak_area, min(0.0, peak_area), max(abs(peak_area) * 10.0, 1e-12)),
+                    ("alpha", peak.get("alpha", 0.8), peak.get("alpha_lower", 1e-3), peak.get("alpha_upper", 1.0)),
+                    ("beta", peak.get("beta", 0.8), peak.get("beta_lower", 1e-3), peak.get("beta_upper", 1.0)),
                 )
-            )
-            fixed.extend(
-                (
-                    bool(peak.get("tau_fixed", False)),
-                    bool(peak.get("area_fixed", False)),
-                    bool(peak.get("fwhm_fixed", False)),
+            else:
+                names_values = (
+                    ("tau", peak_tau, peak_tau / 10.0, peak_tau * 10.0),
+                    ("area", peak_area, min(0.0, peak_area), max(abs(peak_area) * 10.0, 1e-12)),
+                    ("fwhm", peak_fwhm, peak_fwhm / 10.0, peak_fwhm * 10.0),
                 )
-            )
+            for name, value, default_lower, default_upper in names_values:
+                specs.append((index - 1, name))
+                initial.append(value)
+                lower.append(peak.get(f"{name}_lower", default_lower))
+                upper.append(peak.get(f"{name}_upper", default_upper))
+                fixed.append(bool(peak.get(f"{name}_fixed", False)))
 
         initial = np.asarray(initial, dtype=float)
         lower = np.asarray(lower, dtype=float)
@@ -3719,23 +4179,52 @@ class EISApplication:
             all_parameters = initial.copy()
             all_parameters[free_indices] = parameters
             result = np.zeros_like(values, dtype=float)
-            for index in range(count):
-                peak_tau, area, fwhm = all_parameters[index * 3 : index * 3 + 3]
-                ratio = max(fwhm / max(peak_tau, 1e-300), 1e-12)
-                sigma = np.arcsinh(ratio / 2.0) / (
-                    np.log(10.0) * np.sqrt(2.0 * np.log(2.0))
+            for peak_index in range(count):
+                peak = self.drt_peak_parameters[peak_index]
+                values_by_name = {
+                    name: all_parameters[offset]
+                    for offset, (owner, name) in enumerate(specs)
+                    if owner == peak_index
+                }
+                peak_tau = values_by_name["tau"]
+                area = values_by_name["area"]
+                if self._peak_shape(peak) == "voigt":
+                    sigma = values_by_name["sigma"]
+                    gamma_width = values_by_name["gamma"]
+                    alpha = beta = None
+                elif self._peak_shape(peak) == "hn":
+                    sigma = 0.12
+                    gamma_width = None
+                    alpha = values_by_name["alpha"]
+                    beta = values_by_name["beta"]
+                else:
+                    sigma = self._peak_width_from_fwhm(
+                        self._peak_shape(peak), peak_tau, values_by_name["fwhm"]
+                    )
+                    gamma_width = None
+                    alpha = beta = None
+                height = self._peak_height_from_area(
+                    self._peak_shape(peak), area, sigma, gamma_width, alpha, beta
                 )
-                height = area / (sigma * np.log(10.0) * np.sqrt(2.0 * np.pi))
-                result += height * np.exp(
-                    -0.5 * ((values - np.log10(peak_tau)) / sigma) ** 2
-                )
+                model_peak = {
+                    "shape": self._peak_shape(peak),
+                    "center_log10": np.log10(peak_tau),
+                    "sigma_log10": sigma,
+                    "height": height,
+                }
+                if gamma_width is not None:
+                    model_peak["gamma_log10"] = gamma_width
+                if alpha is not None:
+                    model_peak["alpha"] = alpha
+                    model_peak["beta"] = beta
+                result += self._peak_values(values, model_peak)
             return result
         fit_initial = initial[free_indices]
         fit_lower = lower[free_indices].copy()
         fit_upper = upper[free_indices].copy()
         for index in range(fit_initial.size):
             parameter_index = free_indices[index]
-            if fit_lower[index] <= 0 and parameter_index % 3 in {0, 2}:
+            if fit_lower[index] <= 0 and specs[parameter_index][1] in {"tau", "fwhm", "sigma", "gamma", "alpha", "beta"}:
                 fit_lower[index] = 1e-12
             margin = max(abs(fit_initial[index]) * 1e-9, 1e-12)
             fit_initial[index] = np.clip(
@@ -3765,30 +4254,41 @@ class EISApplication:
             errors[free_indices] = np.sqrt(
                 np.maximum(np.diag(covariance), 0.0)
             )
-        for index, peak in enumerate(self.drt_peak_parameters):
-            peak_tau, peak_area, peak_fwhm = fitted[index * 3 : index * 3 + 3]
+        for peak_index, peak in enumerate(self.drt_peak_parameters):
+            fitted_values = {
+                name: fitted[offset]
+                for offset, (owner, name) in enumerate(specs)
+                if owner == peak_index
+            }
+            peak_tau = fitted_values["tau"]
+            peak_area = fitted_values["area"]
             peak["center_log10"] = float(np.log10(peak_tau))
-            ratio = max(peak_fwhm / max(peak_tau, 1e-300), 1e-12)
-            peak["sigma_log10"] = float(
-                np.arcsinh(ratio / 2.0)
-                / (np.log(10.0) * np.sqrt(2.0 * np.log(2.0)))
+            if self._peak_shape(peak) == "voigt":
+                peak["sigma_log10"] = fitted_values["sigma"]
+                peak["gamma_log10"] = fitted_values["gamma"]
+            elif self._peak_shape(peak) == "hn":
+                peak["alpha"] = fitted_values["alpha"]
+                peak["beta"] = fitted_values["beta"]
+            else:
+                peak_fwhm = fitted_values["fwhm"]
+                peak["sigma_log10"] = self._peak_width_from_fwhm(
+                    self._peak_shape(peak), peak_tau, peak_fwhm
+                )
+            peak["height"] = self._peak_height_from_area(
+                self._peak_shape(peak), peak_area, peak["sigma_log10"],
+                peak.get("gamma_log10"), peak.get("alpha"), peak.get("beta")
             )
-            peak["height"] = float(
-                peak_area
-                / (peak["sigma_log10"] * np.log(10.0) * np.sqrt(2.0 * np.pi))
-            )
-            for offset, key, value in (
-                (0, "tau", peak_tau),
-                (1, "area", peak_area),
-                (2, "fwhm", peak_fwhm),
-            ):
+            for offset, (owner, key) in enumerate(specs):
+                if owner != peak_index:
+                    continue
+                value = fitted[offset]
                 peak[f"{key}_error_percent"] = float(
-                    100.0 * errors[index * 3 + offset] / max(abs(value), 1e-300)
+                    100.0 * errors[offset] / max(abs(value), 1e-300)
                 )
         self._store_current_drt_peaks()
         self._refresh_drt_peak_artists()
         self.canvas.draw_idle()
-        self._update_status(f"fitted {count} Gaussian DRT peaks")
+        self._update_status(f"fitted {count} DRT peaks")
 
     def _select_drt_peaks_for_eec(self, peaks, maximum: int):
         window = tk.Toplevel(self.root)
@@ -4014,16 +4514,74 @@ class EISApplication:
             self._refresh_plot(rescale=True)
         self.canvas.draw_idle()
 
+    def _drt_peak_impedance(self, cycle, frequency=None):
+        if not self.drt_peak_parameters:
+            return None
+        if frequency is None:
+            frequency = cycle.frequency_hz
+        frequency = np.asarray(frequency, dtype=float)
+        mode = self.analysis_drt_mode_var.get()
+        resistance = (
+            cycle.saved_hybrid_ohmic_resistance
+            if mode == "Hybrid DRT"
+            else cycle.saved_ridge_ohmic_resistance
+        )
+        inductance = (
+            cycle.saved_ridge_inductance
+            if mode == "Ridge DRT"
+            else cycle.saved_hybrid_inductance
+        )
+        omega = 2.0 * np.pi * frequency
+        impedance = np.full(frequency.size, float(resistance or 0.0), dtype=complex)
+        if inductance is not None:
+            impedance += 1j * omega * float(inductance)
+        distributed_peaks = []
+        for peak in self.drt_peak_parameters:
+            tau, area, _fwhm = self._peak_summary(peak)
+            if self._peak_shape(peak) == "hn":
+                alpha = float(np.clip(peak.get("alpha", 0.8), 1e-3, 0.999))
+                beta = float(np.clip(peak.get("beta", 0.8), 1e-3, 0.999))
+                impedance += area / (1.0 + (1j * omega * tau) ** alpha) ** beta
+            else:
+                distributed_peaks.append(peak)
+        if distributed_peaks:
+            finite_frequency = frequency[np.isfinite(frequency) & (frequency > 0)]
+            if finite_frequency.size:
+                log_tau_min = np.log10(
+                    1.0 / (2.0 * np.pi * np.max(finite_frequency))
+                ) - 1.0
+                log_tau_max = np.log10(
+                    1.0 / (2.0 * np.pi * np.min(finite_frequency))
+                ) + 1.0
+            else:
+                log_tau_min, log_tau_max = -8.0, 8.0
+            for peak in distributed_peaks:
+                center = float(peak["center_log10"])
+                width = self._peak_half_width_log10(peak)
+                log_tau_min = min(log_tau_min, center - 6.0 * width)
+                log_tau_max = max(log_tau_max, center + 6.0 * width)
+            log_tau_grid = np.linspace(log_tau_min, log_tau_max, 1600)
+            tau_grid = 10.0**log_tau_grid
+            gamma_grid = np.zeros_like(log_tau_grid)
+            for peak in distributed_peaks:
+                gamma_grid += self._peak_values(log_tau_grid, peak)
+            for index, angular_frequency in enumerate(omega):
+                kernel = 1.0 / (1.0 + 1j * angular_frequency * tau_grid)
+                impedance[index] += np.trapezoid(
+                    gamma_grid * kernel, log_tau_grid
+                ) * np.log(10.0)
+        return impedance
+
     def _calculate_drt_fit_impedance(self, cycle):
         if not self.drt_peak_parameters:
             return None, None
-        frequency = np.asarray(cycle.frequency_hz, dtype=float)
-        finite = np.isfinite(frequency) & (frequency > 0)
+        measured_frequency = np.asarray(cycle.frequency_hz, dtype=float)
+        finite = np.isfinite(measured_frequency) & (measured_frequency > 0)
         if not np.any(finite):
             return None, None
         frequency = np.geomspace(
-            float(np.min(frequency[finite])),
-            float(np.max(frequency[finite])),
+            float(np.min(measured_frequency[finite])),
+            float(np.max(measured_frequency[finite])),
             300,
         )
         mode = self.analysis_drt_mode_var.get()
@@ -4041,15 +4599,43 @@ class EISApplication:
         )
         if "R0" in table_values:
             resistance = table_values["R0"].initial
+        if "R_inf" in table_values:
+            resistance = table_values["R_inf"].initial
         if "L0" in table_values:
             inductance = table_values["L0"].initial
+        if "inductance" in table_values:
+            inductance = table_values["inductance"].initial
+        log_tau_min = np.log10(1.0 / (2.0 * np.pi * np.max(frequency))) - 1.0
+        log_tau_max = np.log10(1.0 / (2.0 * np.pi * np.min(frequency))) + 1.0
+        for peak in self.drt_peak_parameters:
+            center = float(peak["center_log10"])
+            width = self._peak_half_width_log10(peak)
+            log_tau_min = min(log_tau_min, center - 6.0 * width)
+            log_tau_max = max(log_tau_max, center + 6.0 * width)
+        log_tau_grid = np.linspace(log_tau_min, log_tau_max, 1600)
+        tau_grid = 10.0**log_tau_grid
+        gamma_grid = np.zeros_like(log_tau_grid)
         impedance = np.full(frequency.size, float(resistance or 0.0), dtype=complex)
         omega = 2.0 * np.pi * frequency
         if inductance is not None:
             impedance += 1j * omega * float(inductance)
+        distributed_peaks = []
         for peak in self.drt_peak_parameters:
-            tau, area, _fwhm = self._peak_summary(peak)
-            impedance += area / (1.0 + 1j * omega * tau)
+            if self._peak_shape(peak) == "hn":
+                tau, area, _fwhm = self._peak_summary(peak)
+                alpha = float(np.clip(peak.get("alpha", 0.8), 1e-3, 0.999))
+                beta = float(np.clip(peak.get("beta", 0.8), 1e-3, 0.999))
+                impedance += area / (1.0 + (1j * omega * tau) ** alpha) ** beta
+            else:
+                distributed_peaks.append(peak)
+        for peak in distributed_peaks:
+            gamma_grid += self._peak_values(log_tau_grid, peak)
+        if distributed_peaks:
+            for index, angular_frequency in enumerate(omega):
+                kernel = 1.0 / (1.0 + 1j * angular_frequency * tau_grid)
+                impedance[index] += np.trapezoid(
+                    gamma_grid * kernel, log_tau_grid
+                ) * np.log(10.0)
         return frequency, impedance
 
     def _refresh_drt_fit_artists(self, cycle) -> None:
@@ -4084,8 +4670,6 @@ class EISApplication:
         self._refresh_plot(rescale=False)
 
     def toggle_drt_fit_visibility(self) -> None:
-        if self.show_drt_fit_var.get() and not self._sync_drt_peak_parameters_from_table():
-            self.show_drt_fit_var.set(False)
         self._refresh_plot(rescale=False)
 
     def toggle_kk_view(self) -> None:
@@ -4272,7 +4856,7 @@ class EISApplication:
         self.axes.set_title("No spectrum loaded")
         self.canvas.draw_idle()
         self.status_var.set(message)
-        self.root.title("EIS Fitting")
+        self._update_window_title()
         self._set_controls_enabled(False)
 
     def _start_drt_peak_drag(self, event) -> bool:
@@ -4283,20 +4867,15 @@ class EISApplication:
         best = None
         for index, peak in enumerate(self.drt_peak_parameters):
             center_tau = 10.0 ** peak["center_log10"]
-            half_width = np.sqrt(2.0 * np.log(2.0)) * peak["sigma_log10"]
-            points = (
-                ("top", center_tau, peak["height"]),
-                (
-                    "left",
-                    10.0 ** (peak["center_log10"] - half_width),
-                    peak["height"] / 2.0,
-                ),
-                (
-                    "right",
-                    10.0 ** (peak["center_log10"] + half_width),
-                    peak["height"] / 2.0,
-                ),
-            )
+            half_width = self._peak_half_width_log10(peak)
+            points = [("top", center_tau, peak["height"])]
+            if self._peak_shape(peak) != "hn":
+                points.extend(
+                    (
+                        ("left", 10.0 ** (peak["center_log10"] - half_width), peak["height"] / 2.0),
+                        ("right", 10.0 ** (peak["center_log10"] + half_width), peak["height"] / 2.0),
+                    )
+                )
             for action, x_value, y_value in points:
                 display = self.drt_axes.transData.transform((x_value, y_value))
                 distance = float(np.hypot(display[0] - event.x, display[1] - event.y))
@@ -4353,6 +4932,10 @@ class EISApplication:
             and event.inaxes is getattr(self, "drt_axes", None)
             and self._start_drt_peak_drag(event)
         ):
+            self._drt_peak_drag_moved = False
+            return
+        if event.button == 1 and event.inaxes is getattr(self, "drt_axes", None):
+            self._select_drt_peak_from_event(event)
             return
         if self.busy or self.state is None or event.button != 2 or event.inaxes is None:
             return
@@ -4373,7 +4956,13 @@ class EISApplication:
 
     def _on_plot_button_release(self, event) -> None:
         if event.button == 1 and self._drt_peak_drag is not None:
+            if not self._drt_peak_drag_moved:
+                index = self._drt_peak_drag["index"]
+                self._select_drt_peak(
+                    None if index == self._selected_drt_peak_index else index
+                )
             self._drt_peak_drag = None
+            self._drt_peak_drag_moved = False
             self._update_drt_peak_table()
             self.canvas.draw_idle()
             return
@@ -4387,6 +4976,7 @@ class EISApplication:
         if self._drt_peak_drag is not None:
             if event.inaxes is not self.drt_axes or event.xdata is None or event.ydata is None:
                 return
+            self._drt_peak_drag_moved = True
             peak = self.drt_peak_parameters[self._drt_peak_drag["index"]]
             action = self._drt_peak_drag["action"]
             if action == "top":
@@ -4398,7 +4988,13 @@ class EISApplication:
                     - peak["center_log10"]
                 )
                 peak["sigma_log10"] = max(
-                    distance / np.sqrt(2.0 * np.log(2.0)), 1e-4
+                    distance / (
+                        1.0
+                        if self._peak_shape(peak) == "lorentzian"
+                        else self._peak_half_width_log10(peak)
+                        / max(peak["sigma_log10"], 1e-6)
+                    ),
+                    1e-4,
                 )
             self._store_current_drt_peaks()
             self._refresh_drt_peak_artists()
@@ -5270,6 +5866,7 @@ class EISApplication:
             result.tau_s,
             result.gamma_ohm,
             result.ohmic_resistance,
+            getattr(result, "inductance", None),
         )
         if self.state.active_cycle == cycle_number:
             self._refresh_plot(rescale=True)
@@ -7610,6 +8207,9 @@ class EISApplication:
             return
         self.project_path = project_path.resolve()
         self._saved_project_signature = self._project_signature()
+        self.root.title(
+            f"EIS Fitting — {Path(project_path).name if project_path else 'Untitled'}"
+        )
         self._update_status(f"project saved as {project_path.name}")
 
     def save_project_quick(self, _event=None):
@@ -7644,7 +8244,12 @@ class EISApplication:
         self.status_var.set(f"Loading project {project_path.name}…")
         self._submit(
             lambda: self._load_saved_project(project_path),
-            lambda result: self._finish_project_load(result, project_path),
+                    lambda result: (
+                        setattr(self, "project_path", Path(project_path)),
+                        setattr(self, "_project_title_path", Path(project_path)),
+                        self._finish_project_load(result, project_path),
+                        self._update_window_title(),
+                    )[1],
             "Project load failed",
         )
 

@@ -255,6 +255,7 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
             else None
         ),
         "saved_hybrid_ohmic_resistance": cycle.saved_hybrid_ohmic_resistance,
+        "saved_hybrid_inductance": cycle.saved_hybrid_inductance,
         "saved_hybrid_peak_parameters": [
             dict(peak) for peak in cycle.saved_hybrid_peak_parameters
         ],
@@ -441,7 +442,10 @@ def load_project_file(
             else None
         )
         cycle.saved_ridge_peak_parameters = [
-            {key: float(value) for key, value in peak.items()}
+            {
+                key: str(value) if key == "shape" else float(value)
+                for key, value in peak.items()
+            }
             for peak in saved.get("saved_ridge_peak_parameters", [])
         ]
         cycle.saved_hybrid_tau_s = _optional_array(saved.get("saved_hybrid_tau_s"))
@@ -456,8 +460,16 @@ def load_project_file(
             if saved.get("saved_hybrid_ohmic_resistance") is not None
             else None
         )
+        cycle.saved_hybrid_inductance = (
+            float(saved["saved_hybrid_inductance"])
+            if saved.get("saved_hybrid_inductance") is not None
+            else None
+        )
         cycle.saved_hybrid_peak_parameters = [
-            {key: float(value) for key, value in peak.items()}
+            {
+                key: str(value) if key == "shape" else float(value)
+                for key, value in peak.items()
+            }
             for peak in saved.get("saved_hybrid_peak_parameters", [])
         ]
         if cycle.drt_label == "Hybrid DRT" and cycle.saved_hybrid_tau_s is not None:
