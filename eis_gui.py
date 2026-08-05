@@ -462,8 +462,23 @@ class EISApplication:
         self.root.bind("<Alt-d>", self._on_alt_d)
         self.root.bind("<Alt-D>", self._on_alt_d)
         self.root.bind("<Alt-e>", self.toggle_point_edit_mode)
-        self.root.bind("<Alt-s>", self._on_alt_s)
-        self.root.bind("<Alt-S>", self._on_alt_s)
+        self.root.bind("<Alt-Shift-e>", self._toggle_auto_fit_points_key)
+        self.root.bind("<Alt-Shift-E>", self._toggle_auto_fit_points_key)
+        self.root.bind("<Alt-h>", self._toggle_legends_key)
+        self.root.bind("<Alt-H>", self._toggle_legends_key)
+        self.root.bind("<Alt-f>", self._open_batch_fit_key_menu)
+        self.root.bind("<Alt-F>", self._open_batch_fit_key_menu)
+        self.root.bind("<Alt-b>", self._toggle_plot_mode_key)
+        self.root.bind("<Alt-B>", self._toggle_plot_mode_key)
+        self.root.bind_all("<Alt-KeyPress>", self._handle_alt_keypad)
+        self.root.bind("<Alt-y>", self._toggle_analysis_mode_key)
+        self.root.bind("<Alt-Y>", self._toggle_analysis_mode_key)
+        self.root.bind("<Alt-c>", self._toggle_drt_method_key)
+        self.root.bind("<Alt-C>", self._toggle_drt_method_key)
+        self.root.bind("<Alt-r>", self._calculate_current_drt_key)
+        self.root.bind("<Alt-R>", self._calculate_current_drt_key)
+        self.root.bind("<Alt-s>", self._on_analysis_alt_s)
+        self.root.bind("<Alt-S>", self._on_analysis_alt_s)
         if self.path is not None:
             self.root.after(30, self._begin_loading)
         else:
@@ -2092,6 +2107,72 @@ class EISApplication:
             self.fit()
         return "break"
 
+    def _open_batch_fit_key_menu(self, _event=None):
+        if self.busy:
+            return "break"
+        popup = tk.Toplevel(self.root)
+        popup.title("Batch fit")
+        popup.transient(self.root)
+        popup.resizable(False, False)
+        ttk.Label(
+            popup,
+            text="Batch fit selected spectra\n\n↑  Up     ↓  Down     Enter  Up and Down\n\nPress another key to cancel.",
+            padding=14,
+            justify="center",
+        ).pack()
+        popup.grab_set()
+        popup.focus_force()
+
+        def choose(event):
+            keysym = event.keysym
+            popup.grab_release()
+            popup.destroy()
+            if keysym == "Up":
+                self.batch_fit_selected_down(-1)
+            elif keysym == "Down":
+                self.batch_fit_selected_down(1)
+            elif keysym in {"Return", "KP_Enter"}:
+                self.batch_fit_selected_up_down()
+
+        popup.bind("<KeyPress>", choose)
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+        return "break"
+
+    def _toggle_legends_key(self, _event=None):
+        self.hide_legends_var.set(not self.hide_legends_var.get())
+        self._update_legend_visibility()
+        self.canvas.draw_idle()
+        return "break"
+
+    def _toggle_analysis_mode_key(self, _event=None):
+        self.analysis_mode_var.set(
+            "DRT" if self.analysis_mode_var.get() == "EEC" else "EEC"
+        )
+        self._on_analysis_mode_selected()
+        return "break"
+
+    def _toggle_drt_method_key(self, _event=None):
+        if self.analysis_mode_var.get() != "DRT":
+            return "break"
+        self.analysis_drt_mode_var.set(
+            "Hybrid DRT"
+            if self.analysis_drt_mode_var.get() == "Ridge DRT"
+            else "Ridge DRT"
+        )
+        self._on_analysis_drt_mode_selected()
+        return "break"
+
+    def _calculate_current_drt_key(self, _event=None):
+        if self.analysis_mode_var.get() == "DRT":
+            self._fit_selected_drts()
+        return "break"
+
+    def _on_analysis_alt_s(self, event):
+        if self.analysis_mode_var.get() == "DRT":
+            self.fit_drt_peaks()
+            return "break"
+        return self._on_alt_s(event)
+
     def _on_drt_mode_selected(self, _event=None):
         if hasattr(self, "analysis_drt_mode_var"):
             self.analysis_drt_mode_var.set(self.drt_mode_var.get())
@@ -2445,30 +2526,6 @@ class EISApplication:
         self.initial_values_button.grid(
             row=1, column=0, columnspan=2, pady=3, sticky="ew"
         )
-        self.ridge_drt_button = ttk.Button(
-            actions, text="Ridge DRT", command=self.calculate_ridge_drt
-        )
-        self.ridge_drt_button.grid(row=2, column=0, padx=(0, 4), pady=3, sticky="ew")
-        self.hybrid_drt_button = ttk.Button(
-            actions, text="Hybrid DRT", command=self.calculate_hybrid_drt
-        )
-        self.hybrid_drt_button.grid(row=2, column=1, padx=(4, 0), pady=3, sticky="ew")
-        self.ridge_drt_selected_button = ttk.Button(
-            actions,
-            text="Ridge DRT: selected",
-            command=self.calculate_selected_ridge_drts,
-        )
-        self.ridge_drt_selected_button.grid(
-            row=3, column=0, padx=(0, 4), pady=3, sticky="ew"
-        )
-        self.hybrid_drt_selected_button = ttk.Button(
-            actions,
-            text="Hybrid DRT: selected",
-            command=self.calculate_selected_hybrid_drts,
-        )
-        self.hybrid_drt_selected_button.grid(
-            row=3, column=1, padx=(4, 0), pady=3, sticky="ew"
-        )
         self.batch_fit_button = ttk.Button(
             actions,
             text="Batch fit from current",
@@ -2598,10 +2655,6 @@ class EISApplication:
             self.remove_all_peaks_button,
             self.send_drt_initials_button,
             self.initial_values_button,
-            self.ridge_drt_button,
-            self.hybrid_drt_button,
-            self.ridge_drt_selected_button,
-            self.hybrid_drt_selected_button,
             self.outlier_button,
             self.outlier_selected_button,
             self.reset_button,
@@ -2637,6 +2690,10 @@ class EISApplication:
 
     def _on_analysis_mode_selected(self, _event=None) -> None:
         drt_mode = self.analysis_mode_var.get() == "DRT"
+        if hasattr(self, "drt_fit_button"):
+            self.drt_fit_button.configure(
+                text="Calculate DRT" if drt_mode else "Fit selected"
+            )
         if drt_mode:
             self.model_group.grid_remove()
             self.parameters_group.grid_remove()
@@ -4494,6 +4551,44 @@ class EISApplication:
         self._refresh_plot(rescale=True)
         self._update_status(f"{self.plot_mode.title()} view")
 
+    def _toggle_plot_mode_key(self, _event=None):
+        self.toggle_plot_mode()
+        return "break"
+
+    def _handle_alt_keypad(self, event):
+        keysym_options = {
+            "KP_1": ("show_spectrum_var", self.toggle_spectrum_view),
+            "KP_End": ("show_spectrum_var", self.toggle_spectrum_view),
+            "KP_2": ("show_kk_var", self.toggle_kk_view),
+            "KP_Down": ("show_kk_var", self.toggle_kk_view),
+            "KP_3": ("show_drt_var", self.toggle_drt_view),
+            "KP_Next": ("show_drt_var", self.toggle_drt_view),
+            "KP_4": ("show_eec_fit_var", self.toggle_fit_visibility),
+            "KP_Left": ("show_eec_fit_var", self.toggle_fit_visibility),
+            "KP_6": ("show_drt_fit_var", self.toggle_drt_fit_visibility),
+            "KP_Right": ("show_drt_fit_var", self.toggle_drt_fit_visibility),
+            "KP_9": ("show_drt_recovered_var", self.toggle_drt_recovered_visibility),
+            "KP_Prior": ("show_drt_recovered_var", self.toggle_drt_recovered_visibility),
+        }
+        option = keysym_options.get(getattr(event, "keysym", ""))
+        if option is None:
+            keycode_options = {
+                97: ("show_spectrum_var", self.toggle_spectrum_view),
+                98: ("show_kk_var", self.toggle_kk_view),
+                99: ("show_drt_var", self.toggle_drt_view),
+                100: ("show_eec_fit_var", self.toggle_fit_visibility),
+                102: ("show_drt_fit_var", self.toggle_drt_fit_visibility),
+                105: ("show_drt_recovered_var", self.toggle_drt_recovered_visibility),
+            }
+            option = keycode_options.get(getattr(event, "keycode", None))
+        if option is None:
+            return None
+        variable_name, callback = option
+        variable = getattr(self, variable_name)
+        variable.set(not variable.get())
+        callback()
+        return "break"
+
     def toggle_drt_view(self) -> None:
         self._configure_plot_layout()
         if self.state is None:
@@ -5128,6 +5223,10 @@ class EISApplication:
         self.auto_fit_points_button.configure(
             text=f"Edit points and fit: {'On' if self.point_auto_fit else 'Off'}"
         )
+
+    def _toggle_auto_fit_points_key(self, _event=None):
+        self.toggle_auto_fit_points()
+        return "break"
         self._update_status()
 
     def _fit_after_point_edit(self) -> None:
