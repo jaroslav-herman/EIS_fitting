@@ -452,16 +452,31 @@ class EISApplication:
         self.root.bind("<Control-Down>", lambda _event: self.change_cycle(1, focus_only=True))
         self.root.bind("<Control-a>", self.select_all_spectra)
         self.root.bind("<Delete>", self._on_delete_key)
-        self.root.bind("<Control-e>", self.open_export_menu)
+        self.root.bind("<Control-e>", lambda _event: self.export_selected_fits())
+        self.root.bind("<Control-E>", lambda _event: self.export_selected_fits())
+        self.root.bind(
+            "<Control-Shift-e>",
+            lambda _event: self.export_selected_python_workspace(),
+        )
+        self.root.bind(
+            "<Control-Shift-E>",
+            lambda _event: self.export_selected_python_workspace(),
+        )
         self.root.bind("<Control-s>", self._on_control_s)
         self.root.bind("<Control-S>", self._on_control_s)
-        self.root.bind("<Control-Shift-O>", lambda _event: self.load_project())
-        self.root.bind("<Control-o>", lambda _event: self.import_data())
+        self.root.bind("<Control-l>", lambda _event: self.load_project())
+        self.root.bind("<Control-L>", lambda _event: self.load_project())
+        self.root.bind("<Control-i>", lambda _event: self.import_data())
+        self.root.bind("<Control-I>", lambda _event: self.import_data())
         self.root.bind("<Alt-a>", self._on_alt_a)
         self.root.bind("<Alt-A>", self._on_alt_a)
         self.root.bind("<Alt-d>", self._on_alt_d)
         self.root.bind("<Alt-D>", self._on_alt_d)
         self.root.bind("<Alt-e>", self.toggle_point_edit_mode)
+        self.root.bind("<Alt-q>", self._active_zoom_key)
+        self.root.bind("<Alt-Q>", self._active_zoom_key)
+        self.root.bind("<Alt-v>", self._initial_values_key)
+        self.root.bind("<Alt-V>", self._initial_values_key)
         self.root.bind("<Alt-Shift-e>", self._toggle_auto_fit_points_key)
         self.root.bind("<Alt-Shift-E>", self._toggle_auto_fit_points_key)
         self.root.bind("<Alt-h>", self._toggle_legends_key)
@@ -513,13 +528,13 @@ class EISApplication:
         self.file_menu = tk.Menu(menu_bar, tearoff=False)
         self.file_menu.add_command(
             label="Import data…",
-            accelerator="Ctrl+O",
+            accelerator="Ctrl+I",
             command=self.import_data,
         )
         self.file_menu.add_separator()
         self.file_menu.add_command(
             label="Load project…",
-            accelerator="Ctrl+Shift+O",
+            accelerator="Ctrl+L",
             command=self.load_project,
         )
         self.file_menu.add_command(
@@ -581,6 +596,7 @@ class EISApplication:
         )
         self.export_menu.add_command(
             label="Export fit parameters - selected spectra…",
+            accelerator="Ctrl+E",
             command=self.export_selected_fits,
         )
         self.export_menu.add_separator()
@@ -590,6 +606,7 @@ class EISApplication:
         )
         self.export_menu.add_command(
             label="Export to Python - selected spectra…",
+            accelerator="Ctrl+Shift+E",
             command=self.export_selected_python_workspace,
         )
         self.export_menu.add_separator()
@@ -688,17 +705,7 @@ class EISApplication:
             command=self.toggle_plot_mode,
         )
         self.toggle_plot_mode_button.pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(self.plot_controls, text="DRT").pack(side=tk.LEFT, padx=(10, 4))
         self.drt_mode_var = tk.StringVar(value="Ridge DRT")
-        self.drt_mode_box = ttk.Combobox(
-            self.plot_controls,
-            textvariable=self.drt_mode_var,
-            values=("Ridge DRT", "Hybrid DRT"),
-            state="readonly",
-            width=12,
-        )
-        self.drt_mode_box.pack(side=tk.LEFT)
-        self.drt_mode_box.bind("<<ComboboxSelected>>", self._on_drt_mode_selected)
         ttk.Checkbutton(
             self.plot_controls,
             text="Show spectrum",
@@ -2107,6 +2114,14 @@ class EISApplication:
             self.fit()
         return "break"
 
+    def _initial_values_key(self, _event=None):
+        self.initialize_from_ridge()
+        return "break"
+
+    def _active_zoom_key(self, _event=None):
+        self.reset_plot_view()
+        return "break"
+
     def _open_batch_fit_key_menu(self, _event=None):
         if self.busy:
             return "break"
@@ -2454,17 +2469,18 @@ class EISApplication:
         self.options_group = options_group
         options_group.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         options_group.columnconfigure(1, weight=1)
-        ttk.Label(options_group, text="Min frequency (Hz)").grid(
+        options_group.columnconfigure(3, weight=1)
+        ttk.Label(options_group, text="Min. freq.").grid(
             row=0, column=0, sticky="w"
         )
         ttk.Entry(options_group, textvariable=self.minimum_frequency_var).grid(
             row=0, column=1, padx=(8, 0), pady=2, sticky="ew"
         )
-        ttk.Label(options_group, text="Max frequency (Hz)").grid(
-            row=1, column=0, sticky="w"
+        ttk.Label(options_group, text="Max. freq.").grid(
+            row=0, column=2, padx=(12, 0), sticky="w"
         )
         ttk.Entry(options_group, textvariable=self.maximum_frequency_var).grid(
-            row=1, column=1, padx=(8, 0), pady=2, sticky="ew"
+            row=0, column=3, padx=(8, 0), pady=2, sticky="ew"
         )
         self.frequency_button = ttk.Button(
             options_group,
@@ -2472,7 +2488,7 @@ class EISApplication:
             command=self.apply_frequency_window,
         )
         self.frequency_button.grid(
-            row=2, column=0, padx=(0, 4), pady=(6, 0), sticky="ew"
+            row=1, column=0, padx=(0, 4), pady=(6, 0), sticky="ew"
         )
         self.frequency_selected_button = ttk.Button(
             options_group,
@@ -2480,33 +2496,27 @@ class EISApplication:
             command=self.apply_frequency_window_to_selected,
         )
         self.frequency_selected_button.grid(
-            row=2, column=1, padx=(4, 0), pady=(6, 0), sticky="ew"
+            row=1, column=1, columnspan=3, padx=(4, 0), pady=(6, 0), sticky="ew"
         )
         ttk.Label(options_group, text="Outlier threshold").grid(
-            row=3, column=0, pady=(8, 2), sticky="w"
+            row=2, column=0, pady=(8, 2), sticky="w"
         )
         ttk.Entry(options_group, textvariable=self.threshold_var).grid(
-            row=3, column=1, padx=(8, 0), pady=(8, 2), sticky="ew"
-        )
-        self.outlier_button = ttk.Button(
-            options_group, text="Outliers: current", command=self.find_outliers
-        )
-        self.outlier_button.grid(
-            row=4, column=0, padx=(0, 4), pady=(6, 0), sticky="ew"
+            row=2, column=1, padx=(8, 0), pady=(8, 2), sticky="ew"
         )
         self.outlier_selected_button = ttk.Button(
             options_group,
-            text="Outliers: selected spectra",
+            text="Outliers",
             command=self.find_outliers_for_selected,
         )
         self.outlier_selected_button.grid(
-            row=4, column=1, padx=(4, 0), pady=(6, 0), sticky="ew"
+            row=2, column=2, columnspan=2, padx=(8, 0), pady=(8, 2), sticky="ew"
         )
         self.reset_button = ttk.Button(
             options_group, text="Reset points", command=self.reset_points
         )
         self.reset_button.grid(
-            row=5, column=0, columnspan=2, pady=(6, 0), sticky="ew"
+            row=3, column=0, columnspan=4, pady=(6, 0), sticky="ew"
         )
 
         actions = ttk.LabelFrame(parent, text="Actions", padding=8)
@@ -2525,20 +2535,6 @@ class EISApplication:
         )
         self.initial_values_button.grid(
             row=1, column=0, columnspan=2, pady=3, sticky="ew"
-        )
-        self.batch_fit_button = ttk.Button(
-            actions,
-            text="Batch fit from current",
-            command=self.batch_fit,
-        )
-        self.batch_fit_button.grid(row=4, column=0, columnspan=2, pady=3, sticky="ew")
-        self.python_export_button = ttk.Button(
-            actions,
-            text="Export to Python",
-            command=self.export_python_workspace,
-        )
-        self.python_export_button.grid(
-            row=5, column=0, columnspan=2, pady=3, sticky="ew"
         )
         self.stop_fit_button = ttk.Button(
             actions, text="Stop fit", command=self._cancel_fit, state="disabled"
@@ -2655,11 +2651,8 @@ class EISApplication:
             self.remove_all_peaks_button,
             self.send_drt_initials_button,
             self.initial_values_button,
-            self.outlier_button,
             self.outlier_selected_button,
             self.reset_button,
-            self.batch_fit_button,
-            self.python_export_button,
             self.toggle_points_button,
             self.auto_fit_points_button,
             self.reset_view_button,
@@ -2695,9 +2688,13 @@ class EISApplication:
                 text="Calculate DRT" if drt_mode else "Fit selected"
             )
         if drt_mode:
+            self.show_drt_var.set(True)
+            self.show_drt_recovered_var.set(True)
             self.model_group.grid_remove()
             self.parameters_group.grid_remove()
             self.drt_tools_group.grid()
+            self.toggle_drt_view()
+            self.toggle_drt_recovered_visibility()
             self._update_status("DRT analysis mode")
         else:
             self.model_group.grid()
