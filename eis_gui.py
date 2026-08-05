@@ -2159,6 +2159,73 @@ class EISApplication:
         self.canvas.draw_idle()
         return "break"
 
+    def _open_plot_controls_key_menu(self, _event=None):
+        popup = tk.Toplevel(self.root)
+        popup.title("Plot controls")
+        popup.transient(self.root)
+        popup.resizable(False, False)
+        ttk.Label(
+            popup,
+            text="Press a key for the plot action; another key cancels.",
+            padding=(12, 10, 12, 6),
+        ).pack()
+        status = (
+            f"e  Edit points: {'On' if self.point_toggle_mode else 'Off'}\n"
+            f"E  Edit points and fit: {'On' if self.point_auto_fit else 'Off'}\n"
+            f"h  Hide legends: {'On' if self.hide_legends_var.get() else 'Off'}\n"
+            f"1  Show spectrum: {'On' if self.show_spectrum_var.get() else 'Off'}\n"
+            f"2  Show KK residuals: {'On' if self.show_kk_var.get() else 'Off'}\n"
+            f"3  Show DRT: {'On' if self.show_drt_var.get() else 'Off'}\n"
+            f"4  Show EEC fit: {'On' if self.show_eec_fit_var.get() else 'Off'}\n"
+            f"6  Show DRT fit: {'On' if self.show_drt_fit_var.get() else 'Off'}\n"
+            f"9  Show DRT recovered: {'On' if self.show_drt_recovered_var.get() else 'Off'}\n"
+            f"b  Nyquist/Bode: {self.plot_mode.title()}\n"
+            "q  Active zoom"
+        )
+        ttk.Label(popup, text=status, justify="left", padding=(12, 4, 12, 12)).pack()
+        popup.grab_set()
+        popup.focus_force()
+
+        def choose(event):
+            key = event.keysym
+            popup.grab_release()
+            popup.destroy()
+            actions = {
+                "e": self.toggle_point_edit_mode,
+                "E": self.toggle_auto_fit_points,
+                "h": self._toggle_legends_key,
+                "H": self._toggle_legends_key,
+                "1": lambda: self._toggle_display_key(
+                    "show_spectrum_var", "toggle_spectrum_view"
+                ),
+                "2": lambda: self._toggle_display_key(
+                    "show_kk_var", "toggle_kk_view"
+                ),
+                "3": lambda: self._toggle_display_key(
+                    "show_drt_var", "toggle_drt_view"
+                ),
+                "4": lambda: self._toggle_display_key(
+                    "show_eec_fit_var", "toggle_fit_visibility"
+                ),
+                "6": lambda: self._toggle_display_key(
+                    "show_drt_fit_var", "toggle_drt_fit_visibility"
+                ),
+                "9": lambda: self._toggle_display_key(
+                    "show_drt_recovered_var", "toggle_drt_recovered_visibility"
+                ),
+                "b": self.toggle_plot_mode,
+                "B": self.toggle_plot_mode,
+                "q": self.reset_plot_view,
+                "Q": self.reset_plot_view,
+            }
+            action = actions.get(key)
+            if action is not None:
+                action()
+
+        popup.bind("<KeyPress>", choose)
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+        return "break"
+
     def _toggle_analysis_mode_key(self, _event=None):
         self.analysis_mode_var.set(
             "DRT" if self.analysis_mode_var.get() == "EEC" else "EEC"
@@ -4552,7 +4619,16 @@ class EISApplication:
         self.toggle_plot_mode()
         return "break"
 
+    def _toggle_display_key(self, variable_name: str, callback_name: str):
+        variable = getattr(self, variable_name)
+        variable.set(not variable.get())
+        getattr(self, callback_name)()
+
     def _handle_alt_keypad(self, event):
+        if getattr(event, "keycode", None) == 51 or getattr(event, "keysym", "") in {
+            "3", "scaron"
+        }:
+            return self._open_plot_controls_key_menu(event)
         keysym_options = {
             "KP_1": ("show_spectrum_var", self.toggle_spectrum_view),
             "KP_End": ("show_spectrum_var", self.toggle_spectrum_view),
