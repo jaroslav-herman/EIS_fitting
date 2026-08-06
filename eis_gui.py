@@ -853,7 +853,11 @@ class EISApplication:
         self._base_refresh_plot(*args, **kwargs)
         self._update_drt_recovered_plot()
 
-    def _drt_recovered_impedance(self, cycle) -> np.ndarray | None:
+    def _drt_recovered_impedance(
+        self,
+        cycle,
+        frequencies: np.ndarray | None = None,
+    ) -> np.ndarray | None:
         mode = self._selected_drt_mode()
         if mode == "hybrid":
             tau_values = cycle.saved_hybrid_tau_s
@@ -879,7 +883,9 @@ class EISApplication:
         order = np.argsort(tau_values)
         tau_values = tau_values[order]
         gamma_values = gamma_values[order]
-        frequencies = np.asarray(cycle.frequency_hz, dtype=float)
+        if frequencies is None:
+            frequencies = cycle.frequency_hz
+        frequencies = np.asarray(frequencies, dtype=float)
         angular_frequency = 2.0 * np.pi * frequencies
         integrand = gamma_values[None, :] / (
             1.0 + 1j * angular_frequency[:, None] * tau_values[None, :]
@@ -891,7 +897,11 @@ class EISApplication:
         )
         if resistance is not None:
             impedance = impedance + float(resistance)
-        inductance = cycle.saved_ridge_inductance
+        inductance = (
+            cycle.saved_hybrid_inductance
+            if mode == "hybrid"
+            else cycle.saved_ridge_inductance
+        )
         if inductance is not None:
             impedance = impedance + 1j * angular_frequency * float(inductance)
         return impedance
@@ -954,28 +964,25 @@ class EISApplication:
             if getattr(self, "drt_phase_fit_artist", None) is not None:
                 self.drt_phase_fit_artist.set_data([], [])
             return
-        active_frequency = np.asarray(cycle.frequency_hz[cycle.included], dtype=float)
-        active_frequency = active_frequency[np.isfinite(active_frequency) & (active_frequency > 0)]
-        if active_frequency.size < 2:
+        curve_source_frequency = np.asarray(cycle.frequency_hz, dtype=float)
+        curve_source_frequency = curve_source_frequency[
+            np.isfinite(curve_source_frequency) & (curve_source_frequency > 0)
+        ]
+        if curve_source_frequency.size < 2:
             self.drt_fit_artist.set_data([], [])
             return
-        curve_frequency = np.unique(
-            np.concatenate(
-                (
-                    np.geomspace(
-                        float(np.min(active_frequency)),
-                        float(np.max(active_frequency)),
-                        500,
-                    ),
-                    active_frequency,
-                )
-            )
+        curve_frequency = np.geomspace(
+            float(np.min(curve_source_frequency)),
+            float(np.max(curve_source_frequency)),
+            600,
         )
 
         curve_impedance = self._drt_peak_impedance(cycle, curve_frequency)
         if curve_impedance is None:
             self.drt_fit_artist.set_data([], [])
             return
+        self.drt_fit_artist.set_visible(True)
+        self.drt_fit_artist.set_zorder(4)
         if self.plot_mode == "nyquist":
             self.drt_fit_artist.set_data(
                 curve_impedance.real, -curve_impedance.imag
@@ -1159,15 +1166,31 @@ class EISApplication:
                 [], [], "-", color="#00838f", linewidth=1.8,
                 alpha=0.85, label="DRT recovered",
             )
-        if self.plot_mode == "nyquist":
-            self.drt_recovered_artist.set_data(
-                recovered.real[included], -recovered.imag[included]
+        self.drt_recovered_artist.set_visible(True)
+        self.drt_recovered_artist.set_zorder(3)
+        valid_frequency = np.isfinite(frequency) & (frequency > 0.0)
+        smooth_frequency = None
+        recovered_smooth = None
+        if np.count_nonzero(valid_frequency) >= 2:
+            smooth_frequency = np.geomspace(
+                float(np.min(frequency[valid_frequency])),
+                float(np.max(frequency[valid_frequency])),
+                600,
             )
-            if hasattr(self, "phase_drt_recovered_artist"):
-                self.phase_drt_recovered_artist.set_data([], [])
+            recovered_smooth = self._drt_recovered_impedance(
+                self.state.active, smooth_frequency
+            )
+        if hasattr(self, "phase_drt_recovered_artist"):
+            self.phase_drt_recovered_artist.set_data([], [])
+        if recovered_smooth is None:
+            self.drt_recovered_artist.set_data([], [])
+        elif self.plot_mode == "nyquist":
+            self.drt_recovered_artist.set_data(
+                recovered_smooth.real, -recovered_smooth.imag
+            )
         else:
             self.drt_recovered_artist.set_data(
-                frequency[included], np.abs(recovered[included])
+                smooth_frequency, np.abs(recovered_smooth)
             )
             if (
                 not hasattr(self, "phase_drt_recovered_artist")
@@ -1179,9 +1202,10 @@ class EISApplication:
                     [], [], "-", color="#00695c", linewidth=1.5,
                     alpha=0.85, label="DRT recovered phase",
                 )
-            self.phase_drt_recovered_artist.set_data(
-                frequency[included], self._phase_degrees(recovered[included])
-            )
+            if recovered_smooth is not None:
+                self.phase_drt_recovered_artist.set_data(
+                    smooth_frequency, self._phase_degrees(recovered_smooth)
+                )
         peak_impedance = (
             self._drt_peak_impedance(self.state.active)
             if self.show_drt_fit_var.get() and self.state is not None
@@ -2094,6 +2118,9 @@ class EISApplication:
         return "break"
 
     def _on_alt_a(self, event):
+        if self.analysis_mode_var.get() == "DRT":
+            self.copy_neighbor_drt_peaks(-1)
+            return "break"
         if event.state & 0x0001 or event.keysym == "A":
             self.copy_neighbor_fit_settings(-1)
         else:
@@ -2101,6 +2128,9 @@ class EISApplication:
         return "break"
 
     def _on_alt_d(self, event):
+        if self.analysis_mode_var.get() == "DRT":
+            self.copy_neighbor_drt_peaks(1)
+            return "break"
         if event.state & 0x0001 or event.keysym == "D":
             self.copy_neighbor_fit_settings(1)
         else:
@@ -2143,15 +2173,23 @@ class EISApplication:
             popup.grab_release()
             popup.destroy()
             if keysym == "Up":
-                self.batch_fit_selected_down(-1)
+                self._start_drt_or_eec_batch(-1)
             elif keysym == "Down":
-                self.batch_fit_selected_down(1)
+                self._start_drt_or_eec_batch(1)
             elif keysym in {"Return", "KP_Enter"}:
-                self.batch_fit_selected_up_down()
+                self._start_drt_or_eec_batch(0)
 
         popup.bind("<KeyPress>", choose)
         popup.protocol("WM_DELETE_WINDOW", popup.destroy)
         return "break"
+
+    def _start_drt_or_eec_batch(self, direction: int) -> None:
+        if self.analysis_mode_var.get() == "DRT":
+            self._start_drt_peak_batch(direction)
+        elif direction == 0:
+            self.batch_fit_selected_up_down()
+        else:
+            self.batch_fit_selected_down(direction)
 
     def _toggle_legends_key(self, _event=None):
         self.hide_legends_var.set(not self.hide_legends_var.get())
@@ -4411,6 +4449,12 @@ class EISApplication:
         self.canvas.draw_idle()
         self._update_status(f"fitted {count} DRT peaks")
 
+        if getattr(self, "_drt_peak_batch_queue", None) is not None:
+            self._drt_peak_batch_template = [
+                copy.deepcopy(peak) for peak in self.drt_peak_parameters
+            ]
+            self.root.after(0, self._drt_peak_batch_next)
+
     def _select_drt_peaks_for_eec(self, peaks, maximum: int):
         window = tk.Toplevel(self.root)
         window.title("Select DRT peaks")
@@ -5296,15 +5340,23 @@ class EISApplication:
         self.auto_fit_points_button.configure(
             text=f"Edit points and fit: {'On' if self.point_auto_fit else 'Off'}"
         )
+        self._update_status()
 
     def _toggle_auto_fit_points_key(self, _event=None):
         self.toggle_auto_fit_points()
         return "break"
-        self._update_status()
 
     def _fit_after_point_edit(self) -> None:
-        if self.point_auto_fit and not self.busy:
-            self.fit()
+        if not self.point_auto_fit or self.busy or self.state is None:
+            return
+        if self.analysis_mode_var.get() == "DRT":
+            self._fit_drt_peaks_after_point_edit = True
+            if self.analysis_drt_mode_var.get() == "Hybrid DRT":
+                self.calculate_hybrid_drt()
+            else:
+                self.calculate_ridge_drt()
+            return
+        self.fit()
 
     def _update_status(self, suffix: str = "") -> None:
         if self.state is None:
@@ -5713,6 +5765,9 @@ class EISApplication:
             "Outlier search failed",
         )
 
+        if getattr(self, "_drt_peak_batch_queue", None) is not None:
+            self.root.after(0, self._continue_drt_peak_batch_after_calculation)
+
     def _finish_outliers(
         self,
         cycle_number: int,
@@ -6018,6 +6073,10 @@ class EISApplication:
             analysis.ridge_tau_s,
             analysis.ridge_gamma_ohm,
         )
+        auto_fit_peaks = getattr(
+            self, "_fit_drt_peaks_after_point_edit", False
+        )
+        self._fit_drt_peaks_after_point_edit = False
         if self.state.active_cycle == cycle_number:
             self._refresh_plot(rescale=True)
             self._update_status(
@@ -6025,6 +6084,12 @@ class EISApplication:
                 f"R∞={analysis.ohmic_resistance:.3g} Ω, "
                 f"{analysis.peak_count} peaks"
             )
+
+        if auto_fit_peaks and self.state.active_cycle == cycle_number and self.drt_peak_parameters:
+            self.root.after(0, self.fit_drt_peaks)
+
+        if getattr(self, "_drt_peak_batch_queue", None) is not None:
+            self.root.after(0, self._continue_drt_peak_batch_after_calculation)
 
     def _finish_hybrid_drt(
         self,
@@ -6040,8 +6105,14 @@ class EISApplication:
             result.ohmic_resistance,
             getattr(result, "inductance", None),
         )
+        auto_fit_peaks = getattr(
+            self, "_fit_drt_peaks_after_point_edit", False
+        )
+        self._fit_drt_peaks_after_point_edit = False
         if self.state.active_cycle == cycle_number:
             self._refresh_plot(rescale=True)
+            if auto_fit_peaks and self.drt_peak_parameters:
+                self.root.after(0, self.fit_drt_peaks)
             if result.ohmic_resistance is None:
                 self._update_status("hybrid DRT calculated")
             else:
@@ -6476,6 +6547,116 @@ class EISApplication:
             "Explorer batch fit failed",
         )
 
+    def _start_drt_peak_batch(self, direction: int) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        visible_items = list(self.explorer.get_children(""))
+        selected_items = set(self.explorer.selection())
+        current_item = self._explorer_lookup.get(
+            (self.current_dataset_id, self.state.active_cycle)
+        )
+        if current_item not in visible_items or current_item not in selected_items:
+            self._update_status("include the displayed spectrum in the selection")
+            return
+        if len(selected_items) < 2:
+            self._update_status("select at least two spectra in the explorer first")
+            return
+        self._drt_peak_batch_directions = [1, -1] if direction == 0 else [direction]
+        self._drt_peak_batch_anchor = (
+            self.current_dataset_id,
+            self.state.active_cycle,
+        )
+        self._drt_peak_batch_template = [
+            copy.deepcopy(peak) for peak in self.drt_peak_parameters
+        ]
+        self._drt_peak_batch_queue = None
+        self._prepare_drt_peak_batch_direction()
+
+    def _prepare_drt_peak_batch_direction(self) -> None:
+        if not self._drt_peak_batch_directions:
+            self._drt_peak_batch_template = None
+            self._update_status("DRT peak batch fit completed")
+            return
+        direction = self._drt_peak_batch_directions.pop(0)
+        visible_items = list(self.explorer.get_children(""))
+        selected_items = set(self.explorer.selection())
+        anchor_dataset, anchor_cycle = self._drt_peak_batch_anchor
+        anchor_loaded = self.loaded_projects.get(anchor_dataset)
+        if anchor_loaded is not None:
+            self._switch_dataset(
+                anchor_dataset,
+                anchor_loaded,
+                anchor_cycle,
+                capture_current=False,
+                preserve_existing_selection=True,
+            )
+            visible_items = list(self.explorer.get_children(""))
+        current_item = self._explorer_lookup.get(
+            (self.current_dataset_id, self.state.active_cycle)
+        )
+        if current_item not in visible_items:
+            return
+        start = visible_items.index(current_item)
+        if direction > 0:
+            ordered = visible_items[start:]
+        else:
+            ordered = list(reversed(visible_items[: start + 1]))
+        self._drt_peak_batch_queue = [item for item in ordered if item in selected_items]
+        if len(self._drt_peak_batch_queue) < 2:
+            self._update_status("not enough selected spectra in that direction")
+            self._drt_peak_batch_queue = None
+            self._prepare_drt_peak_batch_direction()
+            return
+        self._drt_peak_batch_direction = direction
+        self._drt_peak_batch_template = [
+            copy.deepcopy(peak) for peak in self.drt_peak_parameters
+        ]
+        self._drt_peak_batch_next()
+
+    def _drt_peak_batch_next(self) -> None:
+        if self.busy:
+            return
+        if not self._drt_peak_batch_queue:
+            self._prepare_drt_peak_batch_direction()
+            return
+        item = self._drt_peak_batch_queue.pop(0)
+        dataset_id, loaded, spectrum = self._explorer_rows[item]
+        self._switch_dataset(
+            dataset_id,
+            loaded,
+            spectrum.cycle,
+            capture_current=False,
+            preserve_existing_selection=True,
+        )
+        self.drt_peak_parameters = [
+            copy.deepcopy(peak) for peak in (self._drt_peak_batch_template or [])
+        ]
+        self._store_current_drt_peaks()
+        self._refresh_drt_peak_artists()
+        cycle = self.state.active
+        mode = self.analysis_drt_mode_var.get()
+        has_drt = (
+            cycle.saved_hybrid_tau_s is not None
+            if mode == "Hybrid DRT"
+            else cycle.saved_ridge_tau_s is not None
+        )
+        if has_drt:
+            self.fit_drt_peaks()
+        elif mode == "Hybrid DRT":
+            self.calculate_hybrid_drt()
+        else:
+            self.calculate_ridge_drt()
+
+    def _continue_drt_peak_batch_after_calculation(self) -> None:
+        if self.state is None:
+            return
+        self.drt_peak_parameters = [
+            copy.deepcopy(peak) for peak in (self._drt_peak_batch_template or [])
+        ]
+        self._store_current_drt_peaks()
+        self._refresh_drt_peak_artists()
+        self.fit_drt_peaks()
+
     def batch_fit_selected_down(self, direction: int = 1) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
@@ -6588,6 +6769,39 @@ class EISApplication:
             return
         self._batch_fit_both_pending = False
         self.batch_fit_selected_down(-1)
+
+    def copy_neighbor_drt_peaks(self, direction: int) -> None:
+        if self.state is None or self.busy:
+            return
+        visible_items = list(self.explorer.get_children(""))
+        current_item = self._explorer_lookup.get(
+            (self.current_dataset_id, self.state.active_cycle)
+        )
+        if current_item not in visible_items:
+            self._update_status("the displayed spectrum is not in the explorer")
+            return
+        source_index = visible_items.index(current_item) + direction
+        if not 0 <= source_index < len(visible_items):
+            self._update_status("no neighboring spectrum in that direction")
+            return
+        source_item = visible_items[source_index]
+        _source_dataset_id, source_loaded, source_spectrum = self._explorer_rows[
+            source_item
+        ]
+        source = self._loaded_cycle_for_popup(source_loaded, source_spectrum.cycle)
+        peak_attribute = (
+            "saved_hybrid_peak_parameters"
+            if self.analysis_drt_mode_var.get() == "Hybrid DRT"
+            else "saved_ridge_peak_parameters"
+        )
+        source_peaks = getattr(source, peak_attribute, [])
+        self.drt_peak_parameters = [copy.deepcopy(peak) for peak in source_peaks]
+        self._selected_drt_peak_index = None
+        self._store_current_drt_peaks()
+        self._refresh_plot(rescale=True)
+        self._update_status(
+            f"DRT peaks copied from spectrum {source_spectrum.cycle}"
+        )
 
     def copy_neighbor_fit(self, direction: int) -> None:
         if self.state is None or self.busy or not self._capture_controls():
