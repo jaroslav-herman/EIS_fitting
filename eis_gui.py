@@ -7606,10 +7606,26 @@ class EISApplication:
                 axes.legend(loc="best", fontsize=8)
             canvas.draw_idle()
 
+        def active_view() -> None:
+            axes.relim()
+            axes.autoscale(enable=True, axis="both", tight=False)
+            axes.autoscale_view()
+            canvas.draw_idle()
+
         def refresh_data() -> None:
             nonlocal fields, split_fields
-            records[:] = self._collect_drt_parameter_records(mode)
+            current_mode = self._selected_drt_mode()
+            records[:] = self._collect_drt_parameter_records(current_mode)
             fields = numeric_fields()
+            if not fields:
+                x_box.configure(values=[])
+                for _y_value, _split_value, _equation, y_box, split_box, _entry, _remove_button in y_rows:
+                    y_box.configure(values=[])
+                    split_box.configure(values=["None"])
+                axes.clear()
+                canvas.draw_idle()
+                self._update_status(f"no {current_mode} parameters are available")
+                return
             parameter_fields = [
                 field
                 for field in fields
@@ -7632,6 +7648,11 @@ class EISApplication:
                     y_value.set(x_values[0])
                 if split_value.get() not in split_fields:
                     split_value.set("None")
+            for field, (low, high, _minimum, _maximum) in list(range_state.items()):
+                if field in fields:
+                    minimum, maximum = bounds(field)
+                    range_state[field] = (low, high, minimum, maximum)
+                    range_labels[field].set(range_text(field))
             refresh_ranges()
 
         def on_split_selected(_event=None) -> None:
@@ -7648,6 +7669,7 @@ class EISApplication:
         x_log.trace_add("write", lambda *_args: refresh_plot())
         y_log.trace_add("write", lambda *_args: refresh_plot())
         ttk.Button(controls, text="Refresh", command=refresh_data).grid(row=4, column=0, pady=(6, 0), sticky="w")
+        ttk.Button(controls, text="Active view", command=active_view).grid(row=4, column=1, pady=(6, 0), sticky="w")
         refresh_ranges()
 
     def open_fit_parameters_explorer(self) -> None:
@@ -8026,6 +8048,12 @@ class EISApplication:
                 axes.legend(loc="best", fontsize=8)
             canvas.draw_idle()
 
+        def active_view() -> None:
+            axes.relim()
+            axes.autoscale(enable=True, axis="both", tight=False)
+            axes.autoscale_view()
+            canvas.draw_idle()
+
         def refresh_data() -> None:
             refreshed = self._collect_fit_parameter_records()
             if not refreshed:
@@ -8047,6 +8075,7 @@ class EISApplication:
 
         x_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
         add_y_row()
+        ttk.Button(controls, text="Active view", command=active_view).grid(row=4, column=1, pady=(6, 0), sticky="w")
         refresh_ranges()
 
     def refresh_fit_parameters_explorer(self, popup: tk.Toplevel) -> None:
