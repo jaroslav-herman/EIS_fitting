@@ -28,6 +28,7 @@ def _external_column_name(name: str) -> str:
     direct = {
         "potential_V": "Ecell_V",
         "current_mA": "I_mA",
+        "time_s": "time/s",
         "minimum_frequency_Hz": "fmin_Hz",
         "maximum_frequency_Hz": "fmax_Hz",
         "active_minimum_frequency_Hz": "fmin_act_Hz",
@@ -152,6 +153,8 @@ def _custom_metadata_columns(cycles: list[CycleState]) -> list[str]:
     reserved = {
         "Ecell_V",
         "I_mA",
+        "time_s",
+        "time/s",
         "fmin_Hz",
         "fmax_Hz",
         "fmin_act_Hz",
@@ -184,6 +187,7 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
         "circuit": cycle.circuit,
         "potential_v": cycle.potential_v,
         "current_ma": cycle.current_ma,
+        "time_s": cycle.time_s,
         "frequency_window": (
             list(cycle.frequency_window) if cycle.frequency_window is not None else None
         ),
@@ -342,6 +346,11 @@ def load_project_file(
         if cycle_number not in available:
             continue
         cycle = load_cycle(dataframe, cycle_number, control)
+        cycle.time_s = (
+            float(saved["time_s"])
+            if saved.get("time_s") is not None
+            else None
+        )
         cycle.circuit = str(saved.get("circuit") or circuit)
         if saved.get("potential_v") is not None:
             cycle.potential_v = float(saved["potential_v"])
@@ -489,6 +498,7 @@ def load_project_file(
     )
     if active_cycle not in restored_cycles:
         active = load_cycle(dataframe, active_cycle, control)
+        active.time_s = None
         active.circuit = circuit
         active.parameters = [
             ParameterValue(
@@ -565,6 +575,7 @@ def export_fit_parameters_for_states(
         "circuit",
         "potential_V",
         "current_mA",
+        "time_s",
         "total_points",
         "active_points",
         "minimum_frequency_Hz",
@@ -594,6 +605,7 @@ def export_fit_parameters_for_states(
                 "circuit": cycle.model(state.circuit),
                 "potential_V": cycle.potential_v,
                 "current_mA": cycle.current_ma,
+                "time_s": cycle.time_s,
                 "total_points": int(cycle.frequency_hz.size),
                 "active_points": int(np.count_nonzero(cycle.included)),
                 "minimum_frequency_Hz": float(np.min(cycle.frequency_hz)),
@@ -665,6 +677,7 @@ def export_python_workspace(
         "circuit",
         "potential_V",
         "current_mA",
+        "time_s",
         "total_points",
         "active_points",
         "minimum_frequency_Hz",
@@ -712,6 +725,7 @@ def export_python_workspace(
                 "circuit": cycle.model(state.circuit),
                 "potential_V": cycle.potential_v,
                 "current_mA": cycle.current_ma,
+                "time_s": cycle.time_s,
                 "total_points": int(cycle.frequency_hz.size),
                 "active_points": int(np.count_nonzero(active)),
                 "minimum_frequency_Hz": float(np.min(cycle.frequency_hz)),
@@ -806,6 +820,7 @@ def export_drts_for_states(
         "circuit",
         "potential_V",
         "current_mA",
+        "time_s",
         "drt_method",
         "point_index",
         "tau_s",
@@ -854,6 +869,7 @@ def export_drts_for_states(
                             "circuit": cycle.model(state.circuit),
                             "potential_V": cycle.potential_v,
                             "current_mA": cycle.current_ma,
+                            "time_s": cycle.time_s,
                             "drt_method": method,
                             "point_index": point_index,
                             "tau_s": float(tau_s),

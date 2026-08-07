@@ -33,6 +33,7 @@ class SpectrumMetadata:
     cycle: int
     potential_v: float
     current_ma: float
+    time_s: float | None
     point_count: int
     minimum_frequency_hz: float
     maximum_frequency_hz: float
@@ -317,12 +318,14 @@ def load_cycle(dataframe, cycle: int, control: str) -> CycleState:
         if "i_ma" in dataframe.columns
         else 0.0
     )
+    time_s = _mean_if_present(dataframe, rows, "time_s")
     return CycleState(
         cycle,
         frequency,
         impedance,
         potential,
         current,
+        time_s,
         custom_metadata=_cycle_custom_metadata(dataframe, cycle, spectrum_kind),
     )
 
@@ -339,12 +342,16 @@ def catalog_spectra(
     for cycle_number in cycles:
         cycle = load_cycle(dataframe, cycle_number, control)
         metadata = _cycle_custom_metadata(dataframe, cycle_number, spectrum_kind)
-        metadata.update(dict(cycle_metadata.get(cycle_number, {})))
+        overrides = dict(cycle_metadata.get(cycle_number, {}))
+        if "time_s" in overrides:
+            cycle.time_s = overrides.pop("time_s")
+        metadata.update(overrides)
         spectra.append(
             SpectrumMetadata(
                 cycle=cycle_number,
                 potential_v=cycle.potential_v,
                 current_ma=cycle.current_ma,
+                time_s=cycle.time_s,
                 point_count=int(cycle.frequency_hz.size),
                 minimum_frequency_hz=float(np.nanmin(cycle.frequency_hz)),
                 maximum_frequency_hz=float(np.nanmax(cycle.frequency_hz)),

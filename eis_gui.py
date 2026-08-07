@@ -217,8 +217,8 @@ class MetadataColumnDialog(tk.Toplevel):
         ttk.Label(
             body,
             text=(
-                f"Paste one value per line for the {spectrum_count} spectra shown "
-                "in the explorer. Blank lines create empty cells."
+                f"Paste one value per line for the {spectrum_count} selected "
+                "spectra in explorer order. Blank lines create empty cells."
             ),
             wraplength=470,
             justify=tk.LEFT,
@@ -244,12 +244,17 @@ class MetadataColumnDialog(tk.Toplevel):
         ttk.Button(buttons, text="Add column", command=self._accept).pack(
             side=tk.RIGHT
         )
+        ttk.Button(
+            buttons,
+            text="Repeat pattern",
+            command=lambda: self._accept(repeat_pattern=True),
+        ).pack(side=tk.RIGHT, padx=(0, 6))
 
         self.bind("<Control-Return>", lambda _event: self._accept())
         self.grab_set()
         self.name_entry.focus_set()
 
-    def _accept(self) -> None:
+    def _accept(self, repeat_pattern: bool = False) -> None:
         name = self.name_entry.get().strip()
         if not name:
             messagebox.showerror(
@@ -259,12 +264,26 @@ class MetadataColumnDialog(tk.Toplevel):
 
         raw = self.values_text.get("1.0", "end-1c").replace("\r\n", "\n")
         lines = raw.split("\n")
-        while len(lines) > self.spectrum_count and lines[-1] == "":
-            lines.pop()
-        if len(lines) != self.spectrum_count:
+        if repeat_pattern:
+            while lines and lines[-1] == "":
+                lines.pop()
+        else:
+            while len(lines) > self.spectrum_count and lines[-1] == "":
+                lines.pop()
+        if repeat_pattern:
+            valid_count = 1 <= len(lines) <= self.spectrum_count
+        else:
+            valid_count = len(lines) == self.spectrum_count
+        if not valid_count:
             messagebox.showerror(
                 "Wrong number of values",
-                f"Paste exactly {self.spectrum_count} values; {len(lines)} were found.",
+                (
+                    f"Paste between 1 and {self.spectrum_count} values for a "
+                    f"repeating pattern; {len(lines)} were found."
+                    if repeat_pattern
+                    else f"Paste exactly {self.spectrum_count} values; "
+                    f"{len(lines)} were found."
+                ),
                 parent=self,
             )
             return
@@ -282,6 +301,12 @@ class MetadataColumnDialog(tk.Toplevel):
             value = cells[0].strip()
             values.append(value if value else None)
 
+        if repeat_pattern:
+            values = [
+                values[index % len(values)]
+                for index in range(self.spectrum_count)
+            ]
+
         self.result = (name, values)
         self.destroy()
 
@@ -294,7 +319,7 @@ class MetadataEditDialog(tk.Toplevel):
         columns: list[str],
     ) -> None:
         super().__init__(parent)
-        self.result: tuple[str, list[str | None]] | None = None
+        self.result: tuple[str, list[str | None], bool] | None = None
         self.spectrum_count = spectrum_count
         self.title("Edit metadata column")
         self.geometry("520x430")
@@ -314,15 +339,30 @@ class MetadataEditDialog(tk.Toplevel):
             values=columns,
             state="readonly",
         ).grid(row=1, column=0, sticky="ew", pady=(3, 10))
+        new_column_frame = ttk.Frame(body)
+        new_column_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        new_column_frame.columnconfigure(2, weight=1)
+        self.new_column_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            new_column_frame,
+            text="Create new column",
+            variable=self.new_column_var,
+            command=self._toggle_new_column,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(new_column_frame, text="Name").grid(
+            row=0, column=1, padx=(10, 4), sticky="e"
+        )
+        self.new_column_entry = ttk.Entry(new_column_frame, state="disabled")
+        self.new_column_entry.grid(row=0, column=2, sticky="ew")
         ttk.Label(
             body,
             text=(
-                f"Paste one value per line for the {spectrum_count} spectra shown "
-                "in the explorer."
+                f"Paste one value per line for the {spectrum_count} selected "
+                "spectra in explorer order."
             ),
             wraplength=470,
             justify=tk.LEFT,
-        ).grid(row=2, column=0, sticky="w", pady=(0, 6))
+        ).grid(row=3, column=0, sticky="w", pady=(0, 6))
         text_frame = ttk.Frame(body)
         text_frame.grid(row=4, column=0, sticky="nsew")
         text_frame.columnconfigure(0, weight=1)
@@ -342,18 +382,59 @@ class MetadataEditDialog(tk.Toplevel):
         ttk.Button(buttons, text="Apply changes", command=self._accept).pack(
             side=tk.RIGHT
         )
+        ttk.Button(
+            buttons,
+            text="Repeat pattern",
+            command=lambda: self._accept(repeat_pattern=True),
+        ).pack(side=tk.RIGHT, padx=(0, 6))
         self.bind("<Control-Return>", lambda _event: self._accept())
         self.grab_set()
 
-    def _accept(self) -> None:
+    def _toggle_new_column(self) -> None:
+        enabled = self.new_column_var.get()
+        self.new_column_entry.configure(state="normal" if enabled else "disabled")
+        if enabled:
+            self.new_column_entry.focus_set()
+
+    def _selected_column_name(self) -> tuple[str, bool] | None:
+        if not self.new_column_var.get():
+            return self.column_var.get(), False
+        name = self.new_column_entry.get().strip()
+        if not name:
+            messagebox.showerror(
+                "Missing column name",
+                "Enter a name for the new column.",
+                parent=self,
+            )
+            return None
+        return name, True
+
+    def _accept(self, repeat_pattern: bool = False) -> None:
+        selected_column = self._selected_column_name()
+        if selected_column is None:
+            return
         raw = self.values_text.get("1.0", "end-1c").replace("\r\n", "\n")
         lines = raw.split("\n")
-        while len(lines) > self.spectrum_count and lines[-1] == "":
-            lines.pop()
-        if len(lines) != self.spectrum_count:
+        if repeat_pattern:
+            while lines and lines[-1] == "":
+                lines.pop()
+        else:
+            while len(lines) > self.spectrum_count and lines[-1] == "":
+                lines.pop()
+        if repeat_pattern:
+            valid_count = 1 <= len(lines) <= self.spectrum_count
+        else:
+            valid_count = len(lines) == self.spectrum_count
+        if not valid_count:
             messagebox.showerror(
                 "Wrong number of values",
-                f"Paste exactly {self.spectrum_count} values; {len(lines)} were found.",
+                (
+                    f"Paste between 1 and {self.spectrum_count} values for a "
+                    f"repeating pattern; {len(lines)} were found."
+                    if repeat_pattern
+                    else f"Paste exactly {self.spectrum_count} values; "
+                    f"{len(lines)} were found."
+                ),
                 parent=self,
             )
             return
@@ -369,7 +450,12 @@ class MetadataEditDialog(tk.Toplevel):
                 return
             value = cells[0].strip()
             values.append(value if value else None)
-        self.result = (self.column_var.get(), values)
+        if repeat_pattern:
+            values = [
+                values[index % len(values)]
+                for index in range(self.spectrum_count)
+            ]
+        self.result = (selected_column[0], values, selected_column[1])
         self.destroy()
 
 
@@ -473,6 +559,8 @@ class EISApplication:
         self.root.bind("<Alt-d>", self._on_alt_d)
         self.root.bind("<Alt-D>", self._on_alt_d)
         self.root.bind("<Alt-e>", self.toggle_point_edit_mode)
+        self.root.bind("<Alt-m>", self.edit_metadata_column_from_clipboard)
+        self.root.bind("<Alt-M>", self.edit_metadata_column_from_clipboard)
         self.root.bind("<Alt-q>", self._active_zoom_key)
         self.root.bind("<Alt-Q>", self._active_zoom_key)
         self.root.bind("<Alt-v>", self._initial_values_key)
@@ -1556,16 +1644,9 @@ class EISApplication:
         explorer_header = ttk.Frame(group)
         ttk.Label(explorer_header, text="Spectra explorer").pack(side=tk.LEFT)
         self.natural_sort_var = tk.BooleanVar(value=False)
-        self.paste_metadata_button = ttk.Button(
-            explorer_header,
-            text="+",
-            width=3,
-            command=self.paste_metadata_column_from_clipboard,
-        )
-        self.paste_metadata_button.pack(side=tk.LEFT, padx=(6, 0))
         self.edit_metadata_button = ttk.Button(
             explorer_header,
-            text="Edit metadata",
+            text="Edit metadata…",
             command=self.edit_metadata_column_from_clipboard,
         )
         self.edit_metadata_button.pack(side=tk.LEFT, padx=(6, 0))
@@ -1585,6 +1666,7 @@ class EISApplication:
             "cycle",
             "potential",
             "current",
+            "time",
             "points",
             "f_min",
             "f_max",
@@ -1603,6 +1685,7 @@ class EISApplication:
             "cycle": "Cycle",
             "potential": "Ecell_V",
             "current": "I_mA",
+            "time": "time/s",
             "points": "Points",
             "f_min": "fmin_act_Hz",
             "f_max": "fmax_act_Hz",
@@ -1614,6 +1697,7 @@ class EISApplication:
             "cycle": "cycle",
             "potential": "potential_v",
             "current": "current_ma",
+            "time": "time_s",
             "points": "point_count",
             "f_min": "minimum_frequency_hz",
             "f_max": "maximum_frequency_hz",
@@ -1628,6 +1712,7 @@ class EISApplication:
             "cycle": 65,
             "potential": 105,
             "current": 110,
+            "time": 95,
             "points": 65,
             "f_min": 125,
             "f_max": 125,
@@ -1725,6 +1810,7 @@ class EISApplication:
             "cycle",
             "potential",
             "current",
+            "time",
             "points",
             "f_min",
             "f_max",
@@ -1751,6 +1837,8 @@ class EISApplication:
                     if name in {
                         "Ecell_V",
                         "I_mA",
+                        "time_s",
+                        "time/s",
                         "fmin_Hz",
                         "fmax_Hz",
                         "fmin_act_Hz",
@@ -1773,6 +1861,7 @@ class EISApplication:
             "cycle": "Cycle",
             "potential": "Voltage (V)",
             "current": "Current (mA)",
+            "time": "time/s",
             "points": "Points",
             "f_min": "Min frequency (Hz)",
             "f_max": "Max frequency (Hz)",
@@ -1784,6 +1873,7 @@ class EISApplication:
             "cycle": 65,
             "potential": 105,
             "current": 110,
+            "time": 95,
             "points": 65,
             "f_min": 125,
             "f_max": 125,
@@ -1814,7 +1904,7 @@ class EISApplication:
             return ""
         if isinstance(value, float) and np.isnan(value):
             return ""
-        numeric_column = column in {"potential", "current", "f_min", "f_max"}
+        numeric_column = column in {"potential", "current", "time", "f_min", "f_max"}
         if column is not None:
             numeric_column |= any(
                 keyword in column.casefold()
@@ -1858,6 +1948,9 @@ class EISApplication:
         if column == "current":
             cycle = loaded.state.cycles.get(spectrum.cycle)
             return cycle.current_ma if cycle is not None else spectrum.current_ma
+        if column == "time":
+            cycle = loaded.state.cycles.get(spectrum.cycle)
+            return cycle.time_s if cycle is not None else spectrum.time_s
         if column == "points":
             return spectrum.point_count
         if column == "f_min":
@@ -2023,6 +2116,8 @@ class EISApplication:
             value = spectrum.potential_v
         elif column == "current":
             value = spectrum.current_ma
+        elif column == "time":
+            value = spectrum.time_s
         elif column == "points":
             value = spectrum.point_count
         elif column == "f_min":
@@ -2743,6 +2838,52 @@ class EISApplication:
         self.drt_peak_table.grid(
             row=5, column=0, columnspan=3, pady=(6, 0), sticky="ew"
         )
+        drt_parameter_actions = ttk.Frame(self.drt_tools_group)
+        drt_parameter_actions.grid(
+            row=6, column=0, columnspan=3, pady=(8, 0), sticky="ew"
+        )
+        for column in range(2):
+            drt_parameter_actions.columnconfigure(column, weight=1)
+        self.drt_parameters_selected_button = ttk.Button(
+            drt_parameter_actions,
+            text="Apply all to selected",
+            command=self.apply_drt_parameters_to_selected,
+        )
+        self.drt_parameters_selected_button.grid(
+            row=0, column=0, columnspan=2, sticky="ew"
+        )
+        self.drt_apply_fix_selected_button = ttk.Button(
+            drt_parameter_actions,
+            text="Apply Fix",
+            command=lambda: self.apply_drt_parameters_to_selected({"fixed"}),
+        )
+        self.drt_apply_fix_selected_button.grid(
+            row=1, column=0, padx=(0, 3), pady=(4, 0), sticky="ew"
+        )
+        self.drt_apply_initial_selected_button = ttk.Button(
+            drt_parameter_actions,
+            text="Apply Initial",
+            command=lambda: self.apply_drt_parameters_to_selected({"initial"}),
+        )
+        self.drt_apply_initial_selected_button.grid(
+            row=1, column=1, padx=(3, 0), pady=(4, 0), sticky="ew"
+        )
+        self.drt_apply_lower_selected_button = ttk.Button(
+            drt_parameter_actions,
+            text="Apply Lower",
+            command=lambda: self.apply_drt_parameters_to_selected({"lower"}),
+        )
+        self.drt_apply_lower_selected_button.grid(
+            row=2, column=0, padx=(0, 3), pady=(4, 0), sticky="ew"
+        )
+        self.drt_apply_upper_selected_button = ttk.Button(
+            drt_parameter_actions,
+            text="Apply Upper",
+            command=lambda: self.apply_drt_parameters_to_selected({"upper"}),
+        )
+        self.drt_apply_upper_selected_button.grid(
+            row=2, column=1, padx=(3, 0), pady=(4, 0), sticky="ew"
+        )
         self.drt_tools_group.grid_remove()
         self.action_buttons = (
             self.fit_button,
@@ -2755,6 +2896,11 @@ class EISApplication:
             self.fit_peaks_button,
             self.remove_all_peaks_button,
             self.send_drt_initials_button,
+            self.drt_parameters_selected_button,
+            self.drt_apply_fix_selected_button,
+            self.drt_apply_initial_selected_button,
+            self.drt_apply_lower_selected_button,
+            self.drt_apply_upper_selected_button,
             self.initial_values_button,
             self.outlier_selected_button,
             self.reset_button,
@@ -2767,7 +2913,6 @@ class EISApplication:
             self.plot_three_electrode_button,
             self.plot_fit_parameters_button,
             self.plot_drt_parameters_button,
-            self.paste_metadata_button,
             self.edit_metadata_button,
             self.frequency_button,
             self.frequency_selected_button,
@@ -3383,6 +3528,150 @@ class EISApplication:
                     ("initial", "Initial values"),
                     ("lower", "Lower limits"),
                     ("upper", "Upper limits"),
+                )
+                if field in fields
+            )
+        self._update_status(f"{action} applied to {updated} spectra{suffix}")
+
+    def _drt_peak_parameter_values(self, peaks) -> list[dict[str, float]]:
+        values = []
+        for peak in peaks:
+            tau, area, fwhm = self._peak_summary(peak)
+            shape = self._peak_shape(peak)
+            item = {"tau": float(tau), "area": float(area)}
+            if shape == "voigt":
+                item["sigma"] = float(peak.get("sigma_log10", 0.12))
+                item["gamma"] = float(
+                    peak.get("gamma_log10", item["sigma"])
+                )
+            elif shape == "hn":
+                item["alpha"] = float(peak.get("alpha", 0.8))
+                item["beta"] = float(peak.get("beta", 0.8))
+            else:
+                item["fwhm"] = float(fwhm)
+            values.append(item)
+        return values
+
+    def _set_drt_peak_initial_value(
+        self,
+        peak: dict,
+        name: str,
+        value: float,
+    ) -> None:
+        tau, area, fwhm = self._peak_summary(peak)
+        shape = self._peak_shape(peak)
+        value = float(value)
+        if name == "tau":
+            tau = max(value, 1e-300)
+        elif name == "area":
+            area = value
+        elif name == "fwhm" and shape not in {"voigt", "hn"}:
+            fwhm = max(value, 1e-300)
+            peak["sigma_log10"] = self._peak_width_from_fwhm(
+                shape, tau, fwhm
+            )
+        elif name in {"sigma", "gamma"} and shape == "voigt":
+            peak[f"{name}_log10"] = max(value, 1e-6)
+        elif name in {"alpha", "beta"} and shape == "hn":
+            peak[name] = value
+        else:
+            return
+        peak["center_log10"] = float(np.log10(max(tau, 1e-300)))
+        if name == "area":
+            peak["area"] = area
+        peak["height"] = self._peak_height_from_area(
+            shape,
+            area,
+            peak.get("sigma_log10", 0.12),
+            peak.get("gamma_log10"),
+            peak.get("alpha"),
+            peak.get("beta"),
+        )
+
+    def apply_drt_parameters_to_selected(
+        self,
+        fields: set[str] | None = None,
+    ) -> None:
+        if self.busy or self.state is None:
+            return
+        if not self._sync_drt_peak_parameters_from_table():
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        fields = fields or {"fixed", "initial", "lower", "upper"}
+        source_peaks = copy.deepcopy(self.drt_peak_parameters)
+        source_values = self._drt_peak_parameter_values(source_peaks)
+        if not source_peaks:
+            self._update_status("add at least one DRT peak first")
+            return
+        mode = self.analysis_drt_mode_var.get()
+        peak_attribute = (
+            "saved_hybrid_peak_parameters"
+            if mode == "Hybrid DRT"
+            else "saved_ridge_peak_parameters"
+        )
+        updated = 0
+        skipped = 0
+        all_fields = {"fixed", "initial", "lower", "upper"}
+        for _dataset_id, loaded, spectrum in selected_rows:
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            target_peaks = copy.deepcopy(getattr(cycle, peak_attribute, None) or [])
+            if fields == all_fields:
+                target_peaks = copy.deepcopy(source_peaks)
+            elif not target_peaks:
+                skipped += 1
+                continue
+            target_values = self._drt_peak_parameter_values(target_peaks)
+            for index, target_peak in enumerate(target_peaks):
+                if index >= len(source_values) or index >= len(target_values):
+                    continue
+                source_peak = source_peaks[index]
+                source_item = source_values[index]
+                target_item = target_values[index]
+                target_shape = self._peak_shape(target_peak)
+                source_shape = self._peak_shape(source_peak)
+                if source_shape != target_shape and fields != all_fields:
+                    continue
+                for name in target_item:
+                    if name not in source_item:
+                        continue
+                    if "initial" in fields:
+                        self._set_drt_peak_initial_value(
+                            target_peak, name, source_item[name]
+                        )
+                    if "lower" in fields:
+                        target_peak[f"{name}_lower"] = source_peak.get(
+                            f"{name}_lower", target_peak.get(f"{name}_lower")
+                        )
+                    if "upper" in fields:
+                        target_peak[f"{name}_upper"] = source_peak.get(
+                            f"{name}_upper", target_peak.get(f"{name}_upper")
+                        )
+                    if "fixed" in fields:
+                        target_peak[f"{name}_fixed"] = bool(
+                            source_peak.get(
+                                f"{name}_fixed",
+                                target_peak.get(f"{name}_fixed", False),
+                            )
+                        )
+            cycle.store_drt_peak_parameters(mode, target_peaks)
+            updated += 1
+        self._refresh_explorer_values()
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        suffix = f", {skipped} skipped" if skipped else ""
+        if fields == all_fields:
+            action = "DRT peak settings"
+        else:
+            action = ", ".join(
+                label
+                for field, label in (
+                    ("fixed", "DRT Fix"),
+                    ("initial", "DRT Initial values"),
+                    ("lower", "DRT Lower limits"),
+                    ("upper", "DRT Upper limits"),
                 )
                 if field in fields
             )
@@ -4669,6 +4958,9 @@ class EISApplication:
         getattr(self, callback_name)()
 
     def _handle_alt_keypad(self, event):
+        if getattr(event, "keysym", "").casefold() == "m":
+            self.edit_metadata_column_from_clipboard()
+            return "break"
         if getattr(event, "keycode", None) == 51 or getattr(event, "keysym", "") in {
             "3", "scaron"
         }:
@@ -6926,6 +7218,14 @@ class EISApplication:
                     "cycle": spectrum.cycle,
                     "potential_V": cycle.potential_v,
                     "current_mA": cycle.current_ma,
+                    "time_s": cycle.time_s,
+                    "Spectrum": (
+                        spectrum.custom_metadata.get(SPECTRUM_METADATA_COLUMN)
+                        or {"working": "WE", "cell": "Cell", "counter": "CE"}.get(
+                            loaded.state.control,
+                            loaded.state.control,
+                        )
+                    ),
                     "circuit": cycle.model(loaded.state.circuit),
                 }
                 record.update(
@@ -6974,6 +7274,14 @@ class EISApplication:
                     "cycle": spectrum.cycle,
                     "potential_V": cycle.potential_v,
                     "current_mA": cycle.current_ma,
+                    "time_s": cycle.time_s,
+                    "Spectrum": (
+                        spectrum.custom_metadata.get(SPECTRUM_METADATA_COLUMN)
+                        or {"working": "WE", "cell": "Cell", "counter": "CE"}.get(
+                            loaded.state.control,
+                            loaded.state.control,
+                        )
+                    ),
                     "drt_mode": mode,
                 }
                 if resistance is not None:
@@ -7035,6 +7343,11 @@ class EISApplication:
             for field in fields
             if field == "R0" or field == "L0" or field.startswith("peak")
         ]
+        split_fields = [
+            "None",
+            "Spectrum",
+            *[field for field in fields if field not in parameter_fields],
+        ]
         x_default = "I_mA" if "I_mA" in fields else fields[0]
         y_default = parameter_fields[0] if parameter_fields else fields[0]
 
@@ -7056,31 +7369,79 @@ class EISApplication:
         for column in range(5):
             controls.columnconfigure(column, weight=1)
         x_var = tk.StringVar(value=x_default)
-        y_var = tk.StringVar(value=y_default)
-        split_var = tk.StringVar(value="None")
+        y_vars: list[tk.StringVar] = []
+        split_vars: list[tk.StringVar] = []
         x_equation = tk.StringVar(value="x")
-        y_equation = tk.StringVar(value="y")
         x_log = tk.BooleanVar(value=False)
         y_log = tk.BooleanVar(value=False)
+        y_rows_frame = ttk.Frame(controls)
+        y_rows_frame.grid(row=1, column=1, columnspan=2, padx=3, sticky="ew")
+        for column in range(3):
+            y_rows_frame.columnconfigure(column, weight=1)
+        y_rows: list[tuple[tk.StringVar, tk.StringVar, tk.StringVar, ttk.Combobox, ttk.Combobox, ttk.Entry]] = []
+
+        def remove_y_row(
+            y_value: tk.StringVar,
+            split_value: tk.StringVar,
+            y_box: ttk.Combobox,
+            split_box: ttk.Combobox,
+            equation_box: ttk.Entry,
+            remove_button: ttk.Button,
+        ) -> None:
+            if len(y_rows) <= 1:
+                return
+            index = y_vars.index(y_value)
+            y_vars.pop(index)
+            split_vars.pop(index)
+            y_rows.pop(index)
+            for widget in (y_box, split_box, equation_box, remove_button):
+                widget.destroy()
+            for row, row_data in enumerate(y_rows):
+                for widget in row_data[3:]:
+                    widget.grid_configure(row=row)
+            refresh_ranges()
+
+        def add_y_row() -> None:
+            row = len(y_rows)
+            y_value = tk.StringVar(value=y_default)
+            split_value = tk.StringVar(value="None")
+            equation = tk.StringVar(value="y")
+            y_box = ttk.Combobox(y_rows_frame, textvariable=y_value, state="readonly")
+            split_box = ttk.Combobox(y_rows_frame, textvariable=split_value, state="readonly")
+            equation_box = ttk.Entry(y_rows_frame, textvariable=equation)
+            remove_button = ttk.Button(y_rows_frame, text="Remove", width=7)
+            remove_button.configure(
+                command=lambda: remove_y_row(
+                    y_value, split_value, y_box, split_box, equation_box, remove_button
+                )
+            )
+            y_box.configure(values=fields)
+            split_box.configure(values=split_fields)
+            y_box.grid(row=row, column=0, padx=(0, 4), sticky="ew")
+            split_box.grid(row=row, column=1, padx=4, sticky="ew")
+            equation_box.grid(row=row, column=2, padx=(4, 0), sticky="ew")
+            remove_button.grid(row=row, column=3, padx=(4, 0), sticky="e")
+            y_vars.append(y_value)
+            split_vars.append(split_value)
+            y_rows.append((y_value, split_value, equation, y_box, split_box, equation_box, remove_button))
+            y_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+            split_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+            equation.trace_add("write", lambda *_args: refresh_plot())
+            refresh_ranges()
+
         ttk.Label(controls, text="X axis").grid(row=0, column=0, sticky="w")
-        ttk.Label(controls, text="Y axis").grid(row=0, column=1, sticky="w")
-        ttk.Label(controls, text="Split by").grid(row=0, column=2, sticky="w")
+        ttk.Label(controls, text="Y axis / split / equation").grid(row=0, column=1, columnspan=2, sticky="w")
+        ttk.Button(controls, text="Add y-variable", width=14, command=add_y_row).grid(row=0, column=4, sticky="e")
         x_box = ttk.Combobox(controls, textvariable=x_var, state="readonly")
-        y_box = ttk.Combobox(controls, textvariable=y_var, state="readonly")
-        split_box = ttk.Combobox(controls, textvariable=split_var, state="readonly")
         x_box.grid(row=1, column=0, padx=(0, 6), sticky="ew")
-        y_box.grid(row=1, column=1, padx=3, sticky="ew")
-        split_box.grid(row=1, column=2, padx=(6, 12), sticky="ew")
-        ttk.Checkbutton(controls, text="Log X", variable=x_log).grid(row=1, column=3, sticky="w")
-        ttk.Checkbutton(controls, text="Log Y", variable=y_log).grid(row=1, column=4, sticky="w")
+        ttk.Checkbutton(controls, text="Log X", variable=x_log).grid(row=2, column=3, sticky="w")
+        ttk.Checkbutton(controls, text="Log Y", variable=y_log).grid(row=2, column=4, sticky="w")
         ttk.Label(controls, text="X equation").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(controls, text="Y equation").grid(row=2, column=1, sticky="w", pady=(6, 0))
         ttk.Entry(controls, textvariable=x_equation).grid(row=3, column=0, padx=(0, 6), sticky="ew")
-        ttk.Entry(controls, textvariable=y_equation).grid(row=3, column=1, padx=3, sticky="ew")
         ttk.Label(
             controls,
             text="Use x, y, column names, and np functions",
-        ).grid(row=3, column=2, columnspan=3, padx=(6, 0), sticky="w")
+        ).grid(row=3, column=1, columnspan=4, padx=(6, 0), sticky="w")
 
         range_frame = ttk.LabelFrame(popup, text="Displayed value ranges", padding=6)
         range_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 6))
@@ -7142,8 +7503,12 @@ class EISApplication:
 
         def refresh_ranges() -> None:
             selected_fields = list(dict.fromkeys(
-                [x_var.get(), y_var.get()]
-                + ([] if split_var.get() == "None" else [split_var.get()])
+                [x_var.get()]
+                + [y_var.get() for y_var in y_vars]
+                + [
+                    split_var.get() for split_var in split_vars
+                    if split_var.get() not in {"None", "Spectrum"}
+                ]
             ))
             for widget_list in range_widgets.values():
                 for widget in widget_list:
@@ -7192,77 +7557,96 @@ class EISApplication:
             axes.grid(True, alpha=0.25)
             axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
             axes.axvline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
-            x_field, y_field, split_field = x_var.get(), y_var.get(), split_var.get()
-            filtered = []
-            selected_fields = [x_field, y_field] + ([] if split_field == "None" else [split_field])
-            for record in records:
-                try:
-                    if any(
-                        field not in record
-                        or not np.isfinite(float(record[field]))
-                        or not value_at(field, range_state[field][0].get()) <= float(record[field]) <= value_at(field, range_state[field][1].get())
-                        for field in selected_fields
-                    ):
+            x_field = x_var.get()
+            plotted_groups: list[tuple[str, list[tuple[float, float]]]] = []
+            for y_value, split_value, equation, *_widgets in y_rows:
+                groups: dict[object, list[tuple[float, float]]] = {}
+                y_field = y_value.get()
+                split_field = split_value.get()
+                selected_fields = [x_field, y_field]
+                if split_field not in {"None", "Spectrum"}:
+                    selected_fields.append(split_field)
+                for record in records:
+                    try:
+                        if any(
+                            field not in record
+                            or not np.isfinite(float(record[field]))
+                            or not value_at(field, range_state[field][0].get()) <= float(record[field]) <= value_at(field, range_state[field][1].get())
+                            for field in selected_fields
+                        ):
+                            continue
+                        x_value = evaluate(record, x_equation.get(), "x", x_field, x_field)
+                        calculated = evaluate(record, equation.get(), "y", x_field, y_field)
+                        if np.isfinite(x_value) and np.isfinite(calculated):
+                            group = "DRT" if split_field == "None" else record.get(split_field)
+                            groups.setdefault(group, []).append((x_value, calculated))
+                    except (KeyError, TypeError, ValueError, SyntaxError, ZeroDivisionError):
                         continue
-                    x_value = evaluate(record, x_equation.get(), "x", x_field, y_field)
-                    y_value = evaluate(record, y_equation.get(), "y", x_field, y_field)
-                    if np.isfinite(x_value) and np.isfinite(y_value):
-                        filtered.append((record, x_value, y_value))
-                except (KeyError, TypeError, ValueError, SyntaxError, ZeroDivisionError):
-                    continue
-            groups: dict[object, list[tuple[dict[str, object], float, float]]] = {}
-            if split_field == "None":
-                groups["DRT"] = filtered
-            else:
-                for row in filtered:
-                    groups.setdefault(row[0][split_field], []).append(row)
-            ordered_groups = sorted(groups.items(), key=lambda item: str(item[0]))
+                for group, values in sorted(groups.items(), key=lambda item: str(item[0])):
+                    plotted_groups.append((f"{y_field} = {equation.get() or 'y'} ({group})", values))
             color_scale = colormaps["rainbow"]
-            for index, (group, values) in enumerate(ordered_groups):
+            for index, (label, values) in enumerate(plotted_groups):
                 if not values:
                     continue
-                color = color_scale(index / max(len(ordered_groups) - 1, 1))
+                color = color_scale(index / max(len(plotted_groups) - 1, 1))
                 axes.plot(
+                    [value[0] for value in values],
                     [value[1] for value in values],
-                    [value[2] for value in values],
                     "o-",
                     color=color,
                     linewidth=1.1,
                     markersize=4,
-                    label=str(group),
+                    label=label,
                 )
             axes.set_xlabel(x_equation.get() or x_field)
-            axes.set_ylabel(y_equation.get() or y_field)
+            axes.set_ylabel(" / ".join(equation.get() or y_value.get() for y_value, _split_value, equation, *_widgets in y_rows))
             axes.set_xscale("log" if x_log.get() else "linear")
             axes.set_yscale("log" if y_log.get() else "linear")
-            if ordered_groups:
+            if plotted_groups:
                 axes.legend(loc="best", fontsize=8)
             canvas.draw_idle()
 
         def refresh_data() -> None:
-            nonlocal fields
+            nonlocal fields, split_fields
             records[:] = self._collect_drt_parameter_records(mode)
             fields = numeric_fields()
+            parameter_fields = [
+                field
+                for field in fields
+                if field == "R0" or field == "L0" or field.startswith("peak")
+            ]
+            split_fields = [
+                "None",
+                "Spectrum",
+                *[field for field in fields if field not in parameter_fields],
+            ]
             x_values = [field for field in fields]
             x_box.configure(values=x_values)
-            y_box.configure(values=x_values)
-            split_box.configure(values=["None", *x_values])
+            for _y_value, _split_value, _equation, y_box, split_box, _entry, _remove_button in y_rows:
+                y_box.configure(values=x_values)
+                split_box.configure(values=split_fields)
             if x_var.get() not in x_values:
                 x_var.set(x_values[0])
-            if y_var.get() not in x_values:
-                y_var.set(x_values[0])
+            for y_value, split_value, _equation, _y_box, _split_box, _entry, _remove_button in y_rows:
+                if y_value.get() not in x_values:
+                    y_value.set(x_values[0])
+                if split_value.get() not in split_fields:
+                    split_value.set("None")
             refresh_ranges()
 
+        def on_split_selected(_event=None) -> None:
+            refresh_ranges()
+            refresh_plot()
+
         x_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
-        y_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
-        split_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+        x_box.configure(values=fields)
+        for y_value, split_value, _equation, y_box, split_box, _entry, _remove_button in y_rows:
+            y_box.configure(values=fields)
+            split_box.configure(values=split_fields)
+        add_y_row()
         x_equation.trace_add("write", lambda *_args: refresh_plot())
-        y_equation.trace_add("write", lambda *_args: refresh_plot())
         x_log.trace_add("write", lambda *_args: refresh_plot())
         y_log.trace_add("write", lambda *_args: refresh_plot())
-        x_box.configure(values=fields)
-        y_box.configure(values=fields)
-        split_box.configure(values=["None", *fields])
         ttk.Button(controls, text="Refresh", command=refresh_data).grid(row=4, column=0, pady=(6, 0), sticky="w")
         refresh_ranges()
 
@@ -7289,6 +7673,7 @@ class EISApplication:
                     "cycle": spectrum.cycle,
                     "potential_V": cycle.potential_v,
                     "current_mA": cycle.current_ma,
+                    "time_s": cycle.time_s,
                     "circuit": cycle.model(loaded.state.circuit),
                 }
                 record.update(
@@ -7333,6 +7718,11 @@ class EISApplication:
                 for prefix in ("R", "Q", "a", "C", "L", "W", "tau")
             )
         ]
+        split_fields = [
+            "None",
+            "Spectrum",
+            *[field for field in numeric_fields if field not in parameter_fields],
+        ]
         x_default = "I_mA" if "I_mA" in numeric_fields else numeric_fields[0]
         y_default = parameter_fields[0] if parameter_fields else numeric_fields[0]
 
@@ -7356,33 +7746,79 @@ class EISApplication:
             controls.columnconfigure(column, weight=1)
 
         x_var = tk.StringVar(value=x_default)
-        y_var = tk.StringVar(value=y_default)
-        split_var = tk.StringVar(value="None")
+        y_vars: list[tk.StringVar] = []
+        split_vars: list[tk.StringVar] = []
         x_equation = tk.StringVar(value="x")
-        y_equation = tk.StringVar(value="y")
         x_log = tk.BooleanVar(value=False)
         y_log = tk.BooleanVar(value=False)
+        y_rows_frame = ttk.Frame(controls)
+        y_rows_frame.grid(row=1, column=1, columnspan=2, padx=3, sticky="ew")
+        for column in range(3):
+            y_rows_frame.columnconfigure(column, weight=1)
+        y_rows: list[tuple[tk.StringVar, tk.StringVar, tk.StringVar, ttk.Combobox, ttk.Combobox, ttk.Entry]] = []
+
+        def remove_y_row(
+            y_value: tk.StringVar,
+            split_value: tk.StringVar,
+            y_box: ttk.Combobox,
+            split_box: ttk.Combobox,
+            equation_box: ttk.Entry,
+            remove_button: ttk.Button,
+        ) -> None:
+            if len(y_rows) <= 1:
+                return
+            index = y_vars.index(y_value)
+            y_vars.pop(index)
+            split_vars.pop(index)
+            y_rows.pop(index)
+            for widget in (y_box, split_box, equation_box, remove_button):
+                widget.destroy()
+            for row, row_data in enumerate(y_rows):
+                for widget in row_data[3:]:
+                    widget.grid_configure(row=row)
+            refresh_ranges()
+
+        def add_y_row() -> None:
+            row = len(y_rows)
+            y_value = tk.StringVar(value=y_default)
+            split_value = tk.StringVar(value="None")
+            equation = tk.StringVar(value="y")
+            y_box = ttk.Combobox(y_rows_frame, textvariable=y_value, state="readonly")
+            split_box = ttk.Combobox(y_rows_frame, textvariable=split_value, state="readonly")
+            equation_box = ttk.Entry(y_rows_frame, textvariable=equation)
+            remove_button = ttk.Button(y_rows_frame, text="Remove", width=7)
+            remove_button.configure(
+                command=lambda: remove_y_row(
+                    y_value, split_value, y_box, split_box, equation_box, remove_button
+                )
+            )
+            y_box.configure(values=numeric_fields)
+            split_box.configure(values=split_fields)
+            y_box.grid(row=row, column=0, padx=(0, 4), sticky="ew")
+            split_box.grid(row=row, column=1, padx=4, sticky="ew")
+            equation_box.grid(row=row, column=2, padx=(4, 0), sticky="ew")
+            remove_button.grid(row=row, column=3, padx=(4, 0), sticky="e")
+            y_vars.append(y_value)
+            split_vars.append(split_value)
+            y_rows.append((y_value, split_value, equation, y_box, split_box, equation_box, remove_button))
+            y_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+            split_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+            equation.trace_add("write", lambda *_args: refresh_plot())
+            refresh_ranges()
+
         ttk.Label(controls, text="X axis").grid(row=0, column=0, sticky="w")
-        ttk.Label(controls, text="Y axis").grid(row=0, column=1, sticky="w")
-        ttk.Label(controls, text="Split by").grid(row=0, column=2, sticky="w")
+        ttk.Label(controls, text="Y axis / split / equation").grid(row=0, column=1, columnspan=2, sticky="w")
+        ttk.Button(controls, text="Add y-variable", width=14, command=add_y_row).grid(row=0, column=4, sticky="e")
         x_box = ttk.Combobox(controls, textvariable=x_var, values=numeric_fields, state="readonly")
-        y_box = ttk.Combobox(controls, textvariable=y_var, values=numeric_fields, state="readonly")
-        split_box = ttk.Combobox(
-            controls, textvariable=split_var, values=["None", *numeric_fields], state="readonly"
-        )
         x_box.grid(row=1, column=0, padx=(0, 6), sticky="ew")
-        y_box.grid(row=1, column=1, padx=3, sticky="ew")
-        split_box.grid(row=1, column=2, padx=(6, 12), sticky="ew")
-        ttk.Checkbutton(controls, text="Log X", variable=x_log).grid(row=1, column=3, sticky="w")
-        ttk.Checkbutton(controls, text="Log Y", variable=y_log).grid(row=1, column=4, sticky="w")
+        ttk.Checkbutton(controls, text="Log X", variable=x_log).grid(row=2, column=3, sticky="w")
+        ttk.Checkbutton(controls, text="Log Y", variable=y_log).grid(row=2, column=4, sticky="w")
         ttk.Label(controls, text="X equation").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Label(controls, text="Y equation").grid(row=2, column=1, sticky="w", pady=(6, 0))
         ttk.Entry(controls, textvariable=x_equation).grid(row=3, column=0, padx=(0, 6), sticky="ew")
-        ttk.Entry(controls, textvariable=y_equation).grid(row=3, column=1, padx=3, sticky="ew")
         ttk.Label(
             controls,
             text="Use column names and np functions, e.g. 1/R1 or np.log10(I_mA)",
-        ).grid(row=3, column=2, columnspan=3, padx=(6, 0), sticky="w")
+        ).grid(row=3, column=1, columnspan=4, padx=(6, 0), sticky="w")
         ttk.Button(
             controls,
             text="Refresh",
@@ -7436,9 +7872,12 @@ class EISApplication:
             return f"{range_value(field, low.get()):.5g} – {range_value(field, high.get()):.5g}"
 
         def refresh_ranges() -> None:
-            fields = [x_var.get(), y_var.get()]
-            if split_var.get() != "None":
-                fields.append(split_var.get())
+            fields = [x_var.get(), *[y_var.get() for y_var in y_vars]]
+            fields.extend(
+                split_var.get()
+                for split_var in split_vars
+                if split_var.get() not in {"None", "Spectrum"}
+            )
             for widget_list in range_widgets.values():
                 for widget in widget_list:
                     widget.grid_remove()
@@ -7500,62 +7939,56 @@ class EISApplication:
             axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
             axes.axvline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
             x_field = x_var.get()
-            y_field = y_var.get()
-            split_field = split_var.get()
-            filtered = []
-            fields = [x_field, y_field]
-            if split_field != "None":
-                fields.append(split_field)
-            for record in records:
-                try:
-                    if any(
-                        field not in record
-                        or not np.isfinite(float(record[field]))
-                        or not (
-                            range_value(field, range_state[field][0].get())
-                            <= float(record[field])
-                            <= range_value(field, range_state[field][1].get())
-                        )
-                        for field in dict.fromkeys(fields)
-                    ):
+            plotted_groups: list[tuple[str, list[tuple[float, float]]]] = []
+            for y_var, split_var, equation, *_widgets in y_rows:
+                groups: dict[object, list[tuple[float, float]]] = {}
+                y_field = y_var.get()
+                split_field = split_var.get()
+                selected_fields = [x_field, y_field]
+                if split_field not in {"None", "Spectrum"}:
+                    selected_fields.append(split_field)
+                for record in records:
+                    try:
+                        if any(
+                            field not in record
+                            or not np.isfinite(float(record[field]))
+                            or not (
+                                range_value(field, range_state[field][0].get())
+                                <= float(record[field])
+                                <= range_value(field, range_state[field][1].get())
+                            )
+                            for field in selected_fields
+                        ):
+                            continue
+                        x_value = evaluate(record, x_equation.get(), x_field, x_field, x_field)
+                        y_value = evaluate(record, equation.get(), y_field, x_field, y_field)
+                        if not np.isfinite(x_value) or not np.isfinite(y_value):
+                            continue
+                        if x_log.get() and x_value <= 0 or y_log.get() and y_value <= 0:
+                            continue
+                        group = "All spectra" if split_field == "None" else record.get(split_field)
+                        groups.setdefault(group, []).append((x_value, y_value))
+                    except Exception:
                         continue
-                    x_value = evaluate(
-                        record, x_equation.get(), x_field, x_field, y_field
-                    )
-                    y_value = evaluate(
-                        record, y_equation.get(), y_field, x_field, y_field
-                    )
-                    if not np.isfinite(x_value) or not np.isfinite(y_value):
-                        continue
-                    if x_log.get() and x_value <= 0 or y_log.get() and y_value <= 0:
-                        continue
-                    filtered.append((record, x_value, y_value))
-                except Exception:
-                    continue
-            groups: dict[object, list[tuple[float, float]]] = {}
-            for record, x_value, y_value in filtered:
-                group = record.get(split_field) if split_field != "None" else "All spectra"
-                groups.setdefault(group, []).append((x_value, y_value))
+                for group, points in sorted(groups.items(), key=lambda item: str(item[0])):
+                    points.sort(key=lambda point: point[0])
+                    plotted_groups.append((f"{y_field} = {equation.get() or 'y'} ({group})", points))
             color_scale = colormaps["rainbow"]
-            ordered_groups = sorted(groups.items(), key=lambda item: item[0])
-            for index, (group, points) in enumerate(ordered_groups):
-                points.sort(key=lambda point: point[0])
+            for index, (label, points) in enumerate(plotted_groups):
+                if not points:
+                    continue
                 x_values, y_values = zip(*points)
                 axes.plot(
                     x_values,
                     y_values,
                     "o-",
-                    color=color_scale(index / max(len(groups) - 1, 1)),
-                    label=str(group),
+                    color=color_scale(index / max(len(plotted_groups) - 1, 1)),
+                    label=label,
                 )
             axes.relim()
             axes.autoscale(enable=True, axis="both", tight=False)
             axes.autoscale_view()
-            plotted_values = [
-                point
-                for _group, points in ordered_groups
-                for point in points
-            ]
+            plotted_values = [point for _label, points in plotted_groups for point in points]
             if plotted_values:
                 plotted_x = np.asarray([point[0] for point in plotted_values], dtype=float)
                 plotted_y = np.asarray([point[1] for point in plotted_values], dtype=float)
@@ -7586,10 +8019,10 @@ class EISApplication:
                 axes.set_xlim(x_min, x_max)
                 axes.set_ylim(y_min, y_max)
             axes.set_xlabel(x_equation.get().strip() or x_field)
-            axes.set_ylabel(y_equation.get().strip() or y_field)
+            axes.set_ylabel(" / ".join(equation.get() or y_var.get() for y_var, _split_var, equation, *_widgets in y_rows))
             axes.set_xscale("log" if x_log.get() else "linear")
             axes.set_yscale("log" if y_log.get() else "linear")
-            if split_field != "None" and groups:
+            if plotted_groups:
                 axes.legend(loc="best", fontsize=8)
             canvas.draw_idle()
 
@@ -7605,11 +8038,15 @@ class EISApplication:
                 range_labels[field].set(range_text(field))
             refresh_plot()
 
-        for variable in (x_var, y_var, split_var, x_equation, y_equation, x_log, y_log):
+        for variable in (x_var, x_equation, x_log, y_log):
             variable.trace_add("write", lambda *_args: refresh_ranges())
+
+        def on_split_selected(_event=None) -> None:
+            refresh_ranges()
+            refresh_plot()
+
         x_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
-        y_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
-        split_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
+        add_y_row()
         refresh_ranges()
 
     def refresh_fit_parameters_explorer(self, popup: tk.Toplevel) -> None:
@@ -7620,9 +8057,9 @@ class EISApplication:
     def edit_metadata_column_from_clipboard(self) -> None:
         if self.busy or self.state is None:
             return
-        visible_items = list(self.explorer.get_children(""))
-        if not visible_items:
-            self._update_status("no spectra are available")
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra first")
             return
         self._sync_custom_metadata_columns()
         editable_columns = ["Ecell_V", "I_mA", *self._custom_metadata_columns]
@@ -7631,15 +8068,81 @@ class EISApplication:
             return
         dialog = MetadataEditDialog(
             self.root,
-            len(visible_items),
+            len(selected_rows),
             editable_columns,
         )
         self.root.wait_window(dialog)
         if dialog.result is None:
             return
-        column_name, values = dialog.result
-        for item, value in zip(visible_items, values):
-            _dataset_id, loaded, spectrum = self._explorer_rows[item]
+        column_name, values, create_new = dialog.result
+        if len(values) != len(selected_rows):
+            messagebox.showerror(
+                "Wrong number of values",
+                f"Paste exactly {len(selected_rows)} values.",
+                parent=self.root,
+            )
+            return
+        if create_new:
+            reserved_names = {
+                "source_file",
+                "source_path",
+                "circuit",
+                "Ecell_V",
+                "I_mA",
+                "time/s",
+                "included_points",
+                "total_points",
+                "outlier_points",
+                "fmin_Hz",
+                "fmax_Hz",
+                "fmin_act_Hz",
+                "fmax_act_Hz",
+            }
+            known_names = [
+                *self._explorer_base_columns(),
+                *self._custom_metadata_columns,
+                *self._explorer_headings.values(),
+                *reserved_names,
+            ]
+            for loaded in self.loaded_projects.values():
+                known_names.extend(str(name) for name in loaded.dataframe.columns)
+            existing_names = {name.casefold(): name for name in known_names}
+            if column_name.startswith("#"):
+                messagebox.showerror(
+                    "Invalid column name",
+                    "Column names cannot start with '#'.",
+                    parent=self.root,
+                )
+                return
+            if column_name.casefold() in existing_names:
+                messagebox.showerror(
+                    "Column already exists",
+                    f"A column named '{existing_names[column_name.casefold()]}' already exists.",
+                    parent=self.root,
+                )
+                return
+            for loaded in self.loaded_projects.values():
+                if column_name not in loaded.dataframe.columns:
+                    loaded.dataframe[column_name] = np.full(
+                        len(loaded.dataframe), None, dtype=object
+                    )
+                for spectrum_item in loaded.spectra:
+                    spectrum_item.custom_metadata.setdefault(column_name, None)
+                    cycle_item = loaded.state.cycles.get(spectrum_item.cycle)
+                    if cycle_item is None:
+                        cycle_item = load_cycle(
+                            loaded.dataframe,
+                            spectrum_item.cycle,
+                            loaded.state.control,
+                        )
+                        if loaded.state.all_frequency_window is not None:
+                            cycle_item.frequency_window = loaded.state.all_frequency_window
+                        cycle_item.circuit = loaded.state.circuit
+                        loaded.state.cycles[spectrum_item.cycle] = cycle_item
+                    cycle_item.custom_metadata.setdefault(column_name, None)
+            if column_name not in self._custom_metadata_columns:
+                self._custom_metadata_columns.append(column_name)
+        for (_dataset_id, loaded, spectrum), value in zip(selected_rows, values):
             cycle = loaded.state.cycles.get(spectrum.cycle)
             if cycle is None:
                 cycle = load_cycle(
@@ -7700,16 +8203,23 @@ class EISApplication:
     def paste_metadata_column_from_clipboard(self) -> None:
         if self.busy or self.state is None:
             return
-        visible_items = list(self.explorer.get_children(""))
-        if not visible_items:
-            self._update_status("no spectra are available")
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra first")
             return
 
-        dialog = MetadataColumnDialog(self.root, len(visible_items))
+        dialog = MetadataColumnDialog(self.root, len(selected_rows))
         self.root.wait_window(dialog)
         if dialog.result is None:
             return
         column_name, values = dialog.result
+        if len(values) != len(selected_rows):
+            messagebox.showerror(
+                "Wrong number of values",
+                f"Paste exactly {len(selected_rows)} values.",
+                parent=self.root,
+            )
+            return
 
         reserved_names = {
             "source_file",
@@ -7758,8 +8268,30 @@ class EISApplication:
             )
             return
 
-        for item, value in zip(visible_items, values):
-            _dataset_id, loaded, spectrum = self._explorer_rows[item]
+        for loaded in self.loaded_projects.values():
+            if column_name not in loaded.dataframe.columns:
+                loaded.dataframe[column_name] = np.full(
+                    len(loaded.dataframe), None, dtype=object
+                )
+            for spectrum in loaded.spectra:
+                spectrum.custom_metadata.setdefault(column_name, None)
+                cycle = loaded.state.cycles.get(spectrum.cycle)
+                if cycle is None:
+                    cycle = load_cycle(
+                        loaded.dataframe,
+                        spectrum.cycle,
+                        loaded.state.control,
+                    )
+                    if loaded.state.all_frequency_window is not None:
+                        cycle.frequency_window = loaded.state.all_frequency_window
+                    cycle.circuit = loaded.state.circuit
+                    loaded.state.cycles[spectrum.cycle] = cycle
+                cycle.custom_metadata.setdefault(column_name, None)
+
+        if column_name not in self._custom_metadata_columns:
+            self._custom_metadata_columns.append(column_name)
+
+        for (_dataset_id, loaded, spectrum), value in zip(selected_rows, values):
             cycle = loaded.state.cycles.get(spectrum.cycle)
             if cycle is None:
                 cycle = load_cycle(
@@ -8670,7 +9202,10 @@ class EISApplication:
                     restored.available_cycles,
                     restored.control,
                     {
-                        cycle_number: cycle.custom_metadata
+                        cycle_number: {
+                            **cycle.custom_metadata,
+                            "time_s": cycle.time_s,
+                        }
                         for cycle_number, cycle in restored.cycles.items()
                     },
                 )
@@ -8703,7 +9238,10 @@ class EISApplication:
             restored.available_cycles,
             restored.control,
             {
-                cycle_number: cycle.custom_metadata
+                cycle_number: {
+                    **cycle.custom_metadata,
+                    "time_s": cycle.time_s,
+                }
                 for cycle_number, cycle in restored.cycles.items()
             },
         )

@@ -51,6 +51,7 @@ class CycleState:
     impedance: np.ndarray
     potential_v: float = 0.0
     current_ma: float = 0.0
+    time_s: float | None = None
     manually_included: np.ndarray | None = None
     outliers: np.ndarray | None = None
     frequency_window: tuple[float, float] | None = None
