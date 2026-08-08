@@ -191,6 +191,7 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
         "frequency_window": (
             list(cycle.frequency_window) if cycle.frequency_window is not None else None
         ),
+        "auto_max_frequency": bool(cycle.auto_max_frequency),
         "manually_included": cycle.manually_included.astype(bool).tolist(),
         "outliers": cycle.outliers.astype(bool).tolist(),
         "parameters": [_parameter_to_dict(value) for value in cycle.parameters],
@@ -373,6 +374,7 @@ def load_project_file(
         cycle.frequency_window = (
             (float(window[0]), float(window[1])) if window is not None else None
         )
+        cycle.auto_max_frequency = bool(saved.get("auto_max_frequency", False))
         cycle.parameters = [
             _parameter_from_dict(value) for value in saved.get("parameters", [])
         ] or [

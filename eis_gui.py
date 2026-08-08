@@ -519,6 +519,9 @@ class EISApplication:
         self.hide_legends_var = tk.BooleanVar(value=False)
         self.minimum_frequency_var = tk.StringVar()
         self.maximum_frequency_var = tk.StringVar()
+        self.auto_max_frequency_var = tk.BooleanVar(value=False)
+        self._frequency_control_guard = False
+        self._frequency_apply_after_id = None
         self.cycle_var = tk.StringVar(value=str(cycle))
         self.status_var = tk.StringVar(value="Opening application…")
 
@@ -3233,34 +3236,41 @@ class EISApplication:
         options_group.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         options_group.columnconfigure(1, weight=1)
         options_group.columnconfigure(3, weight=1)
+        options_group.columnconfigure(4, weight=1)
         ttk.Label(options_group, text="Min. freq.").grid(
             row=0, column=0, sticky="w"
         )
-        ttk.Entry(options_group, textvariable=self.minimum_frequency_var).grid(
+        minimum_frequency_entry = ttk.Entry(
+            options_group, textvariable=self.minimum_frequency_var
+        )
+        minimum_frequency_entry.grid(
             row=0, column=1, padx=(8, 0), pady=2, sticky="ew"
         )
         ttk.Label(options_group, text="Max. freq.").grid(
             row=0, column=2, padx=(12, 0), sticky="w"
         )
-        ttk.Entry(options_group, textvariable=self.maximum_frequency_var).grid(
+        self.maximum_frequency_entry = ttk.Entry(
+            options_group, textvariable=self.maximum_frequency_var
+        )
+        self.maximum_frequency_entry.grid(
             row=0, column=3, padx=(8, 0), pady=2, sticky="ew"
         )
-        self.frequency_button = ttk.Button(
+        ttk.Checkbutton(
             options_group,
-            text="Apply to current cycle",
-            command=self.apply_frequency_window,
-        )
-        self.frequency_button.grid(
-            row=1, column=0, padx=(0, 4), pady=(6, 0), sticky="ew"
-        )
+            text="Auto",
+            variable=self.auto_max_frequency_var,
+            command=self._toggle_auto_max_frequency,
+        ).grid(row=0, column=4, padx=(8, 0), pady=2, sticky="w")
         self.frequency_selected_button = ttk.Button(
             options_group,
             text="Apply to selected spectra",
             command=self.apply_frequency_window_to_selected,
         )
         self.frequency_selected_button.grid(
-            row=1, column=1, columnspan=3, padx=(4, 0), pady=(6, 0), sticky="ew"
+            row=1, column=0, columnspan=5, padx=0, pady=(6, 0), sticky="ew"
         )
+        self.minimum_frequency_var.trace_add("write", self._schedule_frequency_application)
+        self.maximum_frequency_var.trace_add("write", self._schedule_frequency_application)
         ttk.Label(options_group, text="Outlier threshold").grid(
             row=2, column=0, pady=(8, 2), sticky="w"
         )
@@ -3477,7 +3487,6 @@ class EISApplication:
             self.plot_fit_parameters_button,
             self.plot_drt_parameters_button,
             self.edit_metadata_button,
-            self.frequency_button,
             self.frequency_selected_button,
             self.model_button,
             self.model_selected_button,
@@ -3936,15 +3945,184 @@ class EISApplication:
             for label in self._export_menu_actions:
                 self.export_menu.entryconfigure(label, state=menu_state)
 
+    @staticmethod
+    def _automatic_max_frequency(cycle) -> float | None:
+        frequency = np.asarray(cycle.frequency_hz, dtype=float).reshape(-1)
+        impedance = np.asarray(cycle.impedance, dtype=complex).reshape(-1)
+        valid = (
+            np.isfinite(frequency)
+            & (frequency > 0)
+            & np.isfinite(impedance.real)
+            & np.isfinite(impedance.imag)
+        )
+        if np.count_nonzero(valid) < 7:
+            return None
+        order = np.argsort(frequency[valid])[::-1]
+        frequencies = frequency[valid][order]
+        impedance = impedance[valid][order]
+        real = impedance.real
+        negative_imaginary = -impedance.imag
+
+        def rolling_median(values: np.ndarray, width: int) -> np.ndarray:
+            half_width = width // 2
+            return np.asarray(
+                [
+                    np.median(values[max(0, index - half_width): index + half_width + 1])
+                    for index in range(values.size)
+                ],
+                dtype=float,
+            )
+
+        window = min(5, frequencies.size if frequencies.size % 2 else frequencies.size - 1)
+        smoothed_real = rolling_median(real, window)
+        smoothed_negative_imaginary = rolling_median(negative_imaginary, window)
+        smoothed_real = rolling_median(smoothed_real, 3)
+        smoothed_negative_imaginary = rolling_median(smoothed_negative_imaginary, 3)
+        delta_real = np.diff(real)
+        delta_smoothed_real = np.diff(smoothed_real)
+        delta_smoothed_negative_imaginary = np.diff(smoothed_negative_imaginary)
+        noise_count = max(5, min(12, delta_smoothed_real.size))
+        scale_y = max(
+            float(np.ptp(smoothed_negative_imaginary[:noise_count + 1])),
+            np.finfo(float).eps,
+        )
+        y_noise = np.diff(smoothed_negative_imaginary)[:noise_count]
+        y_mad = float(np.median(np.abs(y_noise - np.median(y_noise))))
+        upward_limit = max(0.01 * scale_y, 1.5 * 1.4826 * y_mad)
+        angles = np.arctan2(
+            delta_smoothed_negative_imaginary,
+            np.abs(delta_smoothed_real) + np.finfo(float).eps,
+        )
+        angles = rolling_median(angles, 3)
+        x_changes = delta_smoothed_real
+        x_scale = max(float(np.ptp(smoothed_real)), np.finfo(float).eps)
+        x_noise = x_changes[:noise_count]
+        x_tolerance = max(
+            0.02 * float(np.median(np.abs(x_noise))),
+            1e-6 * x_scale,
+        )
+        search_limit = max(5, int(np.ceil(0.35 * angles.size)))
+        for index in range(1, min(search_limit, angles.size)):
+            turned_right = (
+                x_changes[index - 1] < -x_tolerance
+                and x_changes[index] >= -x_tolerance
+            )
+            if not turned_right or delta_smoothed_negative_imaginary[index] <= upward_limit:
+                continue
+            if index >= 1 and delta_real[index - 1] < 0 and delta_real[index] < 0:
+                continue
+            return float(frequencies[index + 1])
+        candidates = [
+            index
+            for index in range(min(search_limit, angles.size))
+            if delta_smoothed_negative_imaginary[index] > upward_limit
+            and np.isfinite(angles[index])
+        ]
+        for index in sorted(candidates, key=lambda candidate: angles[candidate], reverse=True):
+            if index >= 1 and delta_real[index - 1] < 0 and delta_real[index] < 0:
+                continue
+            return float(frequencies[index + 1])
+        return float(frequencies[0])
+
+    def _update_automatic_max_frequency(self, *, apply: bool = False) -> float | None:
+        if not self.auto_max_frequency_var.get() or self.state is None:
+            return None
+        maximum = self._automatic_max_frequency(self.state.active)
+        if maximum is None:
+            return None
+        try:
+            minimum = float(self.minimum_frequency_var.get())
+        except ValueError:
+            minimum = float(np.nanmin(self.state.active.frequency_hz))
+        if minimum > maximum:
+            minimum = maximum
+            self._frequency_control_guard = True
+            try:
+                self.minimum_frequency_var.set(f"{minimum:g}")
+            finally:
+                self._frequency_control_guard = False
+        self._frequency_control_guard = True
+        try:
+            self.maximum_frequency_var.set(f"{maximum:g}")
+        finally:
+            self._frequency_control_guard = False
+        if apply:
+            self.state.active.frequency_window = (minimum, maximum)
+            self.state.active.invalidate_drt_cache()
+        return maximum
+
+    def _schedule_frequency_application(self, *_args) -> None:
+        if self._frequency_control_guard or self.busy or self.state is None:
+            return
+        if self._frequency_apply_after_id is not None:
+            self.root.after_cancel(self._frequency_apply_after_id)
+        self._frequency_apply_after_id = self.root.after(
+            300, self._apply_frequency_controls
+        )
+
+    def _apply_frequency_controls(self) -> None:
+        self._frequency_apply_after_id = None
+        if self._frequency_control_guard or self.busy or self.state is None:
+            return
+        try:
+            minimum = float(self.minimum_frequency_var.get())
+            maximum = float(self.maximum_frequency_var.get())
+        except ValueError:
+            return
+        if minimum > maximum:
+            return
+        if not self._capture_controls():
+            return
+        self.state.active.clear_fit()
+        self._refresh_plot(rescale=True)
+        self._update_status("frequency range applied")
+
+    def _toggle_auto_max_frequency(self) -> None:
+        self.maximum_frequency_entry.configure(
+            state=tk.DISABLED if self.auto_max_frequency_var.get() else tk.NORMAL
+        )
+        if self.state is None:
+            return
+        self.state.active.auto_max_frequency = self.auto_max_frequency_var.get()
+        if self.auto_max_frequency_var.get():
+            maximum = self._update_automatic_max_frequency(apply=True)
+        else:
+            frequency = np.asarray(self.state.active.frequency_hz, dtype=float)
+            valid = frequency[np.isfinite(frequency) & (frequency > 0)]
+            maximum = float(np.max(valid)) if valid.size else None
+            if maximum is not None:
+                self._frequency_control_guard = True
+                try:
+                    self.maximum_frequency_var.set(f"{maximum:g}")
+                finally:
+                    self._frequency_control_guard = False
+                self._apply_frequency_controls()
+        if maximum is None:
+            self._update_status("no valid measured frequency is available")
+            return
+        self._refresh_plot(rescale=True)
+        self._update_status(
+            f"{'automatic' if self.auto_max_frequency_var.get() else 'manual'} maximum frequency set to {maximum:g} Hz"
+        )
+
     def _restore_controls(self) -> None:
         if self.state is None:
             return
         cycle = self.state.active
         self.parameter_table.set_parameters(self.state.parameters_for(cycle.cycle))
         self.model_var.set(cycle.model(self.state.circuit))
-        if cycle.frequency_window is not None:
-            self.minimum_frequency_var.set(f"{cycle.frequency_window[0]:g}")
-            self.maximum_frequency_var.set(f"{cycle.frequency_window[1]:g}")
+        self.auto_max_frequency_var.set(bool(cycle.auto_max_frequency))
+        self.maximum_frequency_entry.configure(
+            state=tk.DISABLED if self.auto_max_frequency_var.get() else tk.NORMAL
+        )
+        self._frequency_control_guard = True
+        try:
+            if cycle.frequency_window is not None:
+                self.minimum_frequency_var.set(f"{cycle.frequency_window[0]:g}")
+                self.maximum_frequency_var.set(f"{cycle.frequency_window[1]:g}")
+            self._update_automatic_max_frequency(apply=self.auto_max_frequency_var.get())
+        finally:
+            self._frequency_control_guard = False
 
     @staticmethod
     def _clamp_parameter_value(value, lower, upper):
@@ -3992,6 +4170,8 @@ class EISApplication:
         self._clamp_state_parameter_values()
         if self.state is None:
             return False
+        self.state.active.auto_max_frequency = self.auto_max_frequency_var.get()
+        self._update_automatic_max_frequency()
         try:
             parameters = self.parameter_table.values()
             minimum = float(self.minimum_frequency_var.get())
@@ -6323,10 +6503,20 @@ class EISApplication:
             return
         window = self.state.active.frequency_window
         assert window is not None
+        minimum, maximum = window
         updated = 0
         for _dataset_id, loaded, spectrum in selected_rows:
             cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
-            cycle.frequency_window = window
+            cycle.auto_max_frequency = self.auto_max_frequency_var.get()
+            selected_window = window
+            if self.auto_max_frequency_var.get():
+                detected_maximum = self._automatic_max_frequency(cycle)
+                if detected_maximum is not None:
+                    selected_window = (
+                        min(minimum, detected_maximum),
+                        detected_maximum,
+                    )
+            cycle.frequency_window = selected_window
             cycle.invalidate_drt_cache()
             cycle.clear_fit()
             updated += 1

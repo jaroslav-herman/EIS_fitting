@@ -55,6 +55,7 @@ class CycleState:
     manually_included: np.ndarray | None = None
     outliers: np.ndarray | None = None
     frequency_window: tuple[float, float] | None = None
+    auto_max_frequency: bool = False
     parameters: list[ParameterValue] = field(default_factory=list)
     fit_parameters: np.ndarray | None = None
     fit_frequency_hz: np.ndarray | None = None
