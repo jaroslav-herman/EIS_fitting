@@ -506,6 +506,7 @@ class EISApplication:
         self._drt_aux_parameter_limits = {}
         self._plot_imports = None
         self.plot_mode = "nyquist"
+        self.procedure_blocks: dict[str, list[dict[str, str]]] = {}
 
         self.threshold_var = tk.StringVar(value=f"{threshold:g}")
         self.model_var = tk.StringVar(value=circuit)
@@ -677,6 +678,12 @@ class EISApplication:
             command=lambda: self.batch_fit_explorer(-1, to_metadata_value=True),
         )
         menu_bar.add_cascade(label="Fit", menu=self.fit_menu)
+        self.procedure_menu = tk.Menu(menu_bar, tearoff=False)
+        self.procedure_menu.add_command(
+            label="Procedure builder…",
+            command=self.open_procedure_builder,
+        )
+        menu_bar.add_cascade(label="Procedures", menu=self.procedure_menu)
         self.export_menu = tk.Menu(menu_bar, tearoff=False)
         self.export_menu.add_command(
             label="Export fit parameters - all spectra…",
@@ -2211,6 +2218,562 @@ class EISApplication:
         finally:
             self.export_menu.grab_release()
         return "break"
+
+    def open_procedure_builder(self) -> None:
+        existing = getattr(self, "procedure_builder_popup", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+        popup = tk.Toplevel(self.root)
+        self.procedure_builder_popup = popup
+        popup.title("Procedure builder")
+        popup.geometry("760x560")
+        popup.minsize(640, 440)
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(3, weight=1)
+
+        def close_popup() -> None:
+            self.procedure_builder_popup = None
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        steps: list[dict[str, str]] = []
+        action_names = [
+            "Select spectra by metadata",
+            "Sort spectra by metadata",
+            "Set frequency limits for selected",
+            "Find outliers in selected",
+            "Choose EEC model",
+            "Go to spectrum…",
+            "Initial values",
+            "Fit current spectrum",
+            "Batch fit selected up",
+        ]
+        action_help = {
+            "Select spectra by metadata": "column=value, e.g. cycle=14",
+            "Sort spectra by metadata": "column, e.g. time",
+            "Set frequency limits for selected": "minimum,maximum",
+            "Find outliers in selected": "threshold (blank uses current value)",
+            "Choose EEC model": "circuit, e.g. R0-L0-p(R1,CPE1)",
+            "Go to spectrum…": "position in selected spectra: first, middle, last, or a number",
+        }
+        top = ttk.Frame(popup, padding=10)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(1, weight=1)
+        ttk.Label(top, text="Procedure name").grid(row=0, column=0, sticky="w")
+        name_var = tk.StringVar(value="Procedure 1")
+        ttk.Entry(top, textvariable=name_var).grid(row=0, column=1, padx=8, sticky="ew")
+        block_var = tk.StringVar()
+        block_box = ttk.Combobox(top, textvariable=block_var, state="readonly", width=22)
+        block_box.grid(row=0, column=2, sticky="e")
+
+        add_frame = ttk.LabelFrame(popup, text="Add action", padding=8)
+        add_frame.grid(row=1, column=0, padx=10, sticky="ew")
+        add_frame.columnconfigure(1, weight=1)
+        action_var = tk.StringVar(value=action_names[0])
+        action_box = ttk.Combobox(
+            add_frame, textvariable=action_var, values=action_names, state="readonly"
+        )
+        action_box.grid(row=0, column=0, padx=(0, 8), sticky="ew")
+        parameter_var = tk.StringVar()
+        parameter_controls = ttk.Frame(add_frame)
+        parameter_controls.grid(row=0, column=1, sticky="ew")
+        parameter_controls.columnconfigure(0, weight=1)
+        parameter_controls.columnconfigure(1, weight=1)
+        parameter_controls.columnconfigure(2, weight=1)
+        parameter_entry = ttk.Combobox(
+            parameter_controls, textvariable=parameter_var, state="normal"
+        )
+        parameter_entry.grid(row=0, column=0, columnspan=3, sticky="ew")
+        select_column_var = tk.StringVar(value="All")
+        select_operator_var = tk.StringVar(value="=")
+        select_value_var = tk.StringVar()
+
+        def configure_parameter_input(action: str) -> None:
+            for child in parameter_controls.winfo_children():
+                child.grid_remove()
+            if action == "Select spectra by metadata":
+                ttk.Combobox(
+                    parameter_controls,
+                    textvariable=select_column_var,
+                    values=[
+                        "All",
+                        *[
+                            self._explorer_headings.get(column, column)
+                            for column in self._explorer_columns()
+                        ],
+                    ],
+                    state="readonly",
+                ).grid(row=0, column=0, padx=(0, 3), sticky="ew")
+                ttk.Combobox(
+                    parameter_controls,
+                    textvariable=select_operator_var,
+                    values=("=", "<", ">", "<=", ">="),
+                    state="readonly",
+                    width=4,
+                ).grid(row=0, column=1, padx=3, sticky="ew")
+                ttk.Entry(parameter_controls, textvariable=select_value_var).grid(
+                    row=0, column=2, padx=(3, 0), sticky="ew"
+                )
+            else:
+                parameter_entry.grid(row=0, column=0, columnspan=3, sticky="ew")
+
+        def action_parameter() -> str:
+            if action_var.get() == "Select spectra by metadata":
+                return self._serialize_procedure_selection(
+                    select_column_var.get(), select_operator_var.get(), select_value_var.get()
+                )
+            return parameter_var.get().strip()
+
+        configure_parameter_input(action_var.get())
+        help_var = tk.StringVar(value=action_help.get(action_names[0], ""))
+        ttk.Label(add_frame, textvariable=help_var, width=38).grid(
+            row=0, column=2, padx=(8, 0), sticky="w"
+        )
+
+        arguments_frame = ttk.LabelFrame(popup, text="Procedure arguments (edit directly)", padding=8)
+        arguments_frame.grid(row=2, column=0, padx=10, pady=(8, 0), sticky="ew")
+
+        list_frame = ttk.LabelFrame(popup, text="Actions in procedure", padding=8)
+        list_frame.grid(row=3, column=0, padx=10, pady=(8, 0), sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        action_list = tk.Listbox(list_frame, activestyle="dotbox", exportselection=False)
+        action_list.grid(row=0, column=0, sticky="nsew")
+        list_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=action_list.yview)
+        list_scroll.grid(row=0, column=1, sticky="ns")
+        action_list.configure(yscrollcommand=list_scroll.set)
+
+        def render_steps() -> None:
+            action_list.delete(0, tk.END)
+            for child in arguments_frame.winfo_children():
+                child.destroy()
+            for index, step in enumerate(steps, 1):
+                parameter = step["parameter"]
+                suffix = f"  [{parameter}]" if parameter else ""
+                action_list.insert(tk.END, f"{index}. {step['action']}{suffix}")
+                arguments_frame.columnconfigure(index - 1, weight=1)
+                ttk.Label(
+                    arguments_frame,
+                    text=f"{index}. {step['action']}",
+                    wraplength=150,
+                    justify=tk.LEFT,
+                ).grid(row=0, column=index - 1, padx=4, sticky="w")
+                argument_var = tk.StringVar(value=parameter)
+
+                def update_argument(*_args, selected=index - 1, variable=argument_var) -> None:
+                    if selected < len(steps):
+                        steps[selected]["parameter"] = variable.get().strip()
+
+                argument_var.trace_add("write", update_argument)
+                if step["action"] == "Select spectra by metadata":
+                    column_text, operator, value = self._parse_procedure_selection(parameter)
+                    selection_frame = ttk.Frame(arguments_frame)
+                    selection_frame.columnconfigure(0, weight=1)
+                    selection_frame.columnconfigure(2, weight=1)
+                    selection_column_var = tk.StringVar(value=column_text)
+                    selection_operator_var = tk.StringVar(value=operator)
+                    selection_value_var = tk.StringVar(value=value)
+                    ttk.Combobox(
+                        selection_frame,
+                        textvariable=selection_column_var,
+                        values=[
+                            "All",
+                            *[
+                                self._explorer_headings.get(column, column)
+                                for column in self._explorer_columns()
+                            ],
+                        ],
+                        state="readonly",
+                    ).grid(row=0, column=0, padx=(0, 2), sticky="ew")
+                    ttk.Combobox(
+                        selection_frame,
+                        textvariable=selection_operator_var,
+                        values=("=", "<", ">", "<=", ">="),
+                        state="readonly",
+                        width=4,
+                    ).grid(row=0, column=1, padx=2, sticky="ew")
+                    ttk.Entry(selection_frame, textvariable=selection_value_var).grid(
+                        row=0, column=2, padx=(2, 0), sticky="ew"
+                    )
+
+                    def update_selection_argument(*_args, selected=index - 1) -> None:
+                        if selected < len(steps):
+                            steps[selected]["parameter"] = self._serialize_procedure_selection(
+                                selection_column_var.get(),
+                                selection_operator_var.get(),
+                                selection_value_var.get(),
+                            )
+
+                    for variable in (
+                        selection_column_var,
+                        selection_operator_var,
+                        selection_value_var,
+                    ):
+                        variable.trace_add("write", update_selection_argument)
+                    argument_entry = selection_frame
+                elif step["action"] == "Choose EEC model":
+                    argument_entry = ttk.Combobox(
+                        arguments_frame,
+                        textvariable=argument_var,
+                        values=MODEL_PRESETS,
+                        state="normal",
+                        width=18,
+                    )
+                elif step["action"] == "Go to spectrum…":
+                    selected_count = len(self.explorer.selection())
+                    choices = ["first", "middle", "last"]
+                    choices.extend(str(position) for position in range(1, selected_count + 1))
+                    argument_entry = ttk.Combobox(
+                        arguments_frame,
+                        textvariable=argument_var,
+                        values=choices,
+                        state="normal",
+                        width=18,
+                    )
+                else:
+                    argument_entry = ttk.Entry(arguments_frame, textvariable=argument_var, width=18)
+                if step["action"] == "Sort spectra by metadata":
+                    argument_entry.destroy()
+                    argument_entry = ttk.Combobox(
+                        arguments_frame,
+                        textvariable=argument_var,
+                        values=[
+                            self._explorer_headings.get(column, column)
+                            for column in self._explorer_columns()
+                        ],
+                        state="normal",
+                        width=18,
+                    )
+                argument_entry.grid(row=1, column=index - 1, padx=4, pady=(3, 0), sticky="ew")
+                argument_entry.bind("<FocusOut>", lambda _event: render_steps())
+
+        def selected_index() -> int | None:
+            selection = action_list.curselection()
+            return int(selection[0]) if selection else None
+
+        def add_step() -> None:
+            steps.append({"action": action_var.get(), "parameter": action_parameter()})
+            render_steps()
+            action_list.selection_clear(0, tk.END)
+            action_list.selection_set(tk.END)
+
+        def remove_step() -> None:
+            index = selected_index()
+            if index is not None:
+                steps.pop(index)
+                render_steps()
+
+        def move_step(direction: int) -> None:
+            index = selected_index()
+            target = index + direction if index is not None else None
+            if index is None or target is None or not 0 <= target < len(steps):
+                return
+            steps[index], steps[target] = steps[target], steps[index]
+            render_steps()
+            action_list.selection_set(target)
+
+        def new_block() -> None:
+            steps.clear()
+            name_var.set(f"Procedure {len(self.procedure_blocks) + 1}")
+            render_steps()
+
+        def save_block() -> None:
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showerror("Missing name", "Enter a procedure name.", parent=popup)
+                return
+            self.procedure_blocks[name] = copy.deepcopy(steps)
+            block_box.configure(values=sorted(self.procedure_blocks))
+            block_var.set(name)
+            self._update_status(f"procedure '{name}' saved in this session")
+
+        def save_to_file() -> None:
+            name = name_var.get().strip()
+            if name:
+                self.procedure_blocks[name] = copy.deepcopy(steps)
+            if not self.procedure_blocks:
+                messagebox.showwarning("No procedures", "Add and save a procedure first.", parent=popup)
+                return
+            path = filedialog.asksaveasfilename(
+                parent=popup,
+                title="Save procedures",
+                defaultextension=".eisproc",
+                filetypes=[("EIS procedures", "*.eisproc"), ("JSON files", "*.json")],
+            )
+            if not path:
+                return
+            payload = {
+                "format": "eisfit-procedures-v1",
+                "procedures": self.procedure_blocks,
+                "active": name,
+            }
+            try:
+                Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            except OSError as error:
+                messagebox.showerror("Save procedures failed", str(error), parent=popup)
+                return
+            block_box.configure(values=sorted(self.procedure_blocks))
+            self._update_status(f"procedures saved to {Path(path).name}")
+
+        def load_from_file() -> None:
+            path = filedialog.askopenfilename(
+                parent=popup,
+                title="Load procedures",
+                filetypes=[("EIS procedures", "*.eisproc"), ("JSON files", "*.json")],
+            )
+            if not path:
+                return
+            try:
+                payload = json.loads(Path(path).read_text(encoding="utf-8"))
+                loaded_blocks = payload.get("procedures")
+                if not isinstance(loaded_blocks, dict):
+                    raise ValueError("the file does not contain procedure blocks")
+                validated: dict[str, list[dict[str, str]]] = {}
+                for block_name, block_steps in loaded_blocks.items():
+                    if not isinstance(block_name, str) or not isinstance(block_steps, list):
+                        raise ValueError("invalid procedure block")
+                    validated_steps = []
+                    for step in block_steps:
+                        if not isinstance(step, dict) or not isinstance(step.get("action"), str):
+                            raise ValueError("invalid procedure action")
+                        validated_steps.append(
+                            {"action": step["action"], "parameter": str(step.get("parameter", ""))}
+                        )
+                    validated[block_name] = validated_steps
+            except (OSError, json.JSONDecodeError, ValueError) as error:
+                messagebox.showerror("Load procedures failed", str(error), parent=popup)
+                return
+            self.procedure_blocks = validated
+            block_box.configure(values=sorted(self.procedure_blocks))
+            active_name = payload.get("active")
+            if active_name not in self.procedure_blocks:
+                active_name = next(iter(self.procedure_blocks), None)
+            if active_name is not None:
+                block_var.set(active_name)
+                load_block()
+            self._update_status(f"procedures loaded from {Path(path).name}")
+
+        def load_block(_event=None) -> None:
+            name = block_var.get()
+            if name not in self.procedure_blocks:
+                return
+            steps[:] = copy.deepcopy(self.procedure_blocks[name])
+            name_var.set(name)
+            render_steps()
+
+        def run_block() -> None:
+            if not steps:
+                messagebox.showwarning("Empty procedure", "Add at least one action.", parent=popup)
+                return
+            if self.busy:
+                self._update_status("wait for the current operation to finish")
+                return
+            self._procedure_running = True
+            self._run_procedure_steps(copy.deepcopy(steps), 0)
+
+        def update_parameter_choices(_event=None) -> None:
+            configure_parameter_input(action_var.get())
+            if action_var.get() == "Go to spectrum…":
+                selected_count = len(self.explorer.selection())
+                choices = ["first", "middle", "last"]
+                choices.extend(str(index) for index in range(1, selected_count + 1))
+                parameter_entry.configure(values=choices)
+            elif action_var.get() == "Choose EEC model":
+                parameter_entry.configure(values=MODEL_PRESETS)
+            elif action_var.get() == "Sort spectra by metadata":
+                parameter_entry.configure(
+                    values=[
+                        self._explorer_headings.get(column, column)
+                        for column in self._explorer_columns()
+                    ]
+                )
+            else:
+                parameter_entry.configure(values=())
+
+        action_box.bind(
+            "<<ComboboxSelected>>",
+            lambda event: (
+                help_var.set(action_help.get(action_var.get(), "")),
+                update_parameter_choices(event),
+            ),
+        )
+        block_box.bind("<<ComboboxSelected>>", load_block)
+        ttk.Button(add_frame, text="Add", command=add_step).grid(
+            row=0, column=3, padx=(8, 0), sticky="e"
+        )
+        buttons = ttk.Frame(popup, padding=10)
+        buttons.grid(row=4, column=0, sticky="ew")
+        ttk.Button(buttons, text="Remove", command=remove_step).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Move up", command=lambda: move_step(-1)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="Move down", command=lambda: move_step(1)).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="New", command=new_block).pack(side=tk.LEFT, padx=(18, 4))
+        ttk.Button(buttons, text="Save block", command=save_block).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Save to file", command=save_to_file).pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="Load from file", command=load_from_file).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Run block", command=run_block).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Close", command=close_popup).pack(side=tk.RIGHT, padx=4)
+
+    def _procedure_column(self, value: str) -> str:
+        candidate = value.strip()
+        if candidate in self._explorer_columns():
+            return candidate
+        lowered = candidate.casefold()
+        for column, heading in self._explorer_headings.items():
+            if heading.casefold() == lowered:
+                return column
+        raise ValueError(f"unknown explorer column: {candidate}")
+
+    @staticmethod
+    def _serialize_procedure_selection(column: str, operator: str, value: str) -> str:
+        return f"{column}|{operator}|{value}"
+
+    @staticmethod
+    def _parse_procedure_selection(parameter: str) -> tuple[str, str, str]:
+        if "|" in parameter:
+            column, operator, value = parameter.split("|", 2)
+            return column.strip(), operator.strip(), value.strip()
+        column, separator, value = parameter.partition("=")
+        if separator:
+            return column.strip(), "=", value.strip()
+        return "All", "=", ""
+
+    @staticmethod
+    def _compare_procedure_value(actual, operator: str, expected: str, column: str) -> bool:
+        if operator == "=":
+            return (
+                EISApplication._format_explorer_value(actual, column) == expected
+                or str(actual) == expected
+            )
+        try:
+            actual_number = float(actual)
+            expected_number = float(expected)
+        except (TypeError, ValueError):
+            actual_text = str(actual)
+            expected_text = expected
+            comparisons = {
+                "<": actual_text < expected_text,
+                ">": actual_text > expected_text,
+                "<=": actual_text <= expected_text,
+                ">=": actual_text >= expected_text,
+            }
+        else:
+            comparisons = {
+                "<": actual_number < expected_number,
+                ">": actual_number > expected_number,
+                "<=": actual_number <= expected_number,
+                ">=": actual_number >= expected_number,
+            }
+        return comparisons.get(operator, False)
+
+    def _execute_procedure_step(self, step: dict[str, str]) -> None:
+        action = step["action"]
+        parameter = step["parameter"]
+        if action == "Select spectra by metadata":
+            column_text, operator, target = self._parse_procedure_selection(parameter)
+            if column_text.casefold() == "all":
+                self._set_explorer_selection(list(self._explorer_rows))
+                return
+            column = self._procedure_column(column_text)
+            matching = []
+            for item, (_dataset_id, loaded, spectrum) in self._explorer_rows.items():
+                value = self._explorer_value(loaded, spectrum, column)
+                if self._compare_procedure_value(value, operator, target, column):
+                    matching.append(item)
+            self._set_explorer_selection(matching)
+            if matching:
+                self._activate_explorer_item(matching[0])
+            return
+        if action == "Sort spectra by metadata":
+            self._sort_explorer(self._procedure_column(parameter))
+            return
+        if action == "Set frequency limits for selected":
+            values = [part.strip() for part in parameter.split(",")]
+            if len(values) != 2:
+                raise ValueError("frequency limits require minimum,maximum")
+            self.minimum_frequency_var.set(values[0])
+            self.maximum_frequency_var.set(values[1])
+            if not self._capture_controls():
+                raise ValueError("frequency limits are invalid")
+            self.apply_frequency_window_to_selected()
+            return
+        if action == "Find outliers in selected":
+            if parameter:
+                self.threshold_var.set(parameter)
+            self.find_outliers_for_selected()
+            return
+        if action == "Choose EEC model":
+            self.analysis_mode_var.set("EEC")
+            self._on_analysis_mode_selected()
+            self.model_var.set(parameter)
+            if self.explorer.selection():
+                self.apply_model_to_selected()
+            else:
+                self.apply_model()
+            return
+        if action == "Go to spectrum…":
+            items = list(self.explorer.get_children(""))
+            selected = set(self.explorer.selection())
+            candidates = [item for item in items if item in selected]
+            if not candidates:
+                raise ValueError("select spectra in the explorer first")
+            choice = parameter.casefold()
+            if choice == "first":
+                target_index = 0
+            elif choice == "last":
+                target_index = len(candidates) - 1
+            elif choice == "middle":
+                target_index = (len(candidates) - 1) // 2
+            else:
+                try:
+                    target_index = int(parameter) - 1
+                except ValueError as error:
+                    raise ValueError("use first, middle, last, or a spectrum number") from error
+                if not 0 <= target_index < len(candidates):
+                    raise ValueError(f"spectrum number must be between 1 and {len(candidates)}")
+            target = candidates[target_index]
+            self.explorer.focus(target)
+            self.explorer.see(target)
+            self._explorer_primary_item = target
+            self._activate_explorer_item(target)
+            return
+        if action == "Initial values":
+            self.initialize_from_ridge()
+            return
+        if action == "Fit current spectrum":
+            self.fit()
+            return
+        if action == "Batch fit selected up":
+            self.batch_fit_selected_down(-1)
+            return
+        raise ValueError(f"unknown procedure action: {action}")
+
+    def _run_procedure_steps(self, steps: list[dict[str, str]], index: int) -> None:
+        if index >= len(steps):
+            self._procedure_running = False
+            self._update_status("procedure completed")
+            return
+        try:
+            self._execute_procedure_step(steps[index])
+        except Exception as error:
+            self._procedure_running = False
+            messagebox.showerror("Procedure failed", str(error), parent=self.root)
+            return
+        if self.busy:
+            self.root.after(100, lambda: self._continue_procedure_steps(steps, index + 1))
+        else:
+            self.root.after(0, lambda: self._run_procedure_steps(steps, index + 1))
+
+    def _continue_procedure_steps(self, steps: list[dict[str, str]], index: int) -> None:
+        if self.busy:
+            self.root.after(100, lambda: self._continue_procedure_steps(steps, index))
+            return
+        if getattr(self, "_fit_cancel_requested", False):
+            self._procedure_running = False
+            self._update_status("procedure stopped")
+            return
+        self._run_procedure_steps(steps, index)
 
     def _on_alt_a(self, event):
         if self.analysis_mode_var.get() == "DRT":
