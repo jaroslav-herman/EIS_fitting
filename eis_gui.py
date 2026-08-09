@@ -37,6 +37,7 @@ from eis_project import (
     save_project_file,
 )
 from eis_services import (
+    AutomaticEECModel,
     BatchFitReport,
     DRTComputation,
     KKResiduals,
@@ -62,6 +63,7 @@ from eis_services import (
     load_project_from_dataframe,
     load_project,
     load_projects,
+    select_eec_model_from_hybrid_drt,
 )
 
 MODEL_PRESETS = (
@@ -2251,7 +2253,9 @@ class EISApplication:
             "Go to spectrum…",
             "Initial values",
             "Fit current spectrum",
-            "Batch fit selected up",
+            "Fit selected",
+            "Auto model (Hybrid DRT)",
+            "Batch fit selected",
         ]
         action_help = {
             "Select spectra by metadata": "column=value, e.g. cycle=14",
@@ -2260,6 +2264,9 @@ class EISApplication:
             "Find outliers in selected": "threshold (blank uses current value)",
             "Choose EEC model": "circuit, e.g. R0-L0-p(R1,CPE1)",
             "Go to spectrum…": "position in selected spectra: first, middle, last, or a number",
+            "Fit selected": "fits selected spectra using each spectrum's model and initial parameters",
+            "Auto model (Hybrid DRT)": "selects a Hybrid DRT discrete model for selected spectra",
+            "Batch fit selected": "direction: up, down, or up and down",
         }
         top = ttk.Frame(popup, padding=10)
         top.grid(row=0, column=0, sticky="ew")
@@ -2292,6 +2299,7 @@ class EISApplication:
         select_column_var = tk.StringVar(value="All")
         select_operator_var = tk.StringVar(value="=")
         select_value_var = tk.StringVar()
+        batch_direction_var = tk.StringVar(value="up")
 
         def configure_parameter_input(action: str) -> None:
             for child in parameter_controls.winfo_children():
@@ -2319,6 +2327,13 @@ class EISApplication:
                 ttk.Entry(parameter_controls, textvariable=select_value_var).grid(
                     row=0, column=2, padx=(3, 0), sticky="ew"
                 )
+            elif action == "Batch fit selected":
+                ttk.Combobox(
+                    parameter_controls,
+                    textvariable=batch_direction_var,
+                    values=("up", "down", "up and down"),
+                    state="readonly",
+                ).grid(row=0, column=0, columnspan=3, sticky="ew")
             else:
                 parameter_entry.grid(row=0, column=0, columnspan=3, sticky="ew")
 
@@ -2327,6 +2342,8 @@ class EISApplication:
                 return self._serialize_procedure_selection(
                     select_column_var.get(), select_operator_var.get(), select_value_var.get()
                 )
+            if action_var.get() == "Batch fit selected":
+                return batch_direction_var.get()
             return parameter_var.get().strip()
 
         configure_parameter_input(action_var.get())
@@ -2433,6 +2450,18 @@ class EISApplication:
                         textvariable=argument_var,
                         values=choices,
                         state="normal",
+                        width=18,
+                    )
+                elif step["action"] == "Batch fit selected":
+                    direction = parameter.casefold().strip()
+                    if direction not in {"up", "down", "up and down"}:
+                        direction = "up"
+                    argument_var.set(direction)
+                    argument_entry = ttk.Combobox(
+                        arguments_frame,
+                        textvariable=argument_var,
+                        values=("up", "down", "up and down"),
+                        state="readonly",
                         width=18,
                     )
                 else:
@@ -2744,11 +2773,25 @@ class EISApplication:
         if action == "Initial values":
             self.initialize_from_ridge()
             return
+        if action == "Auto model (Hybrid DRT)":
+            self.auto_select_model()
+            return
         if action == "Fit current spectrum":
             self.fit()
             return
-        if action == "Batch fit selected up":
-            self.batch_fit_selected_down(-1)
+        if action == "Fit selected":
+            self.fit_selected()
+            return
+        if action == "Batch fit selected":
+            direction = parameter.casefold().strip()
+            if direction == "up":
+                self.batch_fit_selected_down(-1)
+            elif direction == "down":
+                self.batch_fit_selected_down(1)
+            elif direction == "up and down":
+                self.batch_fit_selected_up_down()
+            else:
+                raise ValueError("batch-fit direction must be up, down, or up and down")
             return
         raise ValueError(f"unknown procedure action: {action}")
 
@@ -2769,7 +2812,7 @@ class EISApplication:
             self.root.after(0, lambda: self._run_procedure_steps(steps, index + 1))
 
     def _continue_procedure_steps(self, steps: list[dict[str, str]], index: int) -> None:
-        if self.busy:
+        if self.busy or getattr(self, "_batch_fit_both_pending", False):
             self.root.after(100, lambda: self._continue_procedure_steps(steps, index))
             return
         if getattr(self, "_fit_cancel_requested", False):
@@ -3189,6 +3232,14 @@ class EISApplication:
         self.open_eec_analysis_button.grid(
             row=3, column=0, columnspan=3, pady=(6, 0), sticky="ew"
         )
+        self.auto_model_button = ttk.Button(
+            model_group,
+            text="Auto model: selected (Hybrid DRT)",
+            command=self.auto_select_model,
+        )
+        self.auto_model_button.grid(
+            row=4, column=0, columnspan=3, pady=(5, 0), sticky="ew"
+        )
 
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
         self.parameters_group = parameters_group
@@ -3495,6 +3546,7 @@ class EISApplication:
             self.switch_blocks_button,
             self.switch_blocks_selected_button,
             self.open_eec_analysis_button,
+            self.auto_model_button,
             self.open_drt_analysis_button,
             self.parameters_selected_button,
             self.apply_fix_selected_button,
@@ -6600,6 +6652,79 @@ class EISApplication:
         self._refresh_explorer_values()
         self._refresh_plot(rescale=True)
         self._update_status(f"model applied to {updated} selected spectra")
+
+    def auto_select_model(self) -> None:
+        if self.state is None or self.busy:
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        if not self._capture_controls():
+            return
+        targets = [
+            (
+                dataset_id,
+                spectrum.cycle,
+                copy.deepcopy(self._loaded_cycle_for_popup(loaded, spectrum.cycle)),
+            )
+            for dataset_id, loaded, spectrum in selected_rows
+        ]
+        self.status_var.set(
+            f"Selecting EEC models with Hybrid DRT for {len(targets)} spectra..."
+        )
+        self._submit(
+            lambda: [
+                (dataset_id, cycle_number, select_eec_model_from_hybrid_drt(cycle))
+                for dataset_id, cycle_number, cycle in targets
+            ],
+            self._finish_auto_model_selection,
+            "Automatic model selection failed",
+        )
+
+    def _finish_auto_model_selection(
+        self,
+        results: list[tuple[str, int, AutomaticEECModel]],
+    ) -> None:
+        if self.state is None:
+            return
+        current_result = None
+        updated = 0
+        for dataset_id, cycle_number, result in results:
+            loaded = self.loaded_projects.get(dataset_id)
+            if loaded is None:
+                continue
+            cycle = self._loaded_cycle_for_popup(loaded, cycle_number)
+            parameters = circuit_parameters(result.circuit)
+            for parameter in parameters:
+                if parameter.name in result.initials:
+                    parameter.initial = self._clamp_parameter_value(
+                        result.initials[parameter.name],
+                        parameter.lower,
+                        parameter.upper,
+                    )
+            cycle.circuit = result.circuit
+            cycle.parameters = parameters
+            cycle.clear_fit()
+            cycle.invalidate_drt_cache()
+            updated += 1
+            if (
+                loaded is self.loaded
+                and cycle_number == self.state.active_cycle
+            ):
+                current_result = result
+        if current_result is not None:
+            self.circuit = current_result.circuit
+            self.model_var.set(current_result.circuit)
+            self.parameter_table.set_parameters(
+                self.state.parameters_for(self.state.active_cycle)
+            )
+        self._restore_controls()
+        self._refresh_explorer_values()
+        self._refresh_plot(rescale=True)
+        self._update_status(
+            f"Hybrid DRT selected models for {updated} spectra"
+        )
 
     @staticmethod
     def _switch_parameter_blocks(state: ProjectState, cycle) -> bool:

@@ -76,6 +76,16 @@ class DRTComputation:
 
 
 @dataclass
+class AutomaticEECModel:
+    circuit: str
+    initials: dict[str, float]
+    peak_count: int
+    criterion: str
+    ohmic_resistance: float
+    inductance: float
+
+
+@dataclass
 class KKResiduals:
     fit_impedance: np.ndarray
     residual_real: np.ndarray
@@ -713,6 +723,104 @@ def calculate_hybrid_drt(state: CycleState) -> DRTComputation:
     )
 
 
+def select_eec_model_from_hybrid_drt(state: CycleState) -> AutomaticEECModel:
+    from copy import deepcopy
+
+    from hybdrt.models import DRT
+
+    active_mask = state.included
+    if int(np.count_nonzero(active_mask)) < 3:
+        raise ValueError("At least three active points are required for model selection")
+    frequency = state.frequency_hz[active_mask]
+    impedance = state.impedance[active_mask]
+    frequency, impedance = sort_spectrum(
+        as_1d_array(frequency),
+        as_1d_array(impedance),
+    )
+    drt = DRT()
+    drt.fit_eis(frequency, impedance)
+    dual = deepcopy(drt)
+    dual.dual_fit_eis(
+        frequency,
+        impedance,
+        discrete_kw=dict(
+            prior=True,
+            prior_strength=None,
+            model_init_kw=dict(drt_element="RQ"),
+        ),
+    )
+    criterion = "lml-bic"
+    candidate_id = dual.get_best_candidate_id("discrete", criterion=criterion)
+    candidate = dual.get_candidate(candidate_id, "discrete")
+    model = candidate["model"]
+    values = model.parameter_dict
+
+    def _value(*names: str) -> float | None:
+        for name in names:
+            if name in values:
+                try:
+                    value = float(values[name])
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(value):
+                    return value
+        return None
+
+    ohmic_resistance = _value("R_R0", "R_R_inf", "R_inf")
+    if ohmic_resistance is None:
+        raise ValueError("Hybrid DRT did not return an ohmic resistance")
+    log_inductance = _value("lnL_L0", "lnL_inductance")
+    direct_inductance = _value("L_L0", "L_inductance", "inductance")
+    if log_inductance is not None:
+        inductance = float(np.exp(log_inductance))
+    elif direct_inductance is not None:
+        inductance = direct_inductance
+    else:
+        inductance = 0.0
+
+    initials = {
+        "R0": max(ohmic_resistance, 0.0),
+        "L0": max(inductance, 0.0),
+    }
+    branch_count = 0
+    for element_name, element_type in zip(
+        getattr(model, "element_names", ()),
+        getattr(model, "element_types", ()),
+    ):
+        if str(element_type).upper() != "RQ":
+            continue
+        resistance = _value(f"R_{element_name}")
+        log_tau = _value(f"lntau_{element_name}")
+        exponent = _value(f"beta_{element_name}")
+        if resistance is None or log_tau is None or exponent is None:
+            continue
+        resistance = max(resistance, np.finfo(float).eps)
+        tau_s = float(np.exp(log_tau))
+        exponent = float(np.clip(exponent, 1e-3, 1.0))
+        q_value = tau_s**exponent / resistance
+        branch_count += 1
+        initials.update(
+            {
+                f"R{branch_count}": resistance,
+                f"CPE{branch_count}_0": q_value,
+                f"CPE{branch_count}_1": exponent,
+            }
+        )
+
+    elements = ["R0", "L0"]
+    elements.extend(
+        f"p(R{index},CPE{index})" for index in range(1, branch_count + 1)
+    )
+    return AutomaticEECModel(
+        circuit="-".join(elements),
+        initials=initials,
+        peak_count=branch_count,
+        criterion=criterion,
+        ohmic_resistance=float(ohmic_resistance),
+        inductance=float(inductance),
+    )
+
+
 def calculate_lin_kk_residuals(state: CycleState) -> KKResiduals:
     import impedance.validation as validation
 
@@ -955,28 +1063,32 @@ def batch_fit_spectra(
                 cycle.frequency_window = project.all_frequency_window
             cycle.circuit = project.circuit
         target_circuit = cycle.model(project.circuit)
-        if target_circuit != expected_circuit:
-            return SpectrumBatchReport(
-                completed,
-                target.label,
-                "The spectrum uses a different fitting model",
-            )
         target_parameters = project.parameters_for(target.cycle)
-        if [parameter.name for parameter in target_parameters] != expected_names:
-            return SpectrumBatchReport(
-                completed,
-                target.label,
-                "The spectrum has incompatible fitting parameters",
+        if use_target_initial_parameters:
+            fit_circuit = target_circuit
+            fit_parameters = target_parameters
+        else:
+            if target_circuit != expected_circuit:
+                return SpectrumBatchReport(
+                    completed,
+                    target.label,
+                    "The spectrum uses a different fitting model",
+                )
+            if [parameter.name for parameter in target_parameters] != expected_names:
+                return SpectrumBatchReport(
+                    completed,
+                    target.label,
+                    "The spectrum has incompatible fitting parameters",
+                )
+            fit_circuit = expected_circuit
+            fit_parameters = _batch_parameters_with_initials(
+                target_parameters,
+                next_parameters,
             )
-        fit_parameters = (
-            target_parameters
-            if use_target_initial_parameters
-            else _batch_parameters_with_initials(target_parameters, next_parameters)
-        )
         try:
             fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
                 cycle,
-                expected_circuit,
+                fit_circuit,
                 fit_parameters,
             )
         except Exception as error:
