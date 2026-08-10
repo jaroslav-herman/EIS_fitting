@@ -8125,9 +8125,11 @@ class EISApplication:
                     try:
                         numeric_value = float(value)
                     except (TypeError, ValueError):
+                        if value is not None:
+                            record[name] = value
                         continue
-                    if np.isfinite(numeric_value):
-                        record[name] = numeric_value
+                    record[name] = numeric_value if np.isfinite(numeric_value) else value
+                record.setdefault("Cycle mod 15", int(spectrum.cycle) % 15)
                 records.append(_externalize_record(record))
         return records
 
@@ -8183,12 +8185,14 @@ class EISApplication:
                         continue
                     if np.isfinite(numeric_value):
                         record[name] = numeric_value
+                record.setdefault("Cycle mod 15", int(spectrum.cycle) % 15)
                 records.append(_externalize_record(record))
         return records
 
     def open_drt_parameters_explorer(self) -> None:
         if self.busy or self.state is None:
             return
+        self._sync_custom_metadata_columns()
         existing_popup = getattr(self, "drt_parameters_popup", None)
         if existing_popup is not None and existing_popup.winfo_exists():
             existing_popup.lift()
@@ -8216,16 +8220,25 @@ class EISApplication:
             ]
 
         fields = numeric_fields()
+        manual_metadata_fields = set(self._custom_metadata_columns) | {
+            "Spectrum",
+            "Cycle mod 15",
+        }
         parameter_fields = [
             field
             for field in fields
-            if field == "R0" or field == "L0" or field.startswith("peak")
+            if field not in manual_metadata_fields
+            and (field == "R0" or field == "L0" or field.startswith("peak"))
         ]
-        split_fields = [
-            "None",
-            "Spectrum",
-            *[field for field in fields if field not in parameter_fields],
+        split_candidates = [
+            field
+            for field in dict.fromkeys(
+                key for record in records for key in record
+            )
+            if field not in {"source_file", "drt_mode"}
+            and field not in parameter_fields
         ]
+        split_fields = ["None", *dict.fromkeys(["Spectrum", *split_candidates])]
         x_default = "I_mA" if "I_mA" in fields else fields[0]
         y_default = parameter_fields[0] if parameter_fields else fields[0]
 
@@ -8386,6 +8399,7 @@ class EISApplication:
                 + [
                     split_var.get() for split_var in split_vars
                     if split_var.get() not in {"None", "Spectrum"}
+                    and split_var.get() in fields
                 ]
             ))
             for widget_list in range_widgets.values():
@@ -8442,7 +8456,7 @@ class EISApplication:
                 y_field = y_value.get()
                 split_field = split_value.get()
                 selected_fields = [x_field, y_field]
-                if split_field not in {"None", "Spectrum"}:
+                if split_field not in {"None", "Spectrum"} and split_field in fields:
                     selected_fields.append(split_field)
                 for record in records:
                     try:
@@ -8460,7 +8474,11 @@ class EISApplication:
                             groups.setdefault(group, []).append((x_value, calculated))
                     except (KeyError, TypeError, ValueError, SyntaxError, ZeroDivisionError):
                         continue
-                for group, values in sorted(groups.items(), key=lambda item: str(item[0])):
+                natural_group_key = natsort_keygen(alg=ns.IGNORECASE)
+                for group, values in sorted(
+                    groups.items(),
+                    key=lambda item: natural_group_key(str(item[0])),
+                ):
                     plotted_groups.append((f"{y_field} = {equation.get() or 'y'} ({group})", values))
             color_scale = colormaps["rainbow"]
             for index, (label, values) in enumerate(plotted_groups):
@@ -8553,6 +8571,7 @@ class EISApplication:
     def open_fit_parameters_explorer(self) -> None:
         if self.busy or self.state is None:
             return
+        self._sync_custom_metadata_columns()
         existing_popup = getattr(self, "fit_parameters_popup", None)
         if existing_popup is not None and existing_popup.winfo_exists():
             existing_popup.lift()
@@ -8574,6 +8593,13 @@ class EISApplication:
                     "potential_V": cycle.potential_v,
                     "current_mA": cycle.current_ma,
                     "time_s": cycle.time_s,
+                    "Spectrum": (
+                        spectrum.custom_metadata.get(SPECTRUM_METADATA_COLUMN)
+                        or {"working": "WE", "cell": "Cell", "counter": "CE"}.get(
+                            loaded.state.control,
+                            loaded.state.control,
+                        )
+                    ),
                     "circuit": cycle.model(loaded.state.circuit),
                 }
                 record.update(
@@ -8595,9 +8621,11 @@ class EISApplication:
                     try:
                         numeric_value = float(value)
                     except (TypeError, ValueError):
+                        if value is not None:
+                            record[name] = value
                         continue
-                    if np.isfinite(numeric_value):
-                        record[name] = numeric_value
+                    record[name] = numeric_value if np.isfinite(numeric_value) else value
+                record.setdefault("Cycle mod 15", int(spectrum.cycle) % 15)
                 records.append(_externalize_record(record))
         if not records:
             self._update_status("no fitted spectra are available")
@@ -8610,19 +8638,28 @@ class EISApplication:
             values = [record.get(field) for record in records]
             if any(isinstance(value, (int, float, np.integer, np.floating)) for value in values):
                 numeric_fields.append(field)
+        manual_metadata_fields = set(self._custom_metadata_columns) | {
+            "Spectrum",
+            "Cycle mod 15",
+        }
         parameter_fields = [
             field
             for field in numeric_fields
-            if any(
+            if field not in manual_metadata_fields
+            and any(
                 field.startswith(prefix)
                 for prefix in ("R", "Q", "a", "C", "L", "W", "tau")
             )
         ]
-        split_fields = [
-            "None",
-            "Spectrum",
-            *[field for field in numeric_fields if field not in parameter_fields],
+        split_candidates = [
+            field
+            for field in dict.fromkeys(
+                key for record in records for key in record
+            )
+            if field not in {"source_file", "circuit"}
+            and field not in parameter_fields
         ]
+        split_fields = ["None", *dict.fromkeys(["Spectrum", *split_candidates])]
         x_default = "I_mA" if "I_mA" in numeric_fields else numeric_fields[0]
         y_default = parameter_fields[0] if parameter_fields else numeric_fields[0]
 
@@ -8777,6 +8814,7 @@ class EISApplication:
                 split_var.get()
                 for split_var in split_vars
                 if split_var.get() not in {"None", "Spectrum"}
+                and split_var.get() in numeric_fields
             )
             for widget_list in range_widgets.values():
                 for widget in widget_list:
@@ -8845,7 +8883,7 @@ class EISApplication:
                 y_field = y_var.get()
                 split_field = split_var.get()
                 selected_fields = [x_field, y_field]
-                if split_field not in {"None", "Spectrum"}:
+                if split_field not in {"None", "Spectrum"} and split_field in numeric_fields:
                     selected_fields.append(split_field)
                 for record in records:
                     try:
@@ -8870,7 +8908,11 @@ class EISApplication:
                         groups.setdefault(group, []).append((x_value, y_value))
                     except Exception:
                         continue
-                for group, points in sorted(groups.items(), key=lambda item: str(item[0])):
+                natural_group_key = natsort_keygen(alg=ns.IGNORECASE)
+                for group, points in sorted(
+                    groups.items(),
+                    key=lambda item: natural_group_key(str(item[0])),
+                ):
                     points.sort(key=lambda point: point[0])
                     plotted_groups.append((f"{y_field} = {equation.get() or 'y'} ({group})", points))
             color_scale = colormaps["rainbow"]
@@ -9005,8 +9047,13 @@ class EISApplication:
                 "fmin_act_Hz",
                 "fmax_act_Hz",
             }
+            explorer_base_columns = self._explorer_base_columns()
+            if column_name.casefold() == "time":
+                explorer_base_columns = tuple(
+                    name for name in explorer_base_columns if name != "time"
+                )
             known_names = [
-                *self._explorer_base_columns(),
+                *explorer_base_columns,
                 *self._custom_metadata_columns,
                 *self._explorer_headings.values(),
                 *reserved_names,
@@ -9142,8 +9189,13 @@ class EISApplication:
             "fmin_act_Hz",
             "fmax_act_Hz",
         }
+        explorer_base_columns = self._explorer_base_columns()
+        if column_name.casefold() == "time":
+            explorer_base_columns = tuple(
+                name for name in explorer_base_columns if name != "time"
+            )
         known_names = [
-            *self._explorer_base_columns(),
+            *explorer_base_columns,
             *self._custom_metadata_columns,
             *self._explorer_headings.values(),
             *reserved_names,
