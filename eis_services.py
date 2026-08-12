@@ -194,13 +194,13 @@ def infer_initial(name: str) -> float:
 def infer_bounds(name: str) -> tuple[float, float]:
     normalized = name.lower()
     if normalized.startswith("cpe") and normalized.endswith("_1"):
-        return 0.0, 1.0
+        return 0.5, 1.0
     if normalized.startswith("r"):
         return 0.0, 1e6
     if normalized.startswith("l"):
         return 0.0, 1.0
     if normalized.startswith("cpe") and normalized.endswith("_0"):
-        return 1e-12, 1e3
+        return 1e-6, 1e3
     if normalized.startswith("c"):
         return 1e-12, 1e3
     return 0.0, 1e6

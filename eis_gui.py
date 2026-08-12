@@ -8494,8 +8494,53 @@ class EISApplication:
                     markersize=4,
                     label=label,
                 )
-            axes.set_xlabel(x_equation.get() or x_field)
-            axes.set_ylabel(" / ".join(equation.get() or y_value.get() for y_value, _split_value, equation, *_widgets in y_rows))
+            axes.relim()
+            axes.autoscale(enable=True, axis="both", tight=False)
+            axes.autoscale_view()
+            plotted_values = [
+                value for _label, values in plotted_groups for value in values
+            ]
+            if plotted_values:
+                plotted_x = np.asarray(
+                    [value[0] for value in plotted_values], dtype=float
+                )
+                plotted_y = np.asarray(
+                    [value[1] for value in plotted_values], dtype=float
+                )
+                x_min, x_max = float(np.min(plotted_x)), float(np.max(plotted_x))
+                y_min, y_max = float(np.min(plotted_y)), float(np.max(plotted_y))
+                if x_min == x_max:
+                    padding = max(abs(x_min) * 0.05, 1.0)
+                    x_min -= padding
+                    x_max += padding
+                elif x_log.get():
+                    x_min /= 1.05
+                    x_max *= 1.05
+                else:
+                    padding = 0.05 * (x_max - x_min)
+                    x_min -= padding
+                    x_max += padding
+                if y_min == y_max:
+                    padding = max(abs(y_min) * 0.05, 1.0)
+                    y_min -= padding
+                    y_max += padding
+                elif y_log.get():
+                    y_min /= 1.05
+                    y_max *= 1.05
+                else:
+                    padding = 0.05 * (y_max - y_min)
+                    y_min -= padding
+                    y_max += padding
+                axes.set_xlim(x_min, x_max)
+                axes.set_ylim(y_min, y_max)
+            x_expression = x_equation.get().strip()
+            x_label = x_field if x_expression in {"", "x"} else x_expression
+            y_labels = []
+            for y_value, _split_value, equation, *_widgets in y_rows:
+                expression = equation.get().strip()
+                y_labels.append(y_value.get() if expression in {"", "y"} else expression)
+            axes.set_xlabel(x_label)
+            axes.set_ylabel(" / ".join(y_labels))
             axes.set_xscale("log" if x_log.get() else "linear")
             axes.set_yscale("log" if y_log.get() else "linear")
             if plotted_groups:
@@ -8522,16 +8567,25 @@ class EISApplication:
                 canvas.draw_idle()
                 self._update_status(f"no {current_mode} parameters are available")
                 return
+            manual_metadata_fields = set(self._custom_metadata_columns) | {
+                "Spectrum",
+                "Cycle mod 15",
+            }
             parameter_fields = [
                 field
                 for field in fields
-                if field == "R0" or field == "L0" or field.startswith("peak")
+                if field not in manual_metadata_fields
+                and (field == "R0" or field == "L0" or field.startswith("peak"))
             ]
-            split_fields = [
-                "None",
-                "Spectrum",
-                *[field for field in fields if field not in parameter_fields],
+            split_candidates = [
+                field
+                for field in dict.fromkeys(
+                    key for record in records for key in record
+                )
+                if field not in {"source_file", "drt_mode"}
+                and field not in parameter_fields
             ]
+            split_fields = ["None", *dict.fromkeys(["Spectrum", *split_candidates])]
             x_values = [field for field in fields]
             x_box.configure(values=x_values)
             for _y_value, _split_value, _equation, y_box, split_box, _entry, _remove_button in y_rows:
@@ -8960,8 +9014,14 @@ class EISApplication:
                     y_max += padding
                 axes.set_xlim(x_min, x_max)
                 axes.set_ylim(y_min, y_max)
-            axes.set_xlabel(x_equation.get().strip() or x_field)
-            axes.set_ylabel(" / ".join(equation.get() or y_var.get() for y_var, _split_var, equation, *_widgets in y_rows))
+            x_expression = x_equation.get().strip()
+            x_label = x_field if x_expression in {"", "x"} else x_expression
+            y_labels = []
+            for y_var, _split_var, equation, *_widgets in y_rows:
+                expression = equation.get().strip()
+                y_labels.append(y_var.get() if expression in {"", "y"} else expression)
+            axes.set_xlabel(x_label)
+            axes.set_ylabel(" / ".join(y_labels))
             axes.set_xscale("log" if x_log.get() else "linear")
             axes.set_yscale("log" if y_log.get() else "linear")
             if plotted_groups:
@@ -8986,8 +9046,10 @@ class EISApplication:
                 range_labels[field].set(range_text(field))
             refresh_plot()
 
-        for variable in (x_var, x_equation, x_log, y_log):
+        for variable in (x_var, x_equation):
             variable.trace_add("write", lambda *_args: refresh_ranges())
+        x_log.trace_add("write", lambda *_args: refresh_plot())
+        y_log.trace_add("write", lambda *_args: refresh_plot())
 
         def on_split_selected(_event=None) -> None:
             refresh_ranges()
