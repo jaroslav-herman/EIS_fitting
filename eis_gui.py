@@ -1754,7 +1754,6 @@ class EISApplication:
         self.explorer.bind("<Double-Button-1>", self._on_explorer_double_click, add="+")
         self.explorer.bind("<Button-1>", self._on_explorer_heading_click, add="+")
         self.explorer.bind("<<TreeviewSelect>>", self._select_explorer_spectrum)
-        self.explorer.bind("<Delete>", lambda _event: self.delete_selected_spectrum())
         self.explorer.bind("<Up>", lambda event: self._on_explorer_arrow(event, -1))
         self.explorer.bind("<Down>", lambda event: self._on_explorer_arrow(event, 1))
         self.explorer.bind("<Control-a>", self.select_all_spectra)
@@ -5026,7 +5025,7 @@ class EISApplication:
     def _on_delete_key(self, _event=None):
         focus = self.root.focus_get()
         if focus is not None and str(focus).startswith(str(self.explorer)):
-            return None
+            return "break"
         if self.analysis_mode_var.get() == "DRT" and self._selected_drt_peak_index is not None:
             self.remove_selected_drt_peak()
             return "break"
@@ -8265,6 +8264,7 @@ class EISApplication:
         x_equation = tk.StringVar(value="x")
         x_log = tk.BooleanVar(value=False)
         y_log = tk.BooleanVar(value=False)
+        hide_legend = tk.BooleanVar(value=False)
         y_rows_frame = ttk.Frame(controls)
         y_rows_frame.grid(row=1, column=1, columnspan=2, padx=3, sticky="ew")
         for column in range(3):
@@ -8327,6 +8327,12 @@ class EISApplication:
         x_box.grid(row=1, column=0, padx=(0, 6), sticky="ew")
         ttk.Checkbutton(controls, text="Log X", variable=x_log).grid(row=2, column=3, sticky="w")
         ttk.Checkbutton(controls, text="Log Y", variable=y_log).grid(row=2, column=4, sticky="w")
+        ttk.Checkbutton(
+            controls,
+            text="Hide legend",
+            variable=hide_legend,
+            command=lambda: refresh_plot(),
+        ).grid(row=4, column=2, sticky="w")
         ttk.Label(controls, text="X equation").grid(row=2, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(controls, textvariable=x_equation).grid(row=3, column=0, padx=(0, 6), sticky="ew")
         ttk.Label(
@@ -8543,9 +8549,17 @@ class EISApplication:
             axes.set_ylabel(" / ".join(y_labels))
             axes.set_xscale("log" if x_log.get() else "linear")
             axes.set_yscale("log" if y_log.get() else "linear")
-            if plotted_groups:
+            if plotted_groups and not hide_legend.get():
                 axes.legend(loc="best", fontsize=8)
             canvas.draw_idle()
+
+        def toggle_legend(_event=None):
+            hide_legend.set(not hide_legend.get())
+            refresh_plot()
+            return "break"
+
+        popup.bind("<Alt-h>", toggle_legend)
+        popup.bind("<Alt-H>", toggle_legend)
 
         def active_view() -> None:
             axes.relim()
@@ -8742,6 +8756,7 @@ class EISApplication:
         x_equation = tk.StringVar(value="x")
         x_log = tk.BooleanVar(value=False)
         y_log = tk.BooleanVar(value=False)
+        hide_legend = tk.BooleanVar(value=False)
         y_rows_frame = ttk.Frame(controls)
         y_rows_frame.grid(row=1, column=1, columnspan=2, padx=3, sticky="ew")
         for column in range(3):
@@ -8804,6 +8819,12 @@ class EISApplication:
         x_box.grid(row=1, column=0, padx=(0, 6), sticky="ew")
         ttk.Checkbutton(controls, text="Log X", variable=x_log).grid(row=2, column=3, sticky="w")
         ttk.Checkbutton(controls, text="Log Y", variable=y_log).grid(row=2, column=4, sticky="w")
+        ttk.Checkbutton(
+            controls,
+            text="Hide legend",
+            variable=hide_legend,
+            command=lambda: refresh_plot(),
+        ).grid(row=4, column=2, sticky="w")
         ttk.Label(controls, text="X equation").grid(row=2, column=0, sticky="w", pady=(6, 0))
         ttk.Entry(controls, textvariable=x_equation).grid(row=3, column=0, padx=(0, 6), sticky="ew")
         ttk.Label(
@@ -9024,9 +9045,17 @@ class EISApplication:
             axes.set_ylabel(" / ".join(y_labels))
             axes.set_xscale("log" if x_log.get() else "linear")
             axes.set_yscale("log" if y_log.get() else "linear")
-            if plotted_groups:
+            if plotted_groups and not hide_legend.get():
                 axes.legend(loc="best", fontsize=8)
             canvas.draw_idle()
+
+        def toggle_legend(_event=None):
+            hide_legend.set(not hide_legend.get())
+            refresh_plot()
+            return "break"
+
+        popup.bind("<Alt-h>", toggle_legend)
+        popup.bind("<Alt-H>", toggle_legend)
 
         def active_view() -> None:
             axes.relim()
@@ -9208,6 +9237,10 @@ class EISApplication:
             else:
                 cycle.custom_metadata[column_name] = value
                 spectrum.custom_metadata[column_name] = value
+                if column_name in loaded.dataframe.columns:
+                    loaded.dataframe[column_name] = loaded.dataframe[column_name].astype(
+                        object
+                    )
                 if "cycle_number" in loaded.dataframe.columns:
                     rows = loaded.dataframe["cycle_number"] == spectrum.cycle
                     loaded.dataframe.loc[rows, column_name] = value
@@ -9328,6 +9361,9 @@ class EISApplication:
             spectrum.custom_metadata[column_name] = value
 
             if "cycle_number" in loaded.dataframe.columns:
+                loaded.dataframe[column_name] = loaded.dataframe[column_name].astype(
+                    object
+                )
                 rows = loaded.dataframe["cycle_number"] == spectrum.cycle
                 loaded.dataframe.loc[rows, column_name] = value
             else:
@@ -9387,13 +9423,26 @@ class EISApplication:
             if not self._capture_controls():
                 return
 
-        for _item, _dataset_id, loaded, spectrum in rows:
-            loaded.state.cycles.pop(spectrum.cycle, None)
-            if spectrum.cycle in loaded.state.available_cycles:
-                loaded.state.available_cycles.remove(spectrum.cycle)
-            loaded.spectra = [
-                entry for entry in loaded.spectra if entry.cycle != spectrum.cycle
+        deleted_cycles_by_dataset: dict[str, set[int]] = {}
+        for _item, dataset_id, loaded, spectrum in rows:
+            deleted_cycles_by_dataset.setdefault(dataset_id, set()).add(spectrum.cycle)
+
+        for dataset_id, deleted_cycles in deleted_cycles_by_dataset.items():
+            loaded = self.loaded_projects[dataset_id]
+            for cycle in deleted_cycles:
+                loaded.state.cycles.pop(cycle, None)
+            loaded.state.available_cycles = [
+                cycle
+                for cycle in loaded.state.available_cycles
+                if cycle not in deleted_cycles
             ]
+            loaded.spectra = [
+                entry for entry in loaded.spectra if entry.cycle not in deleted_cycles
+            ]
+            if "cycle_number" in loaded.dataframe.columns:
+                loaded.dataframe = loaded.dataframe.loc[
+                    ~loaded.dataframe["cycle_number"].isin(deleted_cycles)
+                ].copy()
 
         for dataset_id in list(self._dataset_order):
             loaded = self.loaded_projects.get(dataset_id)
