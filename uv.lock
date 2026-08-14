@@ -136,11 +136,29 @@ name = "eis-fitting"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "bayes-drt2" },
+    { name = "hybrid-drt" },
+    { name = "impedance" },
+    { name = "matplotlib" },
+    { name = "natsort" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "scipy" },
     { name = "wepy" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "wepy", editable = "../wepy" }]
+requires-dist = [
+    { name = "bayes-drt2", git = "https://github.com/jaroslav-herman/bayes-drt2.git" },
+    { name = "hybrid-drt", git = "https://github.com/jdhuang-csm/hybrid-drt.git" },
+    { name = "impedance", specifier = ">=1.7.1" },
+    { name = "matplotlib", specifier = ">=3.11.1" },
+    { name = "natsort", specifier = ">=8.4.0" },
+    { name = "numpy", specifier = ">=2.5.1" },
+    { name = "pandas", specifier = ">=3.0.3" },
+    { name = "scipy", specifier = ">=1.18.0" },
+    { name = "wepy", git = "https://github.com/jaroslav-herman/wepy.git" },
+]
 
 [[package]]
 name = "fonttools"
@@ -798,7 +816,7 @@ wheels = [
 [[package]]
 name = "wepy"
 version = "0.1.0"
-source = { editable = "../wepy" }
+source = { git = "https://github.com/jaroslav-herman/wepy.git#ede59f1f486aecd8d7daeda8214d0c794dc6a480" }
 dependencies = [
     { name = "bayes-drt2" },
     { name = "galvani" },
@@ -809,17 +827,4 @@ dependencies = [
     { name = "natsort" },
     { name = "numpy" },
     { name = "pandas" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "bayes-drt2", git = "https://github.com/jaroslav-herman/bayes-drt2" },
-    { name = "galvani", git = "https://github.com/jaroslav-herman/galvani" },
-    { name = "hybrid-drt", git = "https://github.com/jdhuang-csm/hybrid-drt" },
-    { name = "impedance", specifier = ">=1.7.1" },
-    { name = "matplotlib", specifier = ">=3.11.1" },
-    { name = "mittag-leffler", git = "https://github.com/jdhuang-csm/mittag-leffler" },
-    { name = "natsort", specifier = ">=8.4.0" },
-    { name = "numpy", specifier = ">=2.5.1" },
-    { name = "pandas", specifier = ">=3.0.3" },
 ]

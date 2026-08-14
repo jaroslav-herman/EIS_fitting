@@ -5,8 +5,18 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "bayes-drt2",
+    "hybrid-drt",
+    "impedance>=1.7.1",
+    "matplotlib>=3.11.1",
+    "natsort>=8.4.0",
+    "numpy>=2.5.1",
+    "pandas>=3.0.3",
+    "scipy>=1.18.0",
     "wepy",
 ]
 
 [tool.uv.sources]
-wepy = { path = "../wepy", editable = true }
+bayes-drt2 = { git = "https://github.com/jaroslav-herman/bayes-drt2.git" }
+hybrid-drt = { git = "https://github.com/jdhuang-csm/hybrid-drt.git" }
+wepy = { git = "https://github.com/jaroslav-herman/wepy.git" }
