@@ -275,7 +275,10 @@ def _dataset_id(path: Path, spectrum_kind: str) -> str:
     return f"{path.resolve()}::{spectrum_kind}"
 
 
-def circuit_parameters(circuit: str) -> list[ParameterValue]:
+def circuit_parameters(
+    circuit: str,
+    bounds: dict[str, tuple[float, float]] | None = None,
+) -> list[ParameterValue]:
     from impedance.models.circuits import CustomCircuit
     from impedance.models.circuits.circuits import calculateCircuitLength
 
@@ -285,8 +288,29 @@ def circuit_parameters(circuit: str) -> list[ParameterValue]:
     parameters = []
     for name, unit in zip(names, units):
         lower, upper = infer_bounds(name)
+        if bounds:
+            normalized = name.lower()
+            category = (
+                "cpe_q"
+                if normalized.startswith("cpe") and normalized.endswith("_0")
+                else "cpe_alpha"
+                if normalized.startswith("cpe") and normalized.endswith("_1")
+                else "r"
+                if normalized.startswith("r")
+                else "l"
+                if normalized.startswith("l")
+                else None
+            )
+            if category in bounds:
+                lower, upper = bounds[category]
         parameters.append(
-            ParameterValue(name, unit, infer_initial(name), lower, upper)
+            ParameterValue(
+                name,
+                unit,
+                float(np.clip(infer_initial(name), lower, upper)),
+                lower,
+                upper,
+            )
         )
     return parameters
 
@@ -723,7 +747,10 @@ def calculate_hybrid_drt(state: CycleState) -> DRTComputation:
     )
 
 
-def select_eec_model_from_hybrid_drt(state: CycleState) -> AutomaticEECModel:
+def select_eec_model_from_hybrid_drt(
+    state: CycleState,
+    settings: dict[str, object] | None = None,
+) -> AutomaticEECModel:
     from copy import deepcopy
 
     from hybdrt.models import DRT
@@ -740,16 +767,32 @@ def select_eec_model_from_hybrid_drt(state: CycleState) -> AutomaticEECModel:
     drt = DRT()
     drt.fit_eis(frequency, impedance)
     dual = deepcopy(drt)
+    settings = settings or {}
+    criterion = str(settings.get("criterion", "lml-bic"))
+    if criterion not in {"bic", "lml", "lml-bic"}:
+        criterion = "lml-bic"
+    max_num_peaks = max(int(settings.get("max_num_peaks", 10)), 1)
+    prior = bool(settings.get("prior", True))
+    prior_strength = settings.get("prior_strength")
+    generate_kw = {}
+    find_peaks_kw = {}
+    if settings.get("peak_prominence") is not None:
+        find_peaks_kw["prominence"] = float(settings["peak_prominence"])
+    if settings.get("peak_height") is not None:
+        find_peaks_kw["height"] = float(settings["peak_height"])
+    if find_peaks_kw:
+        generate_kw["find_peaks_kw"] = find_peaks_kw
     dual.dual_fit_eis(
         frequency,
         impedance,
+        generate_kw=generate_kw or None,
         discrete_kw=dict(
-            prior=True,
-            prior_strength=None,
+            max_num_peaks=max_num_peaks,
+            prior=prior,
+            prior_strength=prior_strength,
             model_init_kw=dict(drt_element="RQ"),
         ),
     )
-    criterion = "lml-bic"
     candidate_id = dual.get_best_candidate_id("discrete", criterion=criterion)
     candidate = dual.get_candidate(candidate_id, "discrete")
     model = candidate["model"]
@@ -778,10 +821,18 @@ def select_eec_model_from_hybrid_drt(state: CycleState) -> AutomaticEECModel:
     else:
         inductance = 0.0
 
-    initials = {
-        "R0": max(ohmic_resistance, 0.0),
-        "L0": max(inductance, 0.0),
-    }
+    minimum_r0 = settings.get("min_r0")
+    minimum_l0 = settings.get("min_l0")
+    include_r0 = minimum_r0 is None or ohmic_resistance >= float(minimum_r0)
+    include_l0 = minimum_l0 is None or inductance >= float(minimum_l0)
+    initials = {}
+    elements = []
+    if include_r0:
+        elements.append("R0")
+        initials["R0"] = max(ohmic_resistance, 0.0)
+    if include_l0:
+        elements.append("L0")
+        initials["L0"] = max(inductance, 0.0)
     branch_count = 0
     for element_name, element_type in zip(
         getattr(model, "element_names", ()),
@@ -807,7 +858,6 @@ def select_eec_model_from_hybrid_drt(state: CycleState) -> AutomaticEECModel:
             }
         )
 
-    elements = ["R0", "L0"]
     elements.extend(
         f"p(R{index},CPE{index})" for index in range(1, branch_count + 1)
     )

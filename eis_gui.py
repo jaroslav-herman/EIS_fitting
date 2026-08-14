@@ -756,8 +756,57 @@ class EISApplication:
         return base / "EIS_fitting" / "preferences.json"
 
     def _load_preferences(self) -> tuple[str, ...]:
+        self._fit_explorer_x_preference = "I_mA"
+        self._drt_explorer_x_preference = "I_mA"
+        self._fit_explorer_y_preference = "R0"
+        self._drt_explorer_y_preference = "R0"
+        self._eec_parameter_bounds = {
+            "r": (0.0, 1e6),
+            "l": (0.0, 1.0),
+            "cpe_q": (1e-6, 1e3),
+            "cpe_alpha": (0.5, 1.0),
+        }
+        self._auto_model_settings = {
+            "criterion": "lml-bic",
+            "max_num_peaks": 10,
+            "peak_prominence": None,
+            "peak_height": None,
+            "prior": True,
+            "prior_strength": None,
+            "min_r0": None,
+            "min_l0": None,
+        }
         try:
             payload = json.loads(self._preferences_path.read_text(encoding="utf-8"))
+            self._fit_explorer_x_preference = str(
+                payload.get("fit_explorer_x", "I_mA")
+            ).strip() or "I_mA"
+            self._drt_explorer_x_preference = str(
+                payload.get("drt_explorer_x", "I_mA")
+            ).strip() or "I_mA"
+            self._fit_explorer_y_preference = str(
+                payload.get("fit_explorer_y", "R0")
+            ).strip() or "R0"
+            self._drt_explorer_y_preference = str(
+                payload.get("drt_explorer_y", "R0")
+            ).strip() or "R0"
+            saved_bounds = payload.get("eec_parameter_bounds", {})
+            if isinstance(saved_bounds, dict):
+                for category, default in self._eec_parameter_bounds.items():
+                    value = saved_bounds.get(category)
+                    if isinstance(value, (list, tuple)) and len(value) == 2:
+                        self._eec_parameter_bounds[category] = (
+                            float(value[0]),
+                            float(value[1]),
+                        )
+            saved_auto = payload.get("auto_model", {})
+            if isinstance(saved_auto, dict):
+                for key in self._auto_model_settings:
+                    if key in saved_auto:
+                        self._auto_model_settings[key] = saved_auto[key]
+                self._auto_model_settings["max_num_peaks"] = max(
+                    int(self._auto_model_settings["max_num_peaks"]), 1
+                )
             circuits = payload.get("eec_circuits", [])
             if isinstance(circuits, list):
                 values = tuple(
@@ -773,11 +822,29 @@ class EISApplication:
             pass
         return MODEL_PRESETS
 
-    def _save_preferences(self, circuits: tuple[str, ...]) -> None:
+    def _save_preferences(
+        self,
+        circuits: tuple[str, ...],
+        fit_explorer_x: str,
+        drt_explorer_x: str,
+        fit_explorer_y: str,
+        drt_explorer_y: str,
+    ) -> None:
         self._preferences_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._preferences_path.with_suffix(".tmp")
         temporary.write_text(
-            json.dumps({"eec_circuits": list(circuits)}, indent=2),
+            json.dumps(
+                {
+                    "eec_circuits": list(circuits),
+                    "fit_explorer_x": fit_explorer_x,
+                    "drt_explorer_x": drt_explorer_x,
+                    "fit_explorer_y": fit_explorer_y,
+                    "drt_explorer_y": drt_explorer_y,
+                    "eec_parameter_bounds": self._eec_parameter_bounds,
+                    "auto_model": self._auto_model_settings,
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
         temporary.replace(self._preferences_path)
@@ -796,14 +863,79 @@ class EISApplication:
         popup.minsize(440, 320)
         popup.transient(self.root)
         popup.columnconfigure(0, weight=1)
-        popup.rowconfigure(1, weight=1)
+        popup.rowconfigure(0, weight=1)
+
+        notebook = ttk.Notebook(popup)
+        notebook.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        eec_tab = ttk.Frame(notebook, padding=10)
+        explorer_tab = ttk.Frame(notebook, padding=10)
+        auto_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(eec_tab, text="EEC models")
+        notebook.add(explorer_tab, text="Explorers")
+        notebook.add(auto_tab, text="Auto model selection")
+
+        eec_tab.columnconfigure(0, weight=1)
+        eec_tab.rowconfigure(1, weight=1)
+        explorer_tab.columnconfigure(1, weight=1)
+        auto_tab.columnconfigure(1, weight=1)
+
+        fit_x_values = {"I_mA", "Ecell_V", "time_s", "cycle"}
+        drt_x_values = set(fit_x_values) | {"R0", "L0"}
+        fit_y_values = {"R0"}
+        drt_y_values = {"R0", "L0"}
+        if self.state is not None:
+            for record in self._collect_fit_parameter_records():
+                fit_x_values.update(record)
+                fit_y_values.update(record)
+            for record in self._collect_drt_parameter_records(self._selected_drt_mode()):
+                drt_x_values.update(record)
+                drt_y_values.update(record)
+        fit_x_var = tk.StringVar(value=self._fit_explorer_x_preference)
+        drt_x_var = tk.StringVar(value=self._drt_explorer_x_preference)
+        fit_y_var = tk.StringVar(value=self._fit_explorer_y_preference)
+        drt_y_var = tk.StringVar(value=self._drt_explorer_y_preference)
+        ttk.Label(explorer_tab, text="EEC default X axis").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Combobox(
+            explorer_tab,
+            textvariable=fit_x_var,
+            values=sorted(fit_x_values),
+            state="normal",
+        ).grid(row=0, column=1, padx=(8, 0), sticky="ew")
+        ttk.Label(explorer_tab, text="DRT default X axis").grid(
+            row=1, column=0, pady=(6, 0), sticky="w"
+        )
+        ttk.Combobox(
+            explorer_tab,
+            textvariable=drt_x_var,
+            values=sorted(drt_x_values),
+            state="normal",
+        ).grid(row=1, column=1, padx=(8, 0), pady=(6, 0), sticky="ew")
+        ttk.Label(explorer_tab, text="EEC default Y axis").grid(
+            row=2, column=0, pady=(6, 0), sticky="w"
+        )
+        ttk.Combobox(
+            explorer_tab,
+            textvariable=fit_y_var,
+            values=sorted(fit_y_values),
+            state="normal",
+        ).grid(row=2, column=1, padx=(8, 0), pady=(6, 0), sticky="ew")
+        ttk.Label(explorer_tab, text="DRT default Y axis").grid(
+            row=3, column=0, pady=(6, 0), sticky="w"
+        )
+        ttk.Combobox(
+            explorer_tab,
+            textvariable=drt_y_var,
+            values=sorted(drt_y_values),
+            state="normal",
+        ).grid(row=3, column=1, padx=(8, 0), pady=(6, 0), sticky="ew")
 
         ttk.Label(
-            popup,
+            eec_tab,
             text="EEC circuits shown in the fitting-model lists",
-            padding=(10, 10, 10, 4),
         ).grid(row=0, column=0, sticky="w")
-        list_frame = ttk.Frame(popup, padding=10)
+        list_frame = ttk.Frame(eec_tab, padding=(0, 8, 0, 0))
         list_frame.grid(row=1, column=0, sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
@@ -815,8 +947,110 @@ class EISApplication:
         for circuit in self._model_presets:
             circuit_list.insert(tk.END, circuit)
 
-        entry = ttk.Entry(popup)
-        entry.grid(row=2, column=0, padx=10, pady=(0, 6), sticky="ew")
+        entry = ttk.Entry(eec_tab)
+        entry.grid(row=2, column=0, pady=(8, 6), sticky="ew")
+
+        bound_vars: dict[str, tuple[tk.StringVar, tk.StringVar]] = {}
+        bounds_frame = ttk.LabelFrame(
+            eec_tab, text="Default parameter limits", padding=8
+        )
+        bounds_frame.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        bounds_frame.columnconfigure(1, weight=1)
+        bounds_frame.columnconfigure(3, weight=1)
+        ttk.Label(bounds_frame, text="Parameter").grid(row=0, column=0, sticky="w")
+        ttk.Label(bounds_frame, text="Lower").grid(row=0, column=1, padx=4, sticky="w")
+        ttk.Label(bounds_frame, text="Upper").grid(row=0, column=3, padx=4, sticky="w")
+        for row, (category, label) in enumerate(
+            (("r", "R"), ("l", "L"), ("cpe_q", "CPE Q"), ("cpe_alpha", "CPE alpha")),
+            start=1,
+        ):
+            lower, upper = self._eec_parameter_bounds[category]
+            lower_var = tk.StringVar(value=f"{lower:g}")
+            upper_var = tk.StringVar(value=f"{upper:g}")
+            bound_vars[category] = (lower_var, upper_var)
+            ttk.Label(bounds_frame, text=label).grid(row=row, column=0, sticky="w")
+            ttk.Entry(bounds_frame, textvariable=lower_var).grid(
+                row=row, column=1, padx=4, pady=2, sticky="ew"
+            )
+            ttk.Label(bounds_frame, text="–").grid(row=row, column=2, sticky="w")
+            ttk.Entry(bounds_frame, textvariable=upper_var).grid(
+                row=row, column=3, padx=4, pady=2, sticky="ew"
+            )
+
+        criterion_var = tk.StringVar(value=str(self._auto_model_settings["criterion"]))
+        max_peaks_var = tk.StringVar(value=str(self._auto_model_settings["max_num_peaks"]))
+        prominence_var = tk.StringVar(
+            value="" if self._auto_model_settings["peak_prominence"] is None
+            else str(self._auto_model_settings["peak_prominence"])
+        )
+        height_var = tk.StringVar(
+            value="" if self._auto_model_settings["peak_height"] is None
+            else str(self._auto_model_settings["peak_height"])
+        )
+        prior_var = tk.BooleanVar(value=bool(self._auto_model_settings["prior"]))
+        prior_strength_var = tk.StringVar(
+            value="" if self._auto_model_settings["prior_strength"] is None
+            else str(self._auto_model_settings["prior_strength"])
+        )
+        min_r0_var = tk.StringVar(
+            value="" if self._auto_model_settings["min_r0"] is None
+            else str(self._auto_model_settings["min_r0"])
+        )
+        min_l0_var = tk.StringVar(
+            value="" if self._auto_model_settings["min_l0"] is None
+            else str(self._auto_model_settings["min_l0"])
+        )
+        ttk.Label(
+            auto_tab,
+            text="These settings are used for every Auto model selection run.",
+            wraplength=430,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Label(auto_tab, text="Selection criterion").grid(row=1, column=0, sticky="w")
+        ttk.Combobox(
+            auto_tab,
+            textvariable=criterion_var,
+            values=("bic", "lml", "lml-bic"),
+            state="readonly",
+        ).grid(row=1, column=1, sticky="ew")
+        ttk.Label(auto_tab, text="Maximum DRT peaks / EEC blocks").grid(
+            row=2, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(auto_tab, textvariable=max_peaks_var).grid(
+            row=2, column=1, sticky="ew", pady=(6, 0)
+        )
+        ttk.Label(auto_tab, text="Minimum peak prominence (blank = package default)").grid(
+            row=3, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(auto_tab, textvariable=prominence_var).grid(
+            row=3, column=1, sticky="ew", pady=(6, 0)
+        )
+        ttk.Label(auto_tab, text="Minimum peak height (blank = package default)").grid(
+            row=4, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(auto_tab, textvariable=height_var).grid(
+            row=4, column=1, sticky="ew", pady=(6, 0)
+        )
+        ttk.Checkbutton(auto_tab, text="Use DRT prior", variable=prior_var).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        ttk.Label(auto_tab, text="Prior strength (blank = package default)").grid(
+            row=6, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(auto_tab, textvariable=prior_strength_var).grid(
+            row=6, column=1, sticky="ew", pady=(6, 0)
+        )
+        ttk.Label(auto_tab, text="Minimum R0 threshold (Ω; blank = always include)").grid(
+            row=7, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(auto_tab, textvariable=min_r0_var).grid(
+            row=7, column=1, sticky="ew", pady=(6, 0)
+        )
+        ttk.Label(auto_tab, text="Minimum L0 threshold (H; blank = always include)").grid(
+            row=8, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(auto_tab, textvariable=min_l0_var).grid(
+            row=8, column=1, sticky="ew", pady=(6, 0)
+        )
 
         def add_circuit(_event=None) -> None:
             value = entry.get().strip()
@@ -848,11 +1082,56 @@ class EISApplication:
                 )
                 return
             try:
-                self._save_preferences(circuits)
-            except OSError as error:
+                max_num_peaks = int(max_peaks_var.get())
+                if max_num_peaks < 1:
+                    raise ValueError("maximum peaks must be at least 1")
+
+                def optional_float(variable: tk.StringVar, label: str):
+                    value = variable.get().strip()
+                    if not value:
+                        return None
+                    number = float(value)
+                    if not np.isfinite(number) or number < 0:
+                        raise ValueError(f"{label} must be a non-negative number")
+                    return number
+
+                parameter_bounds = {}
+                for category, (lower_var, upper_var) in bound_vars.items():
+                    lower = float(lower_var.get())
+                    upper = float(upper_var.get())
+                    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+                        raise ValueError(
+                            f"{category} lower limit must be smaller than its upper limit"
+                        )
+                    parameter_bounds[category] = (lower, upper)
+
+                auto_settings = {
+                    "criterion": criterion_var.get(),
+                    "max_num_peaks": max_num_peaks,
+                    "peak_prominence": optional_float(prominence_var, "peak prominence"),
+                    "peak_height": optional_float(height_var, "peak height"),
+                    "prior": bool(prior_var.get()),
+                    "prior_strength": optional_float(prior_strength_var, "prior strength"),
+                    "min_r0": optional_float(min_r0_var, "R0 threshold"),
+                    "min_l0": optional_float(min_l0_var, "L0 threshold"),
+                }
+                self._auto_model_settings = auto_settings
+                self._eec_parameter_bounds = parameter_bounds
+                self._save_preferences(
+                    circuits,
+                    fit_x_var.get().strip() or "I_mA",
+                    drt_x_var.get().strip() or "I_mA",
+                    fit_y_var.get().strip() or "R0",
+                    drt_y_var.get().strip() or "R0",
+                )
+            except (OSError, TypeError, ValueError) as error:
                 messagebox.showerror("Preferences save failed", str(error), parent=popup)
                 return
             self._model_presets = tuple(dict.fromkeys(circuits))
+            self._fit_explorer_x_preference = fit_x_var.get().strip() or "I_mA"
+            self._drt_explorer_x_preference = drt_x_var.get().strip() or "I_mA"
+            self._fit_explorer_y_preference = fit_y_var.get().strip() or "R0"
+            self._drt_explorer_y_preference = drt_y_var.get().strip() or "R0"
             if hasattr(self, "model_box"):
                 self.model_box.configure(values=self._model_presets)
             self._update_status("preferences saved")
@@ -864,8 +1143,8 @@ class EISApplication:
 
         popup.protocol("WM_DELETE_WINDOW", close_popup)
         entry.bind("<Return>", add_circuit)
-        buttons = ttk.Frame(popup, padding=(10, 0, 10, 10))
-        buttons.grid(row=3, column=0, sticky="e")
+        buttons = ttk.Frame(popup, padding=(0, 0, 0, 0))
+        buttons.grid(row=1, column=0, pady=(0, 10), sticky="e")
         ttk.Button(buttons, text="Add", command=add_circuit).pack(side=tk.LEFT, padx=3)
         ttk.Button(buttons, text="Remove selected", command=remove_circuit).pack(
             side=tk.LEFT, padx=3
@@ -3188,7 +3467,10 @@ class EISApplication:
                 return "break"
             self.model_var.set(circuit_list.get(selection[0]))
             close_popup()
-            self.apply_model()
+            if self._selected_spectrum_rows():
+                self.apply_model_to_selected()
+            else:
+                self.apply_model()
             return "break"
 
         popup.protocol("WM_DELETE_WINDOW", close_popup)
@@ -5753,6 +6035,8 @@ class EISApplication:
                 copy.deepcopy(peak) for peak in self.drt_peak_parameters
             ]
             self.root.after(0, self._drt_peak_batch_next)
+        else:
+            self._refresh_open_parameter_explorers()
 
     def _select_drt_peaks_for_eec(self, peaks, maximum: int):
         window = tk.Toplevel(self.root)
@@ -6802,7 +7086,7 @@ class EISApplication:
             )
             return
         try:
-            parameters = circuit_parameters(circuit)
+            parameters = circuit_parameters(circuit, self._eec_parameter_bounds)
         except Exception as error:
             messagebox.showerror(
                 "Invalid model",
@@ -6832,7 +7116,7 @@ class EISApplication:
             )
             return
         try:
-            parameters = circuit_parameters(circuit)
+            parameters = circuit_parameters(circuit, self._eec_parameter_bounds)
         except Exception as error:
             messagebox.showerror(
                 "Invalid model",
@@ -6890,7 +7174,14 @@ class EISApplication:
         )
         self._submit(
             lambda: [
-                (dataset_id, cycle_number, select_eec_model_from_hybrid_drt(cycle))
+                (
+                    dataset_id,
+                    cycle_number,
+                    select_eec_model_from_hybrid_drt(
+                        cycle,
+                        settings=copy.deepcopy(self._auto_model_settings),
+                    ),
+                )
                 for dataset_id, cycle_number, cycle in targets
             ],
             self._finish_auto_model_selection,
@@ -6910,7 +7201,9 @@ class EISApplication:
             if loaded is None:
                 continue
             cycle = self._loaded_cycle_for_popup(loaded, cycle_number)
-            parameters = circuit_parameters(result.circuit)
+            parameters = circuit_parameters(
+                result.circuit, self._eec_parameter_bounds
+            )
             for parameter in parameters:
                 if parameter.name in result.initials:
                     parameter.initial = self._clamp_parameter_value(
@@ -7777,6 +8070,7 @@ class EISApplication:
             self.parameter_table.set_parameters(parameters)
             self._refresh_plot(rescale=True)
             self._update_status("fit complete")
+        self._refresh_open_parameter_explorers()
 
     def fit_selected(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
@@ -7842,6 +8136,7 @@ class EISApplication:
             self.state.cycles[cycle.cycle] = cycle
         self._restore_controls()
         self._refresh_plot(rescale=True)
+        self._refresh_open_parameter_explorers()
         if report.failed_cycle is None:
             self._update_status(f"batch fit completed for {len(report.fits)} cycles")
             return
@@ -7960,6 +8255,7 @@ class EISApplication:
     def _prepare_drt_peak_batch_direction(self) -> None:
         if not self._drt_peak_batch_directions:
             self._drt_peak_batch_template = None
+            self._refresh_open_parameter_explorers()
             self._update_status("DRT peak batch fit completed")
             return
         direction = self._drt_peak_batch_directions.pop(0)
@@ -8116,6 +8412,7 @@ class EISApplication:
             result.loaded.state.cycles[cycle.cycle] = cycle
         self._restore_controls()
         self._refresh_plot(rescale=True)
+        self._refresh_open_parameter_explorers()
         if report.failed_label is None:
             self._update_status(
                 f"explorer batch fit completed for {len(report.fits)} spectra"
@@ -8454,8 +8751,16 @@ class EISApplication:
             and field not in parameter_fields
         ]
         split_fields = ["None", *dict.fromkeys(["Spectrum", *split_candidates])]
-        x_default = "I_mA" if "I_mA" in fields else fields[0]
-        y_default = parameter_fields[0] if parameter_fields else fields[0]
+        x_default = (
+            self._drt_explorer_x_preference
+            if self._drt_explorer_x_preference in fields
+            else ("I_mA" if "I_mA" in fields else fields[0])
+        )
+        y_default = (
+            self._drt_explorer_y_preference
+            if self._drt_explorer_y_preference in fields
+            else (parameter_fields[0] if parameter_fields else fields[0])
+        )
 
         popup = tk.Toplevel(self.root)
         self.drt_parameters_popup = popup
@@ -8467,6 +8772,7 @@ class EISApplication:
 
         def close_popup() -> None:
             self.drt_parameters_popup = None
+            self._drt_parameters_refresh_callback = None
             popup.destroy()
 
         popup.protocol("WM_DELETE_WINDOW", close_popup)
@@ -8848,6 +9154,7 @@ class EISApplication:
         x_equation.trace_add("write", lambda *_args: refresh_plot())
         x_log.trace_add("write", lambda *_args: refresh_plot())
         y_log.trace_add("write", lambda *_args: refresh_plot())
+        self._drt_parameters_refresh_callback = refresh_data
         ttk.Button(controls, text="Refresh", command=refresh_data).grid(row=4, column=0, pady=(6, 0), sticky="w")
         ttk.Button(controls, text="Active view", command=active_view).grid(row=4, column=1, pady=(6, 0), sticky="w")
         refresh_ranges()
@@ -8944,8 +9251,16 @@ class EISApplication:
             and field not in parameter_fields
         ]
         split_fields = ["None", *dict.fromkeys(["Spectrum", *split_candidates])]
-        x_default = "I_mA" if "I_mA" in numeric_fields else numeric_fields[0]
-        y_default = parameter_fields[0] if parameter_fields else numeric_fields[0]
+        x_default = (
+            self._fit_explorer_x_preference
+            if self._fit_explorer_x_preference in numeric_fields
+            else ("I_mA" if "I_mA" in numeric_fields else numeric_fields[0])
+        )
+        y_default = (
+            self._fit_explorer_y_preference
+            if self._fit_explorer_y_preference in numeric_fields
+            else (parameter_fields[0] if parameter_fields else numeric_fields[0])
+        )
 
         popup = tk.Toplevel(self.root)
         self.fit_parameters_popup = popup
@@ -8957,6 +9272,7 @@ class EISApplication:
 
         def close_popup() -> None:
             self.fit_parameters_popup = None
+            self._fit_parameters_refresh_callback = None
             popup.destroy()
 
         popup.protocol("WM_DELETE_WINDOW", close_popup)
@@ -9302,6 +9618,7 @@ class EISApplication:
 
         x_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
         add_y_row()
+        self._fit_parameters_refresh_callback = refresh_data
         ttk.Button(controls, text="Active view", command=active_view).grid(row=4, column=1, pady=(6, 0), sticky="w")
         refresh_ranges()
 
@@ -9309,6 +9626,17 @@ class EISApplication:
         if popup.winfo_exists():
             popup.destroy()
         self.open_fit_parameters_explorer()
+
+    def _refresh_open_parameter_explorers(self) -> None:
+        for attribute, callback_attribute in (
+            ("fit_parameters_popup", "_fit_parameters_refresh_callback"),
+            ("drt_parameters_popup", "_drt_parameters_refresh_callback"),
+        ):
+            popup = getattr(self, attribute, None)
+            callback = getattr(self, callback_attribute, None)
+            if popup is None or not popup.winfo_exists() or callback is None:
+                continue
+            callback()
 
     def edit_metadata_column_from_clipboard(self) -> None:
         if self.busy or self.state is None:
