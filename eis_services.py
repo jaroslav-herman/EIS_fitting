@@ -8,7 +8,14 @@ import warnings
 
 import numpy as np
 
-from eis_model import CycleState, ParameterValue, ProjectState, as_1d_array, sort_spectrum
+from eis_model import (
+    CycleState,
+    ParameterValue,
+    ProjectState,
+    as_1d_array,
+    copy_parameter_values,
+    sort_spectrum,
+)
 
 SPECTRUM_KIND_COLUMN_MAP = {
     "working": ("re_z_ohm", "minus_im_z_ohm", "ewe_v"),
@@ -977,6 +984,86 @@ def fit_cycle(
         as_1d_array(fit_impedance),
         as_1d_array(fit_at_data),
     )
+
+
+def refine_fit_cycle(
+    state: CycleState,
+    circuit: str,
+    parameters: list[ParameterValue],
+    z_threshold: float,
+    max_iterations: int,
+):
+    from copy import deepcopy
+
+    if state.fit_parameters is None or state.fit_at_data_impedance is None:
+        raise ValueError("Refine fit requires an existing fit")
+    active_indices = np.flatnonzero(state.included)
+    if state.fit_at_data_impedance.size != state.frequency_hz.size:
+        raise ValueError("The existing fit does not match the spectrum points")
+
+    working_state = deepcopy(state)
+    working_parameters = copy_parameter_values(parameters)
+    current_result = (
+        as_1d_array(state.fit_parameters).astype(float).copy(),
+        np.asarray(
+            [parameter.error_percent or 0.0 for parameter in parameters],
+            dtype=float,
+        ),
+        as_1d_array(state.fit_frequency_hz).astype(float).copy(),
+        as_1d_array(state.fit_impedance).astype(complex).copy(),
+        as_1d_array(state.fit_at_data_impedance).astype(complex).copy(),
+    )
+    removed_indices: list[int] = []
+    iterations = 0
+
+    def robust_scale(values: np.ndarray) -> float:
+        median = float(np.median(values))
+        mad = float(np.median(np.abs(values - median)))
+        scale = 1.4826 * mad
+        if scale <= np.finfo(float).eps:
+            scale = float(np.std(values))
+        return max(scale, np.finfo(float).eps)
+
+    while iterations < max_iterations:
+        active_indices = np.flatnonzero(working_state.included)
+        if active_indices.size <= 3:
+            break
+        order = np.argsort(working_state.frequency_hz[active_indices])[::-1]
+        measured = working_state.impedance[active_indices][order]
+        calculated = current_result[4][active_indices][order]
+        if calculated.size != measured.size:
+            raise ValueError("The fit and active points have different lengths")
+        residual = measured - calculated
+        real_scale = robust_scale(residual.real)
+        imaginary_scale = robust_scale(residual.imag)
+        normalized = np.hypot(
+            residual.real / real_scale,
+            residual.imag / imaginary_scale,
+        )
+        score_center = float(np.median(normalized))
+        score_scale = robust_scale(normalized)
+        robust_z = 0.6745 * (normalized - score_center) / score_scale
+        candidates = np.flatnonzero(
+            np.isfinite(robust_z) & (robust_z > z_threshold)
+        )
+        if candidates.size == 0:
+            break
+        candidates = candidates[np.argsort(robust_z[candidates])[::-1]]
+        candidates = candidates[: max(active_indices.size - 3, 0)]
+        original_indices = active_indices[order[candidates]]
+        working_state.manually_included[original_indices] = False
+        working_state.outliers[original_indices] = True
+        removed_indices.extend(int(index) for index in original_indices)
+        for parameter, value in zip(working_parameters, current_result[0]):
+            parameter.initial = float(value)
+        current_result = fit_cycle(
+            working_state,
+            circuit,
+            working_parameters,
+        )
+        iterations += 1
+
+    return current_result, np.asarray(removed_indices, dtype=int), iterations
 
 
 def _batch_parameters_with_initials(

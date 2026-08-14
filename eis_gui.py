@@ -59,6 +59,7 @@ from eis_services import (
     analyze_outliers,
     find_outliers_for_all_cycles,
     fit_cycle,
+    refine_fit_cycle,
     load_cycle,
     load_project_from_dataframe,
     load_project,
@@ -513,6 +514,8 @@ class EISApplication:
         self.procedure_blocks: dict[str, list[dict[str, str]]] = {}
 
         self.threshold_var = tk.StringVar(value=f"{threshold:g}")
+        self.refine_z_threshold_var = tk.StringVar(value="3.5")
+        self.refine_max_iterations_var = tk.StringVar(value="5")
         self.model_var = tk.StringVar(value=circuit)
         self.show_drt_var = tk.BooleanVar(value=False)
         self.show_kk_var = tk.BooleanVar(value=False)
@@ -3857,6 +3860,24 @@ class EISApplication:
         self.initial_values_button.grid(
             row=1, column=0, columnspan=2, pady=3, sticky="ew"
         )
+        ttk.Label(actions, text="Robust z threshold").grid(
+            row=2, column=0, padx=(0, 4), pady=3, sticky="w"
+        )
+        ttk.Entry(actions, textvariable=self.refine_z_threshold_var).grid(
+            row=2, column=1, padx=(4, 0), pady=3, sticky="ew"
+        )
+        ttk.Label(actions, text="Maximum refine iterations").grid(
+            row=3, column=0, padx=(0, 4), pady=3, sticky="w"
+        )
+        ttk.Entry(actions, textvariable=self.refine_max_iterations_var).grid(
+            row=3, column=1, padx=(4, 0), pady=3, sticky="ew"
+        )
+        self.refine_fit_button = ttk.Button(
+            actions, text="Refine fit", command=self.refine_fit_selected
+        )
+        self.refine_fit_button.grid(
+            row=4, column=0, columnspan=2, pady=3, sticky="ew"
+        )
         self.stop_fit_button = ttk.Button(
             actions, text="Stop fit", command=self._cancel_fit, state="disabled"
         )
@@ -4009,6 +4030,7 @@ class EISApplication:
         self.action_buttons = (
             self.fit_button,
             self.fit_selected_button,
+            self.refine_fit_button,
             self.drt_fit_button,
             self.add_gaussian_peak_button,
             self.add_lorentzian_peak_button,
@@ -4063,6 +4085,7 @@ class EISApplication:
             self.show_drt_recovered_var.set(True)
             self.model_group.grid_remove()
             self.parameters_group.grid_remove()
+            self.refine_fit_button.grid_remove()
             self.drt_tools_group.grid()
             self.toggle_drt_view()
             self.toggle_drt_recovered_visibility()
@@ -4070,6 +4093,7 @@ class EISApplication:
         else:
             self.model_group.grid()
             self.parameters_group.grid()
+            self.refine_fit_button.grid()
             self.drt_tools_group.grid_remove()
             self._update_status("EEC fitting mode")
 
@@ -8097,6 +8121,130 @@ class EISApplication:
             ),
             self._finish_explorer_batch_fit,
             "Selected fit failed",
+        )
+
+    def refine_fit_selected(self) -> None:
+        if self.busy or self.state is None or not self._capture_controls():
+            return
+        if self.analysis_mode_var.get() != "EEC":
+            return
+        try:
+            z_threshold = float(self.refine_z_threshold_var.get())
+            max_iterations = int(self.refine_max_iterations_var.get())
+            if not np.isfinite(z_threshold) or z_threshold <= 0:
+                raise ValueError("the robust z threshold must be positive")
+            if max_iterations < 1:
+                raise ValueError("the maximum iteration count must be at least 1")
+        except ValueError as error:
+            messagebox.showerror("Invalid refinement settings", str(error), parent=self.root)
+            return
+
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            messagebox.showerror(
+                "No spectra selected",
+                "Select one or more spectra in the Spectra Explorer first.",
+                parent=self.root,
+            )
+            return
+        targets = []
+        seen: set[tuple[str, int]] = set()
+        missing_fit = []
+        for dataset_id, loaded, spectrum in selected_rows:
+            key = (dataset_id, spectrum.cycle)
+            if key in seen:
+                continue
+            seen.add(key)
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            if cycle.fit_parameters is None or cycle.fit_at_data_impedance is None:
+                missing_fit.append(f"{loaded.dataset_label}, cycle {spectrum.cycle}")
+                continue
+            targets.append(
+                (
+                    dataset_id,
+                    loaded,
+                    spectrum.cycle,
+                    copy.deepcopy(cycle),
+                    copy.deepcopy(cycle.parameters),
+                    cycle.model(loaded.state.circuit),
+                )
+            )
+        if missing_fit:
+            messagebox.showerror(
+                "Refine fit unavailable",
+                "Every selected spectrum must have an existing fit. Missing fit:\n"
+                + "\n".join(missing_fit),
+                parent=self.root,
+            )
+            return
+
+        self.status_var.set(f"Refining fit for {len(targets)} selected spectra…")
+        self._submit(
+            lambda: [
+                (
+                    dataset_id,
+                    cycle_number,
+                    refine_fit_cycle(
+                        cycle,
+                        circuit,
+                        parameters,
+                        z_threshold,
+                        max_iterations,
+                    ),
+                )
+                for dataset_id, _loaded, cycle_number, cycle, parameters, circuit in targets
+            ],
+            self._finish_refine_fit,
+            "Refine fit failed",
+        )
+
+    def _finish_refine_fit(self, results) -> None:
+        if self.state is None:
+            return
+        removed_count = 0
+        iteration_count = 0
+        for dataset_id, cycle_number, refinement in results:
+            loaded = self.loaded_projects.get(dataset_id)
+            if loaded is None:
+                continue
+            cycle = self._loaded_cycle_for_popup(loaded, cycle_number)
+            fit_result, removed_indices, iterations = refinement
+            (
+                fitted_parameters,
+                errors_percent,
+                fit_frequency,
+                fit_impedance,
+                fit_at_data,
+            ) = fit_result
+            valid_indices = removed_indices[
+                (removed_indices >= 0) & (removed_indices < cycle.frequency_hz.size)
+            ]
+            cycle.outliers[valid_indices] = True
+            cycle.manually_included[valid_indices] = False
+            cycle.invalidate_drt_cache()
+            cycle.fit_parameters = fitted_parameters
+            cycle.fit_frequency_hz = fit_frequency
+            cycle.fit_impedance = fit_impedance
+            cycle.fit_at_data_impedance = fit_at_data
+            parameters = cycle.parameters
+            for parameter, fitted, error_percent in zip(
+                parameters, fitted_parameters, errors_percent
+            ):
+                parameter.initial = float(fitted)
+                parameter.error_percent = float(error_percent)
+            cycle.parameters = parameters
+            removed_count += len(valid_indices)
+            iteration_count += iterations
+
+        self._restore_controls()
+        self._refresh_explorer_values()
+        self.parameter_table.set_parameters(
+            self.state.parameters_for(self.state.active_cycle)
+        )
+        self._refresh_plot(rescale=True)
+        self._update_status(
+            f"refine fit completed: {removed_count} points deactivated in "
+            f"{iteration_count} iterations"
         )
 
     def batch_fit(self) -> None:
