@@ -479,6 +479,8 @@ class EISApplication:
         self.requested_cycle = cycle
         self.control = control
         self.circuit = circuit
+        self._preferences_path = self._preferences_file_path()
+        self._model_presets = self._load_preferences()
         self.analysis_mode_var = tk.StringVar(value="EEC")
         self.loaded: LoadedProject | None = None
         self.state: ProjectState | None = None
@@ -584,6 +586,8 @@ class EISApplication:
         self.root.bind("<Alt-Y>", self._toggle_analysis_mode_key)
         self.root.bind("<Alt-c>", self._toggle_drt_method_key)
         self.root.bind("<Alt-C>", self._toggle_drt_method_key)
+        self.root.bind("<Alt-Shift-c>", self._open_circuit_picker_key)
+        self.root.bind("<Alt-Shift-C>", self._open_circuit_picker_key)
         self.root.bind("<Alt-r>", self._calculate_current_drt_key)
         self.root.bind("<Alt-R>", self._calculate_current_drt_key)
         self.root.bind("<Alt-s>", self._on_analysis_alt_s)
@@ -689,6 +693,12 @@ class EISApplication:
             command=self.open_procedure_builder,
         )
         menu_bar.add_cascade(label="Procedures", menu=self.procedure_menu)
+        self.preferences_menu = tk.Menu(menu_bar, tearoff=False)
+        self.preferences_menu.add_command(
+            label="Preferences…",
+            command=self.open_preferences,
+        )
+        menu_bar.add_cascade(label="Preferences", menu=self.preferences_menu)
         self.export_menu = tk.Menu(menu_bar, tearoff=False)
         self.export_menu.add_command(
             label="Export fit parameters - all spectra…",
@@ -738,6 +748,135 @@ class EISApplication:
             "Export DRTs - all spectra…",
             "Export DRTs - selected spectra…",
         )
+
+    @staticmethod
+    def _preferences_file_path() -> Path:
+        app_data = os.environ.get("APPDATA")
+        base = Path(app_data) if app_data else Path.home() / ".config"
+        return base / "EIS_fitting" / "preferences.json"
+
+    def _load_preferences(self) -> tuple[str, ...]:
+        try:
+            payload = json.loads(self._preferences_path.read_text(encoding="utf-8"))
+            circuits = payload.get("eec_circuits", [])
+            if isinstance(circuits, list):
+                values = tuple(
+                    dict.fromkeys(
+                        str(circuit).strip()
+                        for circuit in circuits
+                        if str(circuit).strip()
+                    )
+                )
+                if values:
+                    return values
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        return MODEL_PRESETS
+
+    def _save_preferences(self, circuits: tuple[str, ...]) -> None:
+        self._preferences_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._preferences_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"eec_circuits": list(circuits)}, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(self._preferences_path)
+
+    def open_preferences(self) -> None:
+        existing = getattr(self, "preferences_popup", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        popup = tk.Toplevel(self.root)
+        self.preferences_popup = popup
+        popup.title("Preferences")
+        popup.geometry("560x420")
+        popup.minsize(440, 320)
+        popup.transient(self.root)
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            popup,
+            text="EEC circuits shown in the fitting-model lists",
+            padding=(10, 10, 10, 4),
+        ).grid(row=0, column=0, sticky="w")
+        list_frame = ttk.Frame(popup, padding=10)
+        list_frame.grid(row=1, column=0, sticky="nsew")
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        circuit_list = tk.Listbox(list_frame, selectmode=tk.EXTENDED, exportselection=False)
+        circuit_list.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=circuit_list.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        circuit_list.configure(yscrollcommand=scrollbar.set)
+        for circuit in self._model_presets:
+            circuit_list.insert(tk.END, circuit)
+
+        entry = ttk.Entry(popup)
+        entry.grid(row=2, column=0, padx=10, pady=(0, 6), sticky="ew")
+
+        def add_circuit(_event=None) -> None:
+            value = entry.get().strip()
+            if value and value not in circuit_list.get(0, tk.END):
+                circuit_list.insert(tk.END, value)
+                entry.delete(0, tk.END)
+            entry.focus_set()
+
+        def remove_circuit() -> None:
+            for index in reversed(circuit_list.curselection()):
+                circuit_list.delete(index)
+
+        def restore_defaults() -> None:
+            circuit_list.delete(0, tk.END)
+            for circuit in MODEL_PRESETS:
+                circuit_list.insert(tk.END, circuit)
+
+        def save_and_close() -> None:
+            circuits = tuple(
+                circuit.strip()
+                for circuit in circuit_list.get(0, tk.END)
+                if circuit.strip()
+            )
+            if not circuits:
+                messagebox.showerror(
+                    "No circuits",
+                    "Keep at least one EEC circuit in the list.",
+                    parent=popup,
+                )
+                return
+            try:
+                self._save_preferences(circuits)
+            except OSError as error:
+                messagebox.showerror("Preferences save failed", str(error), parent=popup)
+                return
+            self._model_presets = tuple(dict.fromkeys(circuits))
+            if hasattr(self, "model_box"):
+                self.model_box.configure(values=self._model_presets)
+            self._update_status("preferences saved")
+            close_popup()
+
+        def close_popup() -> None:
+            self.preferences_popup = None
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        entry.bind("<Return>", add_circuit)
+        buttons = ttk.Frame(popup, padding=(10, 0, 10, 10))
+        buttons.grid(row=3, column=0, sticky="e")
+        ttk.Button(buttons, text="Add", command=add_circuit).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="Remove selected", command=remove_circuit).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(buttons, text="Restore defaults", command=restore_defaults).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(buttons, text="Save", command=save_and_close).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="Cancel", command=close_popup).pack(side=tk.LEFT, padx=3)
+        popup.grab_set()
+        popup.focus_force()
 
     def _build_interface(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -2436,7 +2575,7 @@ class EISApplication:
                     argument_entry = ttk.Combobox(
                         arguments_frame,
                         textvariable=argument_var,
-                        values=MODEL_PRESETS,
+                        values=self._model_presets,
                         state="normal",
                         width=18,
                     )
@@ -2612,7 +2751,7 @@ class EISApplication:
                 choices.extend(str(index) for index in range(1, selected_count + 1))
                 parameter_entry.configure(values=choices)
             elif action_var.get() == "Choose EEC model":
-                parameter_entry.configure(values=MODEL_PRESETS)
+                parameter_entry.configure(values=self._model_presets)
             elif action_var.get() == "Sort spectra by metadata":
                 parameter_entry.configure(
                     values=[
@@ -2975,6 +3114,8 @@ class EISApplication:
         return "break"
 
     def _toggle_drt_method_key(self, _event=None):
+        if self.analysis_mode_var.get() == "EEC":
+            return self._next_eec_circuit_key()
         if self.analysis_mode_var.get() != "DRT":
             return "break"
         self.analysis_drt_mode_var.set(
@@ -2983,6 +3124,81 @@ class EISApplication:
             else "Ridge DRT"
         )
         self._on_analysis_drt_mode_selected()
+        return "break"
+
+    def _next_eec_circuit_key(self, _event=None):
+        if self.analysis_mode_var.get() != "EEC" or self.state is None:
+            return "break"
+        circuits = self._model_presets
+        if not circuits:
+            return "break"
+        current = self.state.active.model(self.state.circuit)
+        try:
+            next_index = (circuits.index(current) + 1) % len(circuits)
+        except ValueError:
+            next_index = 0
+        self.model_var.set(circuits[next_index])
+        self.apply_model()
+        return "break"
+
+    def _open_circuit_picker_key(self, _event=None):
+        if self.analysis_mode_var.get() != "EEC" or self.state is None:
+            return "break"
+        existing = getattr(self, "circuit_picker_popup", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return "break"
+
+        popup = tk.Toplevel(self.root)
+        self.circuit_picker_popup = popup
+        popup.title("Choose EEC circuit")
+        popup.transient(self.root)
+        popup.resizable(False, False)
+        ttk.Label(
+            popup,
+            text="Select a circuit and press Enter to apply it",
+            padding=(12, 10, 12, 6),
+        ).pack(anchor="w")
+        circuit_list = tk.Listbox(
+            popup,
+            height=min(max(len(self._model_presets), 4), 12),
+            width=max(28, max(map(len, self._model_presets), default=28) + 2),
+            exportselection=False,
+        )
+        circuit_list.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 10))
+        for circuit in self._model_presets:
+            circuit_list.insert(tk.END, circuit)
+
+        current = self.state.active.model(self.state.circuit)
+        try:
+            current_index = self._model_presets.index(current)
+        except ValueError:
+            current_index = 0
+        circuit_list.selection_set(current_index)
+        circuit_list.activate(current_index)
+
+        def close_popup() -> None:
+            self.circuit_picker_popup = None
+            popup.destroy()
+
+        def apply_selected(_event=None):
+            selection = circuit_list.curselection()
+            if not selection:
+                return "break"
+            self.model_var.set(circuit_list.get(selection[0]))
+            close_popup()
+            self.apply_model()
+            return "break"
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        popup.bind("<Return>", apply_selected)
+        popup.bind("<KP_Enter>", apply_selected)
+        popup.bind("<Escape>", lambda _event: close_popup())
+        circuit_list.bind("<Double-Button-1>", apply_selected)
+        popup.grab_set()
+        popup.focus_force()
+        circuit_list.focus_set()
         return "break"
 
     def _calculate_current_drt_key(self, _event=None):
@@ -3180,7 +3396,7 @@ class EISApplication:
         self.model_box = ttk.Combobox(
             model_group,
             textvariable=self.model_var,
-            values=MODEL_PRESETS,
+            values=self._model_presets,
             state="normal",
         )
         self.model_box.grid(row=0, column=0, padx=(0, 5), sticky="ew")
@@ -3639,7 +3855,7 @@ class EISApplication:
         model_box = ttk.Combobox(
             body,
             textvariable=model_var,
-            values=MODEL_PRESETS,
+            values=self._model_presets,
             state="normal",
         )
         model_box.grid(row=1, column=0, sticky="ew", pady=(3, 8))
