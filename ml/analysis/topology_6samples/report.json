@@ -1,0 +1,17 @@
+{
+  "datasets":[
+    "A_raw",
+    "B_manual_range",
+    "C_ml_range_hist_gradient_boosting",
+    "C_ml_range_random_forest"
+  ],
+  "rows":39392,
+  "folds":[
+    "129",
+    "140",
+    "150",
+    "157",
+    "159",
+    "181"
+  ]
+}

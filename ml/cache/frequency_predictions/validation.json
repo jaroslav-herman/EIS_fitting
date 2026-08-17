@@ -1,0 +1,21 @@
+{
+  "source": "ml_frequency_range_181_159_140_129_150_157\\spectrum_only\\predictions.csv",
+  "models": [
+    "hist_gradient_boosting",
+    "random_forest"
+  ],
+  "samples": [
+    "129",
+    "140",
+    "150",
+    "157",
+    "159",
+    "181"
+  ],
+  "prediction_rows": 9848,
+  "unique_spectra": 4924,
+  "duplicate_prediction_rows": 0,
+  "fold_mismatch_rows": 0,
+  "missing_models_or_folds": [],
+  "runtime_s": 0.18232629998237826
+}

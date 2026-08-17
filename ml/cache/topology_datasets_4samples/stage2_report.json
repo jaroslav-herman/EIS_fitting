@@ -1,0 +1,47 @@
+{
+  "datasets": {
+    "topology_raw": {
+      "rows": 8228,
+      "features": 192,
+      "folds": [
+        "129",
+        "140",
+        "150",
+        "157"
+      ]
+    },
+    "topology_manual": {
+      "rows": 8228,
+      "features": 192,
+      "folds": [
+        "129",
+        "140",
+        "150",
+        "157"
+      ]
+    },
+    "topology_ml_rf": {
+      "rows": 8228,
+      "features": 192,
+      "folds": [
+        "129",
+        "140",
+        "150",
+        "157"
+      ]
+    },
+    "topology_ml_hgb": {
+      "rows": 8228,
+      "features": 192,
+      "folds": [
+        "129",
+        "140",
+        "150",
+        "157"
+      ]
+    }
+  },
+  "failures": [],
+  "runtime_s": 32.39520950001315,
+  "failure_count": 0
+}
