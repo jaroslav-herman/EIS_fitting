@@ -6,3 +6,93 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+
+# ==========================
+# Virtual environments
+# ==========================
+
+.venv/
+venv/
+env/
+ENV/
+.uv-cache/
+
+# ==========================
+# Test, type-checker, and notebook caches
+# ==========================
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ==========================
+# IDE / editor files
+# ==========================
+
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ==========================
+# Temporary files and operating-system artifacts
+# ==========================
+
+*.tmp
+*.temp
+*.bak
+.DS_Store
+Thumbs.db
+
+# ==========================
+# ML generated analysis and experiment output
+# ==========================
+
+# ML source code remains trackable: ml/*.py and ml/**/*.py are not ignored.
+# These directories contain reproducible plots, reports, predictions, and
+# sample-specific inference results. Already-tracked files remain tracked.
+ml/cache/
+ml/analysis/
+
+# Root-level experiment output directories.
+ml_results/
+ml_results*/
+ml_frequency_range*/
+ml_outlier_cache*/
+ml_cache_validation*/
+
+# Targeted generated ML result names. Original *.eisfit.json project files
+# and ordinary JSON/CSV source data remain trackable.
+*_ML*.eisfit.json
+*_ML*.json
+*_ML*_predictions.csv
+
+# ==========================
+# Large generated ML artifacts
+# ==========================
+
+*.joblib
+*.npz
+*.npy
+*.parquet
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+
+# ==========================
+# Generated logs
+# ==========================
+
+*.log
+
+# ==========================
+# Local secrets and machine-specific configuration
+# ==========================
+
+.env
+.env.*
+!.env.example
+*.local
