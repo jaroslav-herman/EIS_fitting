@@ -20,4 +20,4 @@ dependencies = [
 [tool.uv.sources]
 bayes-drt2 = { git = "https://github.com/jaroslav-herman/bayes-drt2.git" }
 hybrid-drt = { git = "https://github.com/jdhuang-csm/hybrid-drt.git" }
-wepy = { path = "../wepy", editable = true }
+wepy = { git = "https://github.com/jaroslav-herman/wepy" }

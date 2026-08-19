@@ -159,7 +159,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=3.0.3" },
     { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "scipy", specifier = ">=1.18.0" },
-    { name = "wepy", editable = "../wepy" },
+    { name = "wepy", git = "https://github.com/jaroslav-herman/wepy" },
 ]
 
 [[package]]
@@ -190,7 +190,7 @@ wheels = [
 [[package]]
 name = "galvani"
 version = "0.5.0"
-source = { git = "https://github.com/jaroslav-herman/galvani#bd6d3d6b688afda9a73a59c07089ad57e5042101" }
+source = { git = "https://github.com/jaroslav-herman/galvani#14a5bc29ca47e48c4423d6a93c41d9df7d0aced5" }
 dependencies = [
     { name = "numpy" },
 ]
@@ -840,7 +840,7 @@ wheels = [
 [[package]]
 name = "wepy"
 version = "0.1.0"
-source = { editable = "../wepy" }
+source = { git = "https://github.com/jaroslav-herman/wepy#ede59f1f486aecd8d7daeda8214d0c794dc6a480" }
 dependencies = [
     { name = "bayes-drt2" },
     { name = "galvani" },
@@ -851,17 +851,4 @@ dependencies = [
     { name = "natsort" },
     { name = "numpy" },
     { name = "pandas" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "bayes-drt2", git = "https://github.com/jaroslav-herman/bayes-drt2" },
-    { name = "galvani", git = "https://github.com/jaroslav-herman/galvani" },
-    { name = "hybrid-drt", git = "https://github.com/jdhuang-csm/hybrid-drt" },
-    { name = "impedance", specifier = ">=1.7.1" },
-    { name = "matplotlib", specifier = ">=3.11.1" },
-    { name = "mittag-leffler", git = "https://github.com/jdhuang-csm/mittag-leffler" },
-    { name = "natsort", specifier = ">=8.4.0" },
-    { name = "numpy", specifier = ">=2.5.1" },
-    { name = "pandas", specifier = ">=3.0.3" },
 ]
