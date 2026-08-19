@@ -127,16 +127,47 @@ def _canonical_datasource(value: object) -> str:
     return value.casefold()
 
 
-def _relaxis_circuit(model: object) -> str:
-    """Translate common RelaxIS model labels to impedance.py circuit syntax."""
-    text = str(model or "").strip()
-    if not text or text.casefold() == "impedance":
-        return "R0-L0-p(R1,CPE1)"
-    base = "R0-L0" if re.match(r"^R-I(?:-|$)", text, re.I) else "R0"
-    groups = len(re.findall(r"\(R\)\s*\(P\)", text, re.I))
-    if groups:
-        return base + "-" + "-".join(f"p(R{i},CPE{i})" for i in range(1, groups + 1))
-    return base
+def _relaxis_circuit(model: object) -> str | None:
+    """Translate a compatible RelaxIS topology to impedance.py syntax.
+
+    RelaxIS stores compact labels such as ``R-I-(R)(P)-(R)(P)``.  The
+    parser deliberately returns ``None`` for unknown topologies so an
+    incorrect EEC is never assigned silently.
+    """
+    text = re.sub(r"\s+", "", str(model or "").strip())
+    if not text or text.casefold() in {"impedance", "unassignedspectra"}:
+        return None
+    if re.fullmatch(r"R\d+(?:-L\d+)?(?:-p\(R\d+,CPE\d+\))*", text, re.I):
+        return text
+    match = re.fullmatch(r"(R(?:-I)?)(?:-\(R\)\(P\))*", text, re.I)
+    if not match:
+        return None
+    base = "R0-L0" if match.group(1).casefold() == "r-i" else "R0"
+    groups = len(re.findall(r"\(R\)\(P\)", text, re.I))
+    return base + ("-" if groups else "") + "-".join(
+        f"p(R{i},CPE{i})" for i in range(1, groups + 1)
+    )
+
+
+def _finite_relaxis_limit(value: object) -> float | None:
+    """Convert RelaxIS limits, treating huge/sentinel values as unset."""
+    number = _json_number(value)
+    if number is None or number <= 0 or abs(number) >= 1e100:
+        return None
+    return number
+
+
+def _frequency_window(frame: pd.DataFrame, instance: dict) -> list[float]:
+    measured = (float(frame["freq_hz"].min()), float(frame["freq_hz"].max()))
+    low = _finite_relaxis_limit(instance.get("lowfreqlimit"))
+    high = _finite_relaxis_limit(instance.get("highfreqlimit"))
+    if low is None:
+        low = measured[0]
+    if high is None:
+        high = measured[1]
+    if low > high:
+        return list(measured)
+    return [low, high]
 
 
 def _parameter_name(relaxis_name: object, circuit: str) -> tuple[str, str]:
@@ -219,6 +250,19 @@ def _conflict_choice(handler, datasource: str, instances: list[dict]) -> list[di
     choice = handler(datasource, instances)
     if choice in (None, "all", "ALL", True):
         return instances
+    if isinstance(choice, dict):
+        if choice.get("all"):
+            return instances
+        index = choice.get("index")
+        if isinstance(index, int) and 0 <= index < len(instances):
+            selected = dict(instances[index])
+        else:
+            selected = dict(instances[0])
+        if choice.get("model"):
+            selected["model"] = choice["model"]
+        if choice.get("circuit"):
+            selected["circuit"] = choice["circuit"]
+        return [selected]
     if isinstance(choice, int):
         return [instances[choice]]
     if isinstance(choice, (list, tuple)):
@@ -229,23 +273,23 @@ def _conflict_choice(handler, datasource: str, instances: list[dict]) -> list[di
 
 
 def export_to_eisfit_json(eis3_path: str | Path, output_dir: str | Path, model_conflict_handler=None,
-                          metadata_mapping: dict[str, str] | None = None) -> Path:
+                          metadata_mapping: dict[str, str] | None = None,
+                          unmapped_model_handler=None) -> Path:
     """Convert a RelaxIS database into the built-in EIS-fitting project format."""
     source = Path(eis3_path).resolve()
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     con = connect_read_only(source)
     try:
-        files = pd.read_sql_query(
-            "SELECT ID, groupname, datasource, fitted, lasttransferfunction FROM Files ORDER BY ID", con
-        )
-        points = pd.read_sql_query(
-            "SELECT file_id, frequency, zreal, zimag, active FROM Datapoints ORDER BY file_id, ID", con
-        )
-        parameters = pd.read_sql_query(
-            "SELECT file_id, pindex, name, fixed, value, error, lowerlimit, upperlimit FROM Fitparameters ORDER BY file_id, pindex", con
-        )
-        info = pd.read_sql_query("SELECT file_id, name, value FROM FileInformation", con)
+        files = read_table(con, "Files", ["ID", "groupname", "datasource", "fitted", "lasttransferfunction", "lowfreqlimit", "highfreqlimit"])
+        files = files.sort_values("ID", kind="mergesort") if "ID" in files else files
+        points = read_table(con, "Datapoints", ["ID", "file_id", "frequency", "zreal", "zimag", "active"])
+        if {"file_id", "ID"}.issubset(points.columns):
+            points = points.sort_values(["file_id", "ID"], kind="mergesort")
+        parameters = read_table(con, "Fitparameters", ["file_id", "pindex", "name", "fixed", "value", "error", "lowerlimit", "upperlimit"])
+        if {"file_id", "pindex"}.issubset(parameters.columns):
+            parameters = parameters.sort_values(["file_id", "pindex"], kind="mergesort")
+        info = read_table(con, "FileInformation", ["file_id", "name", "value"])
     finally:
         con.close()
 
@@ -256,8 +300,12 @@ def export_to_eisfit_json(eis3_path: str | Path, output_dir: str | Path, model_c
             continue
         group = str(row.get("groupname") or "").strip()
         assigned = group.casefold() != "unassigned spectra"
+        topology = row.get("lasttransferfunction")
+        if not topology or str(topology).casefold() == "impedance":
+            topology = group
         instance = {"file_id": int(row["ID"]), "datasource": row["datasource"], "model": group, "assigned": assigned,
-                    "circuit": _relaxis_circuit(row.get("lasttransferfunction") or group), "fitted": bool(row.get("fitted"))}
+                    "circuit": _relaxis_circuit(topology) if assigned else "R0-L0-p(R1,CPE1)", "fitted": bool(row.get("fitted")),
+                    "lowfreqlimit": row.get("lowfreqlimit"), "highfreqlimit": row.get("highfreqlimit")}
         grouped.setdefault(key, {"display": str(row["datasource"]), "assigned": [], "unassigned": []})["assigned" if assigned else "unassigned"].append(instance)
 
     selected: list[dict] = []
@@ -277,6 +325,19 @@ def export_to_eisfit_json(eis3_path: str | Path, output_dir: str | Path, model_c
         frame = frame[frame["frequency"].notna() & frame["zreal"].notna() & frame["zimag"].notna()]
         if frame.empty:
             continue
+        if instance["circuit"] is None:
+            if unmapped_model_handler is None:
+                raise ValueError(
+                    f"RelaxIS model {instance['model']!r} for datasource "
+                    f"{instance['datasource']!r} cannot be mapped automatically"
+                )
+            mapped = unmapped_model_handler(instance["model"], instance)
+            if isinstance(mapped, dict):
+                instance = {**instance, **mapped}
+            else:
+                instance = {**instance, "circuit": mapped}
+            if not instance.get("circuit"):
+                raise ValueError(f"No EIS-fitting circuit was selected for {instance['model']!r}")
         metadata = {"source_name": instance["datasource"], "relaxis_group": instance["model"]}
         metadata.update(_eisfit_metadata(info_by_file.get(file_id, {}), metadata_mapping))
         frame["freq_hz"] = frame["frequency"].astype(float)
@@ -286,6 +347,9 @@ def export_to_eisfit_json(eis3_path: str | Path, output_dir: str | Path, model_c
         frame["ewe_v"] = _json_number(info_by_file.get(file_id, {}).get("DCVoltage"), 0.0)
         frame["i_ma"] = _json_number(info_by_file.get(file_id, {}).get("Current"), 0.0)
         frame["time_s"] = _json_number(info_by_file.get(file_id, {}).get("Time"), None)
+        # Keep every point-wise field aligned with the descending order used
+        # by eis_services.load_cycle().
+        frame = frame.sort_values("freq_hz", ascending=False, kind="mergesort").reset_index(drop=True)
         dataframe = frame[["freq_hz", "cycle_number", "re_z_ohm", "minus_im_z_ohm", "ewe_v", "i_ma", "time_s"]]
         params = []
         for row in parameters[parameters["file_id"] == file_id].to_dict("records"):
@@ -297,7 +361,7 @@ def export_to_eisfit_json(eis3_path: str | Path, output_dir: str | Path, model_c
         state = {"format": PROJECT_FORMAT, "version": PROJECT_VERSION, "source_path": str(source), "circuit": instance["circuit"], "control": "working",
                  "active_cycle": cycle_number, "all_frequency_window": None, "default_parameters": params,
                  "cycles": {str(cycle_number): {"circuit": instance["circuit"], "potential_v": dataframe["ewe_v"].iloc[0], "current_ma": dataframe["i_ma"].iloc[0], "time_s": dataframe["time_s"].iloc[0],
-                 "frequency_window": [float(dataframe["freq_hz"].min()), float(dataframe["freq_hz"].max())], "auto_max_frequency": False,
+                 "frequency_window": _frequency_window(frame, instance), "auto_max_frequency": False,
                  "manually_included": frame["active"].fillna(0).astype(bool).tolist(), "outliers": [False] * len(frame), "parameters": params, "fit_parameters": None,
                  "fit_frequency_hz": None, "fit_impedance": None, "fit_at_data_impedance": None, "ridge_tau_s": None, "ridge_gamma_ohm": None, "drt_label": None,
                  "saved_ridge_tau_s": None, "saved_ridge_gamma_ohm": None, "saved_ridge_included_mask": None, "saved_ridge_outlier_indices": None, "saved_ridge_parameters": [],

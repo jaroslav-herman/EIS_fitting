@@ -12629,10 +12629,12 @@ class EISApplication:
             tempfile.mkdtemp(prefix="eis_fitting_relaxis_")
         )
         try:
+            self._relaxis_model_override = None
             converted_path = export_to_eisfit_json(
                 source_path,
                 temporary_directory,
                 model_conflict_handler=self._resolve_relaxis_model_conflict,
+                unmapped_model_handler=self._resolve_unmapped_relaxis_model,
             )
             result = self._load_saved_project(converted_path)
             return result, temporary_directory
@@ -12643,6 +12645,9 @@ class EISApplication:
     def _resolve_relaxis_model_conflict(
         self, datasource: str, instances: list[dict]
     ) -> list[dict] | int | str:
+        override = getattr(self, "_relaxis_model_override", None)
+        if override is not None:
+            return dict(override)
         result: dict[str, object] = {}
         finished = threading.Event()
 
@@ -12682,16 +12687,29 @@ class EISApplication:
                 state="readonly",
                 width=48,
             ).pack(anchor="w", padx=32, pady=(0, 12))
+            apply_all = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                dialog,
+                text="Apply selected model for all spectra in this import",
+                variable=apply_all,
+            ).pack(anchor="w", padx=16, pady=(0, 10))
 
             def accept() -> None:
                 if choice.get() == "all":
                     result["value"] = "all"
                 else:
-                    result["value"] = next(
+                    index = next(
                         index
                         for index, label in enumerate(models)
                         if label == selected_model.get()
                     )
+                    selected_instance = instances[index]
+                    result["value"] = {"index": index}
+                    if apply_all.get():
+                        self._relaxis_model_override = {
+                            "model": selected_instance.get("model"),
+                            "circuit": selected_instance.get("circuit"),
+                        }
                 dialog.destroy()
 
             ttk.Button(dialog, text="Continue", command=accept).pack(
@@ -12704,6 +12722,62 @@ class EISApplication:
         self.root.after(0, show_dialog)
         finished.wait()
         return result.get("value", "all")
+
+    def _resolve_unmapped_relaxis_model(self, model: str, instance: dict) -> dict:
+        """Explicitly select a known EIS-fitting circuit for an unknown label."""
+        override = getattr(self, "_relaxis_model_override", None)
+        if override is not None:
+            return dict(override)
+        result: dict[str, object] = {}
+        finished = threading.Event()
+
+        def show_dialog() -> None:
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Choose EEC model for RelaxIS import")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            ttk.Label(
+                dialog,
+                text=f"RelaxIS model {model!r} cannot be mapped automatically.\n"
+                "Select an EIS-fitting circuit explicitly:",
+                justify=tk.LEFT,
+            ).pack(anchor="w", padx=16, pady=(16, 10))
+            selected = tk.StringVar(value=self._model_presets[0] if self._model_presets else "")
+            ttk.Combobox(
+                dialog, textvariable=selected, values=self._model_presets,
+                state="readonly", width=48,
+            ).pack(anchor="w", padx=16, pady=(0, 12))
+            apply_all = tk.BooleanVar(value=False)
+            ttk.Checkbutton(
+                dialog,
+                text="Apply selected model for all remaining unresolved spectra",
+                variable=apply_all,
+            ).pack(anchor="w", padx=16, pady=(0, 10))
+
+            def accept() -> None:
+                result["value"] = {"circuit": selected.get(), "model": selected.get()}
+                if apply_all.get():
+                    self._relaxis_model_override = dict(result["value"])
+                dialog.destroy()
+
+            def cancel() -> None:
+                result["value"] = {"circuit": None}
+                dialog.destroy()
+
+            buttons = ttk.Frame(dialog)
+            buttons.pack(anchor="e", padx=16, pady=(0, 14))
+            ttk.Button(buttons, text="Cancel", command=cancel).pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Button(buttons, text="Continue", command=accept).pack(side=tk.LEFT)
+            dialog.protocol("WM_DELETE_WINDOW", cancel)
+            dialog.wait_window()
+            finished.set()
+
+        self.root.after(0, show_dialog)
+        finished.wait()
+        selected = result.get("value", {"circuit": None})
+        if not selected.get("circuit"):
+            raise ValueError(f"No EIS-fitting circuit selected for RelaxIS model {model!r}")
+        return selected
 
     def _finish_relaxis_project_load(
         self,
