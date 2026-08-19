@@ -416,15 +416,92 @@ def load_project(
     return projects[0]
 
 
+def _read_eis_dataframe(path: Path):
+    if path.suffix.casefold() == ".mpr":
+        import pandas as pd
+        from galvani.BioLogic import MPRfile, MPR_MAGIC
+
+        file_size = path.stat().st_size
+        prefix = path.read_bytes()[: len(MPR_MAGIC)]
+        if prefix != MPR_MAGIC:
+            raise ValueError(
+                f"File is not a recognized BioLogic .mpr file: {path.name} "
+                f"(size={file_size} bytes, signature={prefix[:16].hex()})"
+            )
+        try:
+            mpr = MPRfile(str(path), error_on_unknown_column=False)
+        except Exception as error:
+            raise ValueError(
+                f"Could not parse the BioLogic .mpr binary header in {path.name} "
+                f"(size={file_size} bytes, signature={prefix[:16].hex()}); "
+                f"the file may use an unsupported MPR format or be incomplete"
+            ) from error
+        dataframe = pd.DataFrame(mpr.data)
+        rename = {
+            "freq/Hz": "freq_hz",
+            "cycle number": "cycle_number",
+            "z cycle": "z_cycle",
+            "time/s": "time_s",
+            "<time>/s": "time_s",
+            "I/mA": "i_ma",
+            "<I>/mA": "i_ma",
+            "Ewe/V": "ewe_v",
+            "<Ewe>/V": "ewe_v",
+            "Ece/V": "ece_v",
+            "<Ece>/V": "ece_v",
+            "Ewe-Ece/V": "ewe_ece_v",
+            "Re(Z)/Ohm": "re_z_ohm",
+            "-Im(Z)/Ohm": "minus_im_z_ohm",
+            "Re(Zce)/Ohm": "re_zce_ohm",
+            "-Im(Zce)/Ohm": "minus_im_zce_ohm",
+            "Re(Zwe-ce)/Ohm": "re_zwe_ce_ohm",
+            "-Im(Zwe-ce)/Ohm": "minus_im_zwe_ce_ohm",
+        }
+        dataframe = dataframe.rename(
+            columns={name: value for name, value in rename.items() if name in dataframe}
+        )
+        if "z_cycle" in dataframe and "freq_hz" in dataframe:
+            nonzero_frequency = np.isfinite(dataframe["freq_hz"]) & (
+                dataframe["freq_hz"] != 0
+            )
+            z_cycles = _safe_unique_ints(dataframe.loc[nonzero_frequency, "z_cycle"])
+            if len(z_cycles) > 1:
+                dataframe["cycle_number"] = dataframe["z_cycle"]
+        if {"ewe_v", "ece_v"}.issubset(dataframe.columns):
+            dataframe["ewe_ece_v"] = dataframe["ewe_v"] - dataframe["ece_v"]
+        three_electrode = "ece_v" in dataframe or {
+            "re_zce_ohm",
+            "minus_im_zce_ohm",
+        }.issubset(dataframe.columns)
+        if not three_electrode:
+            if "re_zwe_ce_ohm" not in dataframe and "re_z_ohm" in dataframe:
+                dataframe["re_zwe_ce_ohm"] = dataframe["re_z_ohm"]
+            if (
+                "minus_im_zwe_ce_ohm" not in dataframe
+                and "minus_im_z_ohm" in dataframe
+            ):
+                dataframe["minus_im_zwe_ce_ohm"] = dataframe["minus_im_z_ohm"]
+            dataframe = dataframe.drop(
+                columns=["re_z_ohm", "minus_im_z_ohm"], errors="ignore"
+            )
+            if "ewe_ece_v" not in dataframe and "ewe_v" in dataframe:
+                dataframe["ewe_ece_v"] = dataframe["ewe_v"]
+        header_meta = {"Potential control": "Ewe-Ece"}
+        return dataframe, header_meta, "PEIS"
+
+    from wepy import read_mpt_dataframe
+
+    return read_mpt_dataframe(path)
+
+
 def load_projects_for_file(
     path: Path,
     cycle: int,
     control: str,
     circuit: str,
+    spectrum_kinds: list[str] | None = None,
 ) -> list[LoadedProject]:
-    from wepy import read_mpt_dataframe
-
-    dataframe, header_meta, technique = read_mpt_dataframe(path)
+    dataframe, header_meta, technique = _read_eis_dataframe(path)
     cycles = (
         _safe_unique_ints(dataframe["cycle_number"].values)
         if "cycle_number" in dataframe.columns
@@ -434,11 +511,15 @@ def load_projects_for_file(
         raise ValueError("No cycles were found in the file")
     parameters = circuit_parameters(circuit)
     projects: list[LoadedProject] = []
-    spectrum_kinds = _order_spectrum_kinds(
-        _available_spectrum_kinds(dataframe, header_meta),
+    available_kinds = _available_spectrum_kinds(dataframe, header_meta)
+    ordered_kinds = _order_spectrum_kinds(
+        available_kinds,
         control,
     )
-    for spectrum_kind in spectrum_kinds:
+    if spectrum_kinds is not None:
+        requested = set(spectrum_kinds)
+        ordered_kinds = [kind for kind in ordered_kinds if kind in requested]
+    for spectrum_kind in ordered_kinds:
         valid_cycles, skipped_cycles = _cycles_with_impedance(
             dataframe, cycles, spectrum_kind
         )
@@ -531,17 +612,31 @@ def load_projects(
     control: str,
     circuit: str,
     cycle: int = 1,
+    spectrum_kinds_by_path: dict[Path, list[str]] | None = None,
 ) -> ProjectImportReport:
     loaded: list[tuple[str, LoadedProject]] = []
     errors: list[tuple[Path, str]] = []
     for path in paths:
         try:
-            projects = load_projects_for_file(path, cycle, control, circuit)
+            selected_kinds = (
+                spectrum_kinds_by_path.get(path.resolve())
+                if spectrum_kinds_by_path is not None
+                else None
+            )
+            projects = load_projects_for_file(
+                path, cycle, control, circuit, selected_kinds
+            )
         except Exception as error:
             errors.append((path, f"{type(error).__name__}: {error}"))
         else:
             loaded.extend((project.dataset_id, project) for project in projects)
     return ProjectImportReport(loaded, errors)
+
+
+def inspect_eis_file_spectrum_kinds(path: Path) -> list[str]:
+    """Return the electrode-pair spectra available in an EIS data file."""
+    _dataframe, header_meta, _technique = _read_eis_dataframe(path)
+    return _available_spectrum_kinds(_dataframe, header_meta)
 
 
 def _clamp_initial(value: float, parameter: ParameterValue) -> float:

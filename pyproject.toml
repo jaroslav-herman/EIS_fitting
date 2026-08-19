@@ -14,9 +14,12 @@ dependencies = [
     "pandas>=3.0.3",
     "scipy>=1.18.0",
     "wepy",
+    "pyarrow>=25.0.1",
+    "galvani",
 ]
 
 [tool.uv.sources]
 bayes-drt2 = { git = "https://github.com/jaroslav-herman/bayes-drt2.git" }
 hybrid-drt = { git = "https://github.com/jdhuang-csm/hybrid-drt.git" }
 wepy = { git = "https://github.com/jaroslav-herman/wepy.git" }
+galvani = { git = "https://github.com/jaroslav-herman/galvani" }

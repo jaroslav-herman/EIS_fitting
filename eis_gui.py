@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
@@ -18,7 +20,7 @@ from scipy.optimize import curve_fit
 from scipy.special import voigt_profile
 from wepy.eis import tau as cpe_tau
 
-from eis_model import ParameterValue, ProjectState
+from eis_model import CycleState, ParameterValue, ProjectState
 from eis_project import (
     _dataframe_to_payload,
     _state_to_payload,
@@ -59,12 +61,25 @@ from eis_services import (
     analyze_outliers,
     find_outliers_for_all_cycles,
     fit_cycle,
+    inspect_eis_file_spectrum_kinds,
     refine_fit_cycle,
     load_cycle,
     load_project_from_dataframe,
     load_project,
     load_projects,
     select_eec_model_from_hybrid_drt,
+)
+from ml.gui_results import MLResult, load_ml_results, suggested_eec
+from ml.results_schema import spectrum_identifier
+from ml.point_validity import detect_outliers_in_active_points
+from spectrum_simulator import logarithmic_frequencies, simulate_spectrum
+from extract_relaxis import export_to_eisfit_json
+from explorer_filter import (
+    FilterCondition,
+    FilterDefinition,
+    apply_filters,
+    field_is_numeric,
+    field_operators,
 )
 
 MODEL_PRESETS = (
@@ -462,6 +477,72 @@ class MetadataEditDialog(tk.Toplevel):
         self.destroy()
 
 
+class ElectrodeSelectionDialog(tk.Toplevel):
+    _labels = {
+        "working": "WE–RE",
+        "cell": "WE–CE",
+        "counter": "CE–RE",
+    }
+
+    def __init__(self, parent: tk.Tk, path: Path, available: list[str]) -> None:
+        super().__init__(parent)
+        self.result: tuple[list[str], bool] | None = None
+        self.title(f"Select spectra — {path.name}")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            body,
+            text="This file contains multiple electrode-pair spectra.\nSelect the spectra to import:",
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 8))
+        self._variables = {
+            kind: tk.BooleanVar(value=True) for kind in available
+        }
+        for kind in ("working", "cell", "counter"):
+            if kind in self._variables:
+                ttk.Checkbutton(
+                    body,
+                    text=self._labels[kind],
+                    variable=self._variables[kind],
+                ).pack(anchor="w")
+        self.apply_to_all_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            body,
+            text="Apply to all subsequent applicable files in this import",
+            variable=self.apply_to_all_var,
+        ).pack(anchor="w", pady=(8, 0))
+        buttons = ttk.Frame(body)
+        buttons.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Import selected", command=self._accept).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+        self.bind("<Return>", lambda _event: self._accept())
+        self.grab_set()
+
+    def _accept(self) -> None:
+        selected = [kind for kind, variable in self._variables.items() if variable.get()]
+        if not selected:
+            messagebox.showerror(
+                "No spectra selected",
+                "Select at least one electrode-pair spectrum.",
+                parent=self,
+            )
+            return
+        self.result = (selected, self.apply_to_all_var.get())
+        self.destroy()
+
+
+def _compatible_spectrum_selection(
+    selection: list[str], available: list[str]
+) -> list[str] | None:
+    compatible = [kind for kind in selection if kind in available]
+    return compatible or None
+
+
 class EISApplication:
     def __init__(
         self,
@@ -491,6 +572,9 @@ class EISApplication:
         self._explorer_rows: dict[str, tuple[str, LoadedProject, SpectrumMetadata]] = (
             {}
         )
+        self._explorer_current_column_order: list[str] | None = None
+        self._fit_explorer_filter = FilterDefinition()
+        self._drt_explorer_filter = FilterDefinition()
         self._explorer_lookup: dict[tuple[str, int], str] = {}
         self._explorer_anchor_item: str | None = None
         self._explorer_primary_item: str | None = None
@@ -512,8 +596,13 @@ class EISApplication:
         self._plot_imports = None
         self.plot_mode = "nyquist"
         self.procedure_blocks: dict[str, list[dict[str, str]]] = {}
+        self.simulator_spectrum = None
+        self.simulator_parameters: list[ParameterValue] = []
+        self.simulator_drt_result = None
+        self.simulator_drt_mode_var = tk.StringVar(value="Ridge DRT")
 
         self.threshold_var = tk.StringVar(value=f"{threshold:g}")
+        self.deterministic_threshold_var = tk.StringVar(value="4")
         self.refine_z_threshold_var = tk.StringVar(value="3.5")
         self.refine_max_iterations_var = tk.StringVar(value="5")
         self.model_var = tk.StringVar(value=circuit)
@@ -524,6 +613,13 @@ class EISApplication:
         self.show_drt_fit_var = tk.BooleanVar(value=False)
         self.show_drt_recovered_var = tk.BooleanVar(value=False)
         self.hide_legends_var = tk.BooleanVar(value=False)
+        self.show_ml_frequency_ranges_var = tk.BooleanVar(value=False)
+        self.show_ml_active_points_var = tk.BooleanVar(value=False)
+        self.show_ml_model_var = tk.BooleanVar(value=False)
+        self.show_ml_residuals_var = tk.BooleanVar(value=False)
+        self.ml_results: dict[str, MLResult] = {}
+        self.ml_results_directory: Path | None = None
+        self.ml_results_status_var = tk.StringVar(value="No ML results loaded")
         self.minimum_frequency_var = tk.StringVar()
         self.maximum_frequency_var = tk.StringVar()
         self.auto_max_frequency_var = tk.BooleanVar(value=False)
@@ -639,6 +735,10 @@ class EISApplication:
             command=self.load_project,
         )
         self.file_menu.add_command(
+            label="Load RelaxIS 3 project",
+            command=self.load_relaxis_project,
+        )
+        self.file_menu.add_command(
             label="Save project…",
             accelerator="Ctrl+S",
             command=self.save_project,
@@ -649,6 +749,7 @@ class EISApplication:
         self.file_menu.add_command(label="Exit", command=self.close)
         menu_bar.add_cascade(label="File", menu=self.file_menu)
         self._project_menu_actions = (
+            "Load RelaxIS 3 project",
             "Load project…",
             "Save project…",
             "Save current mask…",
@@ -763,6 +864,8 @@ class EISApplication:
         self._drt_explorer_x_preference = "I_mA"
         self._fit_explorer_y_preference = "R0"
         self._drt_explorer_y_preference = "R0"
+        self._explorer_column_order_preference: list[str] = []
+        self._explorer_new_columns_position = "end"
         self._eec_parameter_bounds = {
             "r": (0.0, 1e6),
             "l": (0.0, 1.0),
@@ -793,6 +896,14 @@ class EISApplication:
             self._drt_explorer_y_preference = str(
                 payload.get("drt_explorer_y", "R0")
             ).strip() or "R0"
+            saved_column_order = payload.get("explorer_column_order", [])
+            if isinstance(saved_column_order, list):
+                self._explorer_column_order_preference = [
+                    str(value).strip() for value in saved_column_order if str(value).strip()
+                ]
+            position = str(payload.get("explorer_new_columns_position", "end")).casefold()
+            if position in {"beginning", "end"}:
+                self._explorer_new_columns_position = position
             saved_bounds = payload.get("eec_parameter_bounds", {})
             if isinstance(saved_bounds, dict):
                 for category, default in self._eec_parameter_bounds.items():
@@ -832,6 +943,8 @@ class EISApplication:
         drt_explorer_x: str,
         fit_explorer_y: str,
         drt_explorer_y: str,
+        explorer_column_order: list[str],
+        explorer_new_columns_position: str,
     ) -> None:
         self._preferences_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._preferences_path.with_suffix(".tmp")
@@ -843,6 +956,8 @@ class EISApplication:
                     "drt_explorer_x": drt_explorer_x,
                     "fit_explorer_y": fit_explorer_y,
                     "drt_explorer_y": drt_explorer_y,
+                    "explorer_column_order": explorer_column_order,
+                    "explorer_new_columns_position": explorer_new_columns_position,
                     "eec_parameter_bounds": self._eec_parameter_bounds,
                     "auto_model": self._auto_model_settings,
                 },
@@ -880,6 +995,7 @@ class EISApplication:
         eec_tab.columnconfigure(0, weight=1)
         eec_tab.rowconfigure(1, weight=1)
         explorer_tab.columnconfigure(1, weight=1)
+        explorer_tab.rowconfigure(5, weight=1)
         auto_tab.columnconfigure(1, weight=1)
 
         fit_x_values = {"I_mA", "Ecell_V", "time_s", "cycle"}
@@ -933,6 +1049,64 @@ class EISApplication:
             values=sorted(drt_y_values),
             state="normal",
         ).grid(row=3, column=1, padx=(8, 0), pady=(6, 0), sticky="ew")
+        self._sync_custom_metadata_columns()
+        preference_columns = self._explorer_columns()
+        saved_order = [
+            column for column in self._explorer_column_order_preference
+            if column in preference_columns
+        ]
+        saved_order.extend(column for column in preference_columns if column not in saved_order)
+        ttk.Label(explorer_tab, text="Spectra Explorer column order").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(12, 4)
+        )
+        order_frame = ttk.Frame(explorer_tab)
+        order_frame.grid(row=5, column=0, columnspan=2, sticky="nsew")
+        order_frame.columnconfigure(0, weight=1)
+        order_frame.rowconfigure(0, weight=1)
+        order_list = tk.Listbox(order_frame, exportselection=False, height=6)
+        order_list.grid(row=0, column=0, sticky="nsew")
+        order_scrollbar = ttk.Scrollbar(
+            order_frame, orient=tk.VERTICAL, command=order_list.yview
+        )
+        order_scrollbar.grid(row=0, column=1, sticky="ns")
+        order_list.configure(yscrollcommand=order_scrollbar.set)
+        for column in saved_order:
+            order_list.insert(tk.END, f"{column} — {self._explorer_headings.get(column, column)}")
+        ttk.Label(explorer_tab, text="Unlisted columns:").grid(
+            row=6, column=0, sticky="w", pady=(6, 0)
+        )
+        new_columns_position_var = tk.StringVar(
+            value=self._explorer_new_columns_position.title()
+        )
+        ttk.Combobox(
+            explorer_tab,
+            textvariable=new_columns_position_var,
+            values=("End", "Beginning"),
+            state="readonly",
+        ).grid(row=6, column=1, sticky="ew", pady=(6, 0))
+
+        def move_order_item(direction: int) -> None:
+            selection = order_list.curselection()
+            if not selection:
+                return
+            index = selection[0]
+            target = index + direction
+            if not 0 <= target < order_list.size():
+                return
+            value = order_list.get(index)
+            order_list.delete(index)
+            order_list.insert(target, value)
+            order_list.selection_set(target)
+            order_list.see(target)
+
+        order_buttons = ttk.Frame(explorer_tab)
+        order_buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(4, 0))
+        ttk.Button(order_buttons, text="Move up", command=lambda: move_order_item(-1)).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(order_buttons, text="Move down", command=lambda: move_order_item(1)).pack(
+            side=tk.LEFT, padx=3
+        )
 
         ttk.Label(
             eec_tab,
@@ -1126,6 +1300,11 @@ class EISApplication:
                     drt_x_var.get().strip() or "I_mA",
                     fit_y_var.get().strip() or "R0",
                     drt_y_var.get().strip() or "R0",
+                    [
+                        saved_order_item.split(" — ", 1)[0]
+                        for saved_order_item in order_list.get(0, tk.END)
+                    ],
+                    new_columns_position_var.get().casefold(),
                 )
             except (OSError, TypeError, ValueError) as error:
                 messagebox.showerror("Preferences save failed", str(error), parent=popup)
@@ -1135,6 +1314,11 @@ class EISApplication:
             self._drt_explorer_x_preference = drt_x_var.get().strip() or "I_mA"
             self._fit_explorer_y_preference = fit_y_var.get().strip() or "R0"
             self._drt_explorer_y_preference = drt_y_var.get().strip() or "R0"
+            self._explorer_column_order_preference = [
+                saved_order_item.split(" — ", 1)[0]
+                for saved_order_item in order_list.get(0, tk.END)
+            ]
+            self._explorer_new_columns_position = new_columns_position_var.get().casefold()
             if hasattr(self, "model_box"):
                 self.model_box.configure(values=self._model_presets)
             self._update_status("preferences saved")
@@ -1263,6 +1447,60 @@ class EISApplication:
             variable=self.show_drt_recovered_var,
             command=self.toggle_drt_recovered_visibility,
         ).pack(side=tk.LEFT, padx=(8, 0))
+        self.ml_controls = ttk.LabelFrame(
+            self.plot_frame, text="ML results", padding=(6, 3)
+        )
+        self.ml_controls.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
+        ttk.Button(
+            self.ml_controls,
+            text="Load ML results…",
+            command=self.load_ml_results,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            self.ml_controls,
+            text="Load ML results file",
+            command=self.load_ml_results_file,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            self.ml_controls,
+            text="Apply ML EEC Model",
+            command=self.apply_ml_eec_to_selected,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            self.ml_controls,
+            text="Load ML Frequency Selection",
+            command=self.apply_ml_frequency_to_selected,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            self.ml_controls,
+            text="Apply ML Active Points",
+            command=self.apply_ml_active_points_to_selected,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            self.ml_controls,
+            text="Load ML Initial Parameters",
+            command=self.load_and_apply_ml_initial_parameters,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            self.ml_controls,
+            text="Restore Original Selection",
+            command=self.restore_ml_original_selection,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        for text, variable in (
+            ("Frequency ranges", self.show_ml_frequency_ranges_var),
+            ("Active points", self.show_ml_active_points_var),
+            ("EEC model", self.show_ml_model_var),
+            ("Residuals", self.show_ml_residuals_var),
+        ):
+            ttk.Checkbutton(
+                self.ml_controls,
+                text=text,
+                variable=variable,
+                command=self._refresh_ml_visuals,
+            ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(
+            self.ml_controls, textvariable=self.ml_results_status_var
+        ).pack(side=tk.LEFT, padx=(10, 0))
         self.figure = Figure(figsize=(7.5, 6.5), dpi=100, constrained_layout=True)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
         self.canvas.draw()
@@ -2000,10 +2238,54 @@ class EISApplication:
             [], [], "-", color="#00897b", linewidth=1.8, alpha=0.9, label="DRT fit"
         )
         self.drt_phase_fit_artist = None
+        (self.ml_range_artist,) = self.axes.plot(
+            [], [], "o", markerfacecolor="none", markeredgecolor="#00838f",
+            markersize=10, markeredgewidth=1.2, alpha=0.35,
+            label="ML frequency range",
+        )
+        (self.ml_active_artist,) = self.axes.plot(
+            [], [], "D", color="#2e7d32", markersize=5, alpha=0.8,
+            label="ML active points",
+        )
+        (self.ml_rejected_artist,) = self.axes.plot(
+            [], [], "x", color="#ef6c00", markersize=6, alpha=0.75,
+            label="ML rejected points",
+        )
+        (self.ml_model_artist,) = self.axes.plot(
+            [], [], "--", color="#d81b60", linewidth=2.0, alpha=0.9,
+            label="ML EEC model",
+        )
+        self.ml_residual_artist = self._line_collection_class(
+            [], colors="#d81b60", linewidths=0.8, linestyles="dotted",
+            alpha=0.45, zorder=1, label="ML residuals",
+        )
+        self.axes.add_collection(self.ml_residual_artist)
+        self.ml_phase_active_artist = None
+        self.ml_phase_rejected_artist = None
+        self.ml_phase_model_artist = None
+        self.ml_phase_residual_artist = None
         if self.phase_axes is not None:
             (self.drt_phase_fit_artist,) = self.phase_axes.plot(
                 [], [], "-", color="#00897b", linewidth=1.6, alpha=0.9, label="−Phase DRT fit"
             )
+        if self.phase_axes is not None:
+            (self.ml_phase_active_artist,) = self.phase_axes.plot(
+                [], [], "D", color="#388e3c", markersize=4, alpha=0.75,
+                label="ML active phase",
+            )
+            (self.ml_phase_rejected_artist,) = self.phase_axes.plot(
+                [], [], "x", color="#f57c00", markersize=5, alpha=0.7,
+                label="ML rejected phase",
+            )
+            (self.ml_phase_model_artist,) = self.phase_axes.plot(
+                [], [], "--", color="#c2185b", linewidth=1.7, alpha=0.9,
+                label="ML EEC phase",
+            )
+            self.ml_phase_residual_artist = self._line_collection_class(
+                [], colors="#c2185b", linewidths=0.7, linestyles="dotted",
+                alpha=0.4, zorder=1, label="ML phase residuals",
+            )
+            self.phase_axes.add_collection(self.ml_phase_residual_artist)
         self.axes.legend(loc="best")
         if self.phase_axes is not None:
             self.phase_axes.legend(loc="best")
@@ -2089,12 +2371,19 @@ class EISApplication:
             variable=self.natural_sort_var,
             command=self._toggle_natural_sort,
         ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            explorer_header,
+            text="Restore",
+            command=self.restore_explorer_column_order,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         group.configure(labelwidget=explorer_header)
         group.pack(fill=tk.BOTH, expand=True)
         group.columnconfigure(0, weight=1)
         group.rowconfigure(0, weight=1)
+        group.rowconfigure(1, weight=0)
         columns = (
             "fitted",
+            "drt",
             "source",
             "cycle",
             "potential",
@@ -2138,6 +2427,7 @@ class EISApplication:
         self._explorer_sort_reverse: dict[str, bool] = {}
         self._explorer_sort_columns: list[tuple[str, bool]] = []
         self._explorer_selected_column = "cycle"
+        self._explorer_header_drag: dict[str, object] | None = None
         widths = {
             "fitted": 62,
             "drt": 48,
@@ -2158,12 +2448,19 @@ class EISApplication:
             )
             anchor = tk.W if column == "source" else tk.E
             self.explorer.column(
-                column, width=widths[column], minwidth=55, anchor=anchor
+                column, width=widths[column], minwidth=55, anchor=anchor, stretch=False
             )
+        self.explorer.configure(displaycolumns=self._explorer_display_columns())
         scrollbar = ttk.Scrollbar(
             group, orient=tk.VERTICAL, command=self.explorer.yview
         )
-        self.explorer.configure(yscrollcommand=scrollbar.set)
+        self.explorer_xscrollbar = ttk.Scrollbar(
+            group, orient=tk.HORIZONTAL, command=self.explorer.xview
+        )
+        self.explorer.configure(
+            yscrollcommand=scrollbar.set,
+            xscrollcommand=self.explorer_xscrollbar.set,
+        )
         self.explorer.grid(row=0, column=0, sticky="nsew")
         self.explorer.tag_configure(
             "focus_row",
@@ -2171,16 +2468,32 @@ class EISApplication:
             font=("Segoe UI", 9, "bold"),
         )
         scrollbar.grid(row=0, column=1, sticky="ns")
+        self.explorer_xscrollbar.grid(row=1, column=0, sticky="ew")
+        self.explorer.bind(
+            "<Configure>",
+            lambda _event: self._schedule_explorer_horizontal_scrollbar_update(),
+            add="+",
+        )
         self.explorer.bind("<Button-1>", self._on_explorer_click, add="+")
         self.explorer.bind("<Double-Button-1>", self._on_explorer_double_click, add="+")
         self.explorer.bind("<Button-1>", self._on_explorer_heading_click, add="+")
         self.explorer.bind("<<TreeviewSelect>>", self._select_explorer_spectrum)
+        self.explorer.bind(
+            "<B1-Motion>",
+            self._on_explorer_header_drag_motion,
+            add="+",
+        )
+        self.explorer.bind(
+            "<ButtonRelease-1>",
+            self._on_explorer_header_release,
+            add="+",
+        )
         self.explorer.bind("<Up>", lambda event: self._on_explorer_arrow(event, -1))
         self.explorer.bind("<Down>", lambda event: self._on_explorer_arrow(event, 1))
         self.explorer.bind("<Control-a>", self.select_all_spectra)
 
         explorer_actions = ttk.Frame(group)
-        explorer_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        explorer_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         explorer_actions.columnconfigure(0, weight=1)
         explorer_actions.columnconfigure(1, weight=1)
         explorer_actions.columnconfigure(2, weight=1)
@@ -2232,7 +2545,23 @@ class EISApplication:
             group,
             textvariable=self.explorer_selection_var,
             anchor="w",
-        ).grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        self._schedule_explorer_horizontal_scrollbar_update()
+
+    def _schedule_explorer_horizontal_scrollbar_update(self) -> None:
+        if not hasattr(self, "explorer_xscrollbar"):
+            return
+        self.root.after_idle(self._update_explorer_horizontal_scrollbar)
+
+    def _update_explorer_horizontal_scrollbar(self) -> None:
+        if not hasattr(self, "explorer_xscrollbar"):
+            return
+        first, last = self.explorer.xview()
+        if first <= 0.0 and last >= 1.0:
+            self.explorer_xscrollbar.grid_remove()
+        else:
+            self.explorer_xscrollbar.grid()
 
     def _explorer_base_columns(self) -> tuple[str, ...]:
         return (
@@ -2250,6 +2579,33 @@ class EISApplication:
 
     def _explorer_columns(self) -> list[str]:
         return [*self._explorer_base_columns(), *self._custom_metadata_columns]
+
+    def _explorer_display_columns(self) -> list[str]:
+        available = self._explorer_columns()
+        preferred = self._explorer_current_column_order
+        if preferred is None:
+            preferred = self._explorer_column_order_preference
+        ordered = [column for column in preferred if column in available]
+        unlisted = [column for column in available if column not in ordered]
+        if self._explorer_new_columns_position == "beginning":
+            ordered = [*unlisted, *ordered]
+        else:
+            ordered.extend(unlisted)
+        return ordered
+
+    def _apply_explorer_column_order(self, order: list[str] | None = None) -> None:
+        available = self._explorer_columns()
+        if order is not None:
+            self._explorer_current_column_order = [
+                column for column in order if column in available
+            ]
+        display_columns = self._explorer_display_columns()
+        self.explorer.configure(displaycolumns=display_columns)
+        self._schedule_explorer_horizontal_scrollbar_update()
+
+    def restore_explorer_column_order(self) -> None:
+        self._explorer_current_column_order = None
+        self._apply_explorer_column_order()
 
     def _sync_custom_metadata_columns(self) -> None:
         columns: list[str] = []
@@ -2284,8 +2640,11 @@ class EISApplication:
     def _refresh_explorer_schema(self) -> None:
         if not hasattr(self, "explorer"):
             return
-        columns = self._explorer_columns()
-        self.explorer.configure(columns=columns)
+        columns = self._explorer_display_columns()
+        self.explorer.configure(
+            columns=columns,
+            displaycolumns=self._explorer_display_columns(),
+        )
         headings = {
             "fitted": "Fitted",
             "drt": "DRT",
@@ -2328,7 +2687,10 @@ class EISApplication:
             )
             if column in {"fitted", "drt"}:
                 anchor = tk.CENTER
-            self.explorer.column(column, width=widths[column], minwidth=55, anchor=anchor)
+            self.explorer.column(
+                column, width=widths[column], minwidth=55, anchor=anchor, stretch=False
+            )
+        self._schedule_explorer_horizontal_scrollbar_update()
 
     @staticmethod
     def _format_explorer_value(value, column: str | None = None) -> str:
@@ -2440,6 +2802,7 @@ class EISApplication:
         self._update_explorer_selection_status()
         if self._explorer_sort_columns:
             self._apply_explorer_sort()
+        self._schedule_explorer_horizontal_scrollbar_update()
 
     def _sort_explorer(self, column: str) -> None:
         if not self._explorer_rows:
@@ -2454,23 +2817,66 @@ class EISApplication:
         if self.explorer.identify_region(event.x, event.y) != "heading":
             return
         column_index = self.explorer.identify_column(event.x)
-        columns = list(self._explorer_columns())
+        columns = list(self._explorer_display_columns())
         if not column_index.startswith("#"):
             return "break"
         index = int(column_index[1:]) - 1
         if index < 0 or index >= len(columns):
             return "break"
         column = columns[index]
+        self._explorer_header_drag = {
+            "column": column,
+            "start_x": event.x,
+            "state": event.state,
+            "moved": False,
+        }
+        return "break"
+
+    def _on_explorer_header_drag_motion(self, event):
+        drag = self._explorer_header_drag
+        if drag is None:
+            return
+        if abs(event.x - int(drag["start_x"])) < 5:
+            return
+        columns = self._explorer_display_columns()
+        target_index_text = self.explorer.identify_column(event.x)
+        if not target_index_text.startswith("#"):
+            return
+        target_index = int(target_index_text[1:]) - 1
+        if not 0 <= target_index < len(columns):
+            return
+        source_column = str(drag["column"])
+        source_index = columns.index(source_column)
+        if source_index == target_index:
+            return
+        columns.insert(target_index, columns.pop(source_index))
+        self._explorer_current_column_order = columns
+        drag["moved"] = True
+        self._apply_explorer_column_order(columns)
+
+    def _on_explorer_header_release(self, event):
+        drag = self._explorer_header_drag
+        self._explorer_header_drag = None
+        if drag is None:
+            self._schedule_explorer_horizontal_scrollbar_update()
+            return
+        if not bool(drag["moved"]):
+            self._sort_explorer_heading(
+                str(drag["column"]), int(drag["state"])
+            )
+        self._schedule_explorer_horizontal_scrollbar_update()
+
+    def _sort_explorer_heading(self, column: str, state: int) -> None:
         if not self._explorer_rows:
-            return "break"
-        shift_pressed = bool(event.state & 0x0001)
+            return
+        shift_pressed = bool(state & 0x0001)
         if not shift_pressed:
             reverse = self._explorer_sort_reverse.get(column, False)
             self._explorer_sort_columns = [(column, reverse)]
             self._explorer_selected_column = column
             self._apply_explorer_sort()
             self._explorer_sort_reverse[column] = not reverse
-            return "break"
+            return
         existing = {name: reverse for name, reverse in self._explorer_sort_columns}
         if column in existing:
             reverse = not existing[column]
@@ -2484,7 +2890,6 @@ class EISApplication:
         self._explorer_selected_column = column
         self._apply_explorer_sort()
         self._explorer_sort_reverse[column] = not reverse
-        return "break"
 
     def _toggle_natural_sort(self) -> None:
         if not self._explorer_rows:
@@ -3547,7 +3952,7 @@ class EISApplication:
             return "break"
         item = self.explorer.identify_row(event.y)
         column_id = self.explorer.identify_column(event.x)
-        columns = self._explorer_columns()
+        columns = self._explorer_display_columns()
         if not item or not column_id.startswith("#"):
             return "break"
         column_index = int(column_id[1:]) - 1
@@ -3664,7 +4069,7 @@ class EISApplication:
         self.analysis_mode_box = ttk.Combobox(
             mode_frame,
             textvariable=self.analysis_mode_var,
-            values=("EEC", "DRT"),
+            values=("EEC", "DRT", "Spectra Simulator"),
             state="readonly",
             width=12,
         )
@@ -3689,40 +4094,26 @@ class EISApplication:
         self.model_button = ttk.Button(
             model_group, text="Set model", command=self.apply_model
         )
-        self.model_button.grid(row=0, column=1)
+        self.model_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
         self.model_selected_button = ttk.Button(
             model_group,
             text="Set model for selected",
             command=self.apply_model_to_selected,
         )
-        self.model_selected_button.grid(row=0, column=2, padx=(5, 0))
-        self.sort_tau_button = ttk.Button(
-            model_group,
-            text="Sort by tau: current",
-            command=self.sort_parameters_by_tau,
-        )
-        self.sort_tau_button.grid(row=1, column=0, padx=(0, 3), pady=(5, 0), sticky="ew")
+        self.model_selected_button.grid(row=0, column=2, padx=(5, 0), sticky="ew")
         self.sort_tau_selected_button = ttk.Button(
             model_group,
-            text="Sort by tau: selected",
+            text="Sort by tau",
             command=self.sort_selected_parameters_by_tau,
         )
-        self.sort_tau_selected_button.grid(row=1, column=1, columnspan=2, padx=(3, 0), pady=(5, 0), sticky="ew")
-        self.switch_blocks_button = ttk.Button(
-            model_group,
-            text="Switch blocks: current",
-            command=self.switch_parameter_blocks,
-        )
-        self.switch_blocks_button.grid(
-            row=2, column=0, padx=(0, 3), pady=(5, 0), sticky="ew"
-        )
+        self.sort_tau_selected_button.grid(row=1, column=0, padx=(0, 3), pady=(5, 0), sticky="ew")
         self.switch_blocks_selected_button = ttk.Button(
             model_group,
-            text="Switch blocks: selected",
+            text="Switch blocks",
             command=self.switch_selected_parameter_blocks,
         )
         self.switch_blocks_selected_button.grid(
-            row=2, column=1, columnspan=2, padx=(3, 0), pady=(5, 0), sticky="ew"
+            row=1, column=1, columnspan=2, padx=(3, 0), pady=(5, 0), sticky="ew"
         )
         self.open_eec_analysis_button = ttk.Button(
             model_group,
@@ -3740,14 +4131,41 @@ class EISApplication:
         self.auto_model_button.grid(
             row=4, column=0, columnspan=3, pady=(5, 0), sticky="ew"
         )
-
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
         self.parameters_group = parameters_group
         parameters_group.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        parameters_group.columnconfigure(0, weight=1)
+        parameters_group.rowconfigure(0, weight=1)
         parent.rowconfigure(2, weight=1)
-        self.parameter_table = ParameterTable(parameters_group)
+        parameter_canvas_frame = ttk.Frame(parameters_group)
+        parameter_canvas_frame.grid(row=0, column=0, sticky="nsew")
+        parameter_canvas_frame.columnconfigure(0, weight=1)
+        parameter_canvas_frame.rowconfigure(0, weight=1)
+        self.parameter_canvas = tk.Canvas(parameter_canvas_frame, highlightthickness=0)
+        self.parameter_canvas.grid(row=0, column=0, sticky="nsew")
+        self.parameter_scrollbar = ttk.Scrollbar(
+            parameter_canvas_frame, orient=tk.VERTICAL, command=self.parameter_canvas.yview
+        )
+        self.parameter_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.parameter_canvas.configure(yscrollcommand=self.parameter_scrollbar.set)
+        parameter_contents = ttk.Frame(self.parameter_canvas)
+        self.parameter_contents = parameter_contents
+        parameter_window = self.parameter_canvas.create_window(
+            (0, 0), window=parameter_contents, anchor="nw"
+        )
+        parameter_contents.bind(
+            "<Configure>",
+            lambda _event: self._update_parameter_scroll_region(),
+        )
+        self.parameter_canvas.bind(
+            "<Configure>",
+            lambda event: self.parameter_canvas.itemconfigure(
+                parameter_window, width=event.width
+            ),
+        )
+        self.parameter_table = ParameterTable(parameter_contents)
         self.parameter_table.pack(fill=tk.BOTH, expand=True)
-        parameter_actions = ttk.Frame(parameters_group)
+        parameter_actions = ttk.Frame(parameter_contents)
         parameter_actions.pack(fill=tk.X, pady=(8, 0))
         for column in range(2):
             parameter_actions.columnconfigure(column, weight=1)
@@ -3781,6 +4199,9 @@ class EISApplication:
             command=lambda: self.apply_parameters_to_selected({"upper"}),
         )
         self.apply_upper_selected_button.grid(row=2, column=1, padx=(3, 0), pady=(4, 0), sticky="ew")
+        self.root.bind_all("<MouseWheel>", self._parameter_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._parameter_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self._parameter_mousewheel, add="+")
 
         options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
         self.options_group = options_group
@@ -3836,11 +4257,25 @@ class EISApplication:
         self.outlier_selected_button.grid(
             row=2, column=2, columnspan=2, padx=(8, 0), pady=(8, 2), sticky="ew"
         )
+        ttk.Label(options_group, text="Deterministic threshold").grid(
+            row=3, column=0, pady=(8, 2), sticky="w"
+        )
+        ttk.Entry(
+            options_group, textvariable=self.deterministic_threshold_var
+        ).grid(row=3, column=1, padx=(8, 0), pady=(8, 2), sticky="ew")
+        self.deterministic_outlier_button = ttk.Button(
+            options_group,
+            text="Remove deterministic outliers",
+            command=self.remove_deterministic_outliers,
+        )
+        self.deterministic_outlier_button.grid(
+            row=3, column=2, columnspan=2, padx=(8, 0), pady=(8, 2), sticky="ew"
+        )
         self.reset_button = ttk.Button(
             options_group, text="Reset points", command=self.reset_points
         )
         self.reset_button.grid(
-            row=3, column=0, columnspan=4, pady=(6, 0), sticky="ew"
+            row=4, column=0, columnspan=4, pady=(6, 0), sticky="ew"
         )
 
         actions = ttk.LabelFrame(parent, text="Actions", padding=8)
@@ -4027,6 +4462,7 @@ class EISApplication:
             row=2, column=1, padx=(3, 0), pady=(4, 0), sticky="ew"
         )
         self.drt_tools_group.grid_remove()
+        self._build_simulator_controls(parent)
         self.action_buttons = (
             self.fit_button,
             self.fit_selected_button,
@@ -4046,6 +4482,7 @@ class EISApplication:
             self.drt_apply_upper_selected_button,
             self.initial_values_button,
             self.outlier_selected_button,
+            self.deterministic_outlier_button,
             self.reset_button,
             self.toggle_points_button,
             self.auto_fit_points_button,
@@ -4060,12 +4497,11 @@ class EISApplication:
             self.frequency_selected_button,
             self.model_button,
             self.model_selected_button,
-            self.sort_tau_button,
             self.sort_tau_selected_button,
-            self.switch_blocks_button,
             self.switch_blocks_selected_button,
             self.open_eec_analysis_button,
             self.auto_model_button,
+            self.import_simulator_fit_button,
             self.open_drt_analysis_button,
             self.parameters_selected_button,
             self.apply_fix_selected_button,
@@ -4074,19 +4510,269 @@ class EISApplication:
             self.apply_upper_selected_button,
         )
 
+    def _build_simulator_controls(self, parent: ttk.Frame) -> None:
+        group = ttk.LabelFrame(parent, text="Spectra Simulator", padding=8)
+        self.simulator_group = group
+        group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        group.columnconfigure(1, weight=1)
+        group.columnconfigure(3, weight=1)
+        self.simulator_circuit_var = tk.StringVar(value=self.model_var.get())
+        self.simulator_min_frequency_var = tk.StringVar(value="1")
+        self.simulator_max_frequency_var = tk.StringVar(value="1e6")
+        self.simulator_points_var = tk.StringVar(value="10")
+        self.simulator_noise_var = tk.BooleanVar(value=False)
+        self.simulator_noise_level_var = tk.StringVar(value="1")
+        self.simulator_seed_var = tk.StringVar(value="")
+        ttk.Label(group, text="Circuit").grid(row=0, column=0, sticky="w")
+        circuit_box = ttk.Combobox(group, textvariable=self.simulator_circuit_var,
+                                   values=self._model_presets, state="normal")
+        circuit_box.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(8, 0))
+        circuit_box.bind("<<ComboboxSelected>>", lambda _event: self._ensure_simulator_parameters())
+        self.import_simulator_fit_button = ttk.Button(
+            group, text="Import Fit Parameters", command=self.import_simulator_fit_parameters,
+            state="disabled",
+        )
+        self.import_simulator_fit_button.grid(
+            row=0, column=3, sticky="ew", padx=(5, 0)
+        )
+        fields = (("Min. freq.", self.simulator_min_frequency_var),
+                  ("Max. freq.", self.simulator_max_frequency_var),
+                  ("Points/decade", self.simulator_points_var),
+                  ("Noise (%)", self.simulator_noise_level_var),
+                  ("Seed", self.simulator_seed_var))
+        for row, (label, variable) in enumerate(fields, start=1):
+            ttk.Label(group, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Entry(group, textvariable=variable).grid(row=row, column=1, columnspan=3,
+                                                         sticky="ew", padx=(8, 0), pady=2)
+        ttk.Checkbutton(group, text="Add noise", variable=self.simulator_noise_var).grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        ttk.Button(group, text="Calculate spectrum", command=self.calculate_simulator_spectrum).grid(
+            row=7, column=0, columnspan=2, sticky="ew", pady=(7, 0), padx=(0, 3))
+        ttk.Button(group, text="Add to Spectra Explorer", command=self.add_simulator_to_explorer).grid(
+            row=7, column=2, columnspan=2, sticky="ew", pady=(7, 0), padx=(3, 0))
+        ttk.Combobox(group, textvariable=self.simulator_drt_mode_var,
+                     values=("Ridge DRT", "Hybrid DRT"), state="readonly").grid(
+                         row=9, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        ttk.Button(group, text="Calculate DRT", command=self.calculate_simulator_drt).grid(
+            row=9, column=2, columnspan=2, sticky="ew", padx=(3, 0), pady=(7, 0))
+        self.simulator_parameter_table = ParameterTable(group)
+        self.simulator_parameter_table.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        group.grid_remove()
+        self._ensure_simulator_parameters()
+
+    def _update_parameter_scroll_region(self) -> None:
+        if not hasattr(self, "parameter_canvas"):
+            return
+        self.parameter_canvas.configure(
+            scrollregion=self.parameter_canvas.bbox("all") or (0, 0, 0, 0)
+        )
+        content_height = self.parameter_contents.winfo_reqheight()
+        canvas_height = self.parameter_canvas.winfo_height()
+        if content_height > canvas_height + 1:
+            self.parameter_scrollbar.grid()
+        else:
+            self.parameter_scrollbar.grid_remove()
+            self.parameter_canvas.yview_moveto(0)
+
+    def _parameter_mousewheel(self, event):
+        try:
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+        except tk.TclError:
+            return None
+        inside = False
+        while widget is not None:
+            if widget is self.parameters_group:
+                inside = True
+                break
+            widget = getattr(widget, "master", None)
+        if not inside:
+            return None
+        if getattr(event, "num", None) == 4:
+            direction = -1
+        elif getattr(event, "num", None) == 5:
+            direction = 1
+        else:
+            direction = -1 if event.delta > 0 else 1
+        self.parameter_canvas.yview_scroll(direction, "units")
+        return "break"
+
+    def _ensure_simulator_parameters(self) -> None:
+        circuit = self.simulator_circuit_var.get().strip()
+        if not circuit:
+            return
+        try:
+            parameters = circuit_parameters(circuit)
+        except (TypeError, ValueError, ImportError):
+            return
+        if [p.name for p in parameters] != [p.name for p in self.simulator_parameters]:
+            self.simulator_parameters = parameters
+            self.simulator_parameter_table.set_parameters(parameters)
+
+    def calculate_simulator_spectrum(self) -> None:
+        try:
+            self._ensure_simulator_parameters()
+            parameters = self.simulator_parameter_table.values()
+            seed_text = self.simulator_seed_var.get().strip()
+            seed = int(seed_text) if seed_text else None
+            frequencies = logarithmic_frequencies(float(self.simulator_min_frequency_var.get()),
+                                                   float(self.simulator_max_frequency_var.get()),
+                                                   int(self.simulator_points_var.get()))
+            self.simulator_spectrum = simulate_spectrum(
+                self.simulator_circuit_var.get().strip(), frequencies,
+                [p.initial for p in parameters], noise_enabled=self.simulator_noise_var.get(),
+                noise_level_percent=float(self.simulator_noise_level_var.get()), seed=seed)
+        except (TypeError, ValueError, ImportError) as error:
+            messagebox.showerror("Simulator", str(error), parent=self.root)
+            return
+        self._update_status("simulated spectrum calculated")
+        self._refresh_plot(rescale=True)
+
+    @staticmethod
+    def _normalized_circuit(circuit: str | None) -> str:
+        return re.sub(r"\s+", "", str(circuit or "")).casefold()
+
+    def import_simulator_fit_parameters(self) -> None:
+        if self.state is None:
+            messagebox.showinfo(
+                "Import Fit Parameters",
+                "Select a spectrum in Spectra Explorer first.",
+                parent=self.root,
+            )
+            return
+        cycle = self.state.active
+        current_model = cycle.model(self.state.circuit)
+        simulator_model = self.simulator_circuit_var.get().strip()
+        if self._normalized_circuit(current_model) != self._normalized_circuit(simulator_model):
+            messagebox.showerror(
+                "Different EEC models",
+                "Current spectrum and simulator EEC models are different. "
+                "Fit parameters cannot be imported.",
+                parent=self.root,
+            )
+            return
+        if cycle.fit_parameters is None or len(cycle.fit_parameters) != len(cycle.parameters):
+            messagebox.showinfo(
+                "Import Fit Parameters",
+                "The current spectrum has no complete EEC fit to import.",
+                parent=self.root,
+            )
+            return
+        self._ensure_simulator_parameters()
+        fitted_by_name = {
+            parameter.name: float(value)
+            for parameter, value in zip(cycle.parameters, cycle.fit_parameters)
+            if np.isfinite(value)
+        }
+        simulator_parameters = self.simulator_parameter_table.values()
+        missing = [parameter.name for parameter in simulator_parameters
+                   if parameter.name not in fitted_by_name]
+        if missing:
+            messagebox.showwarning(
+                "Incomplete fit parameters",
+                "The following simulator parameters were not found in the fit: "
+                + ", ".join(missing) + ". Existing simulator values were preserved.",
+                parent=self.root,
+            )
+        for parameter in simulator_parameters:
+            if parameter.name in fitted_by_name:
+                parameter.initial = self._clamp_parameter_value(
+                    fitted_by_name[parameter.name], parameter.lower, parameter.upper
+                )
+        self.simulator_parameters = simulator_parameters
+        self.simulator_parameter_table.set_parameters(simulator_parameters)
+        frequency_window = cycle.frequency_window
+        if frequency_window is None:
+            frequency_window = (
+                float(np.nanmin(cycle.frequency_hz)),
+                float(np.nanmax(cycle.frequency_hz)),
+            )
+        self.simulator_min_frequency_var.set(f"{min(frequency_window):g}")
+        self.simulator_max_frequency_var.set(f"{max(frequency_window):g}")
+        self.calculate_simulator_spectrum()
+        self._update_status("fit parameters and frequency limits imported to simulator")
+
+    def _simulator_cycle(self) -> CycleState:
+        if self.simulator_spectrum is None:
+            raise ValueError("Calculate a simulated spectrum first")
+        cycle = CycleState(1, self.simulator_spectrum.frequency_hz,
+                           self.simulator_spectrum.impedance)
+        cycle.parameters = copy.deepcopy(self.simulator_parameters)
+        cycle.circuit = self.simulator_circuit_var.get().strip()
+        return cycle
+
+    def calculate_simulator_drt(self) -> None:
+        try:
+            cycle = self._simulator_cycle()
+        except ValueError as error:
+            messagebox.showerror("Simulator DRT", str(error), parent=self.root)
+            return
+        method = self.simulator_drt_mode_var.get()
+        self._submit(
+            (lambda: calculate_hybrid_drt(cycle)) if method == "Hybrid DRT"
+            else (lambda: analyze_outliers(cycle, float(self.threshold_var.get()), cycle.parameters)),
+            self._finish_simulator_drt,
+            "Simulator DRT calculation failed",
+        )
+
+    def _finish_simulator_drt(self, result) -> None:
+        if isinstance(result, RidgeInitialization):
+            self.simulator_drt_result = DRTComputation(
+                result.ridge_tau_s, result.ridge_gamma_ohm, result.ohmic_resistance
+            )
+        else:
+            self.simulator_drt_result = result
+        self.show_drt_var.set(True)
+        self._refresh_plot(rescale=True)
+        self._update_status(f"{self.simulator_drt_mode_var.get()} calculated for simulated spectrum")
+
+    def add_simulator_to_explorer(self) -> None:
+        if self.simulator_spectrum is None:
+            self.calculate_simulator_spectrum()
+        if self.simulator_spectrum is None:
+            return
+        import pandas as pd
+        spectrum = self.simulator_spectrum
+        source = Path.cwd() / f"simulated_{len(self._dataset_order) + 1}.eisfit"
+        dataframe = pd.DataFrame({"cycle_number": np.ones(spectrum.frequency_hz.size, dtype=int),
+                                  "freq_hz": spectrum.frequency_hz,
+                                  "re_zwe_ce_ohm": spectrum.impedance.real,
+                                  "minus_im_zwe_ce_ohm": -spectrum.impedance.imag,
+                                  "ewe_ece_v": np.zeros(spectrum.frequency_hz.size),
+                                  "time_s": np.zeros(spectrum.frequency_hz.size),
+                                  "current_ma": np.zeros(spectrum.frequency_hz.size)})
+        loaded = load_project_from_dataframe(dataframe, source, 1, "cell",
+                                             self.simulator_circuit_var.get().strip(), "Simulated")
+        loaded.dataset_id = f"simulator::{source.stem}"
+        loaded.dataset_label = f"{source.stem} [Cell · simulated]"
+        loaded.state.active.custom_metadata.update({"Source": "Simulator",
+                                                     "Circuit": self.simulator_circuit_var.get().strip()})
+        self._register_dataset(loaded.dataset_id, loaded)
+        self._populate_explorer()
+        self._switch_dataset(loaded.dataset_id, loaded, 1, capture_current=False)
+
     def _on_analysis_mode_selected(self, _event=None) -> None:
+        simulator_mode = self.analysis_mode_var.get() == "Spectra Simulator"
         drt_mode = self.analysis_mode_var.get() == "DRT"
         if hasattr(self, "drt_fit_button"):
             self.drt_fit_button.configure(
                 text="Calculate DRT" if drt_mode else "Fit selected"
             )
-        if drt_mode:
+        if simulator_mode:
+            self.model_group.grid_remove()
+            self.parameters_group.grid_remove()
+            self.refine_fit_button.grid_remove()
+            self.drt_tools_group.grid_remove()
+            self.simulator_group.grid()
+            self._update_status("Spectra Simulator mode")
+            self._refresh_plot(rescale=True)
+        elif drt_mode:
             self.show_drt_var.set(True)
             self.show_drt_recovered_var.set(True)
             self.model_group.grid_remove()
             self.parameters_group.grid_remove()
             self.refine_fit_button.grid_remove()
             self.drt_tools_group.grid()
+            self.simulator_group.grid_remove()
             self.toggle_drt_view()
             self.toggle_drt_recovered_visibility()
             self._update_status("DRT analysis mode")
@@ -4095,6 +4781,7 @@ class EISApplication:
             self.parameters_group.grid()
             self.refine_fit_button.grid()
             self.drt_tools_group.grid_remove()
+            self.simulator_group.grid_remove()
             self._update_status("EEC fitting mode")
 
     def _capture_detached_eec_parameters(self) -> bool:
@@ -4352,11 +5039,25 @@ class EISApplication:
             return
         self.status_var.set(f"Loading {self.path.name}…")
         self._submit(
+            lambda: [(self.path, inspect_eis_file_spectrum_kinds(self.path))],
+            lambda inspections: self._finish_initial_inspection(inspections),
+            "Could not open the spectrum",
+        )
+
+    def _finish_initial_inspection(
+        self, inspections: list[tuple[Path, list[str]]]
+    ) -> None:
+        selected_kinds = self._select_import_spectrum_kinds(inspections)
+        if selected_kinds is None:
+            self._update_status("data import cancelled")
+            return
+        self._submit(
             lambda: load_projects(
                 [self.path],
                 self.control,
                 self.circuit,
                 self.requested_cycle,
+                spectrum_kinds_by_path=selected_kinds,
             ),
             self._finish_loading,
             "Could not open the spectrum",
@@ -4428,6 +5129,7 @@ class EISApplication:
         self._update_status(f"source: {loaded.dataset_label}")
         if self.show_kk_var.get():
             self._ensure_kk_residuals()
+        self._set_controls_enabled(self.state is not None)
 
     def _submit(
         self,
@@ -4509,7 +5211,7 @@ class EISApplication:
                 "Load project…",
                 state=tk.DISABLED if self.busy else tk.NORMAL,
             )
-            for label in self._project_menu_actions[1:]:
+            for label in self._project_menu_actions:
                 self.file_menu.entryconfigure(label, state=menu_state)
         if hasattr(self, "fit_menu"):
             for label in self._fit_menu_actions:
@@ -5012,7 +5714,612 @@ class EISApplication:
         project_name = Path(project_path).name if project_path else "Untitled"
         self.root.title(f"EIS Fitting — {project_name}")
 
+    def load_ml_results(self) -> None:
+        directory = filedialog.askdirectory(
+            parent=self.root,
+            title="Select ML results directory",
+            initialdir=str(self._current_directory()),
+        )
+        if not directory:
+            return
+        try:
+            results = load_ml_results(Path(directory))
+        except (OSError, ValueError, TypeError) as error:
+            messagebox.showerror("ML results", str(error), parent=self.root)
+            return
+        self.ml_results = results
+        self.ml_results_directory = Path(directory).resolve()
+        self._refresh_ml_visuals()
+        if results:
+            self.ml_results_status_var.set(f"Loaded {len(results)} ML results")
+        else:
+            self.ml_results_status_var.set("No ML results found")
+
+    def load_ml_results_file(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load ML results file",
+            initialdir=str(self._current_directory()),
+            filetypes=(("ML results JSON", "*_ml_results.json"), ("JSON", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            results = load_ml_results(Path(path))
+        except (OSError, ValueError, TypeError) as error:
+            messagebox.showerror("ML results", str(error), parent=self.root)
+            return
+        self.ml_results = results
+        self.ml_results_directory = Path(path).resolve()
+        self._attach_ml_initial_results_to_projects()
+        self._refresh_ml_visuals()
+        self.ml_results_status_var.set(
+            f"Loaded {len(results)} ML results" if results else "No ML results found"
+        )
+
+    def load_ml_initial_parameters(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load ML initial parameters",
+            initialdir=str(self._current_directory()),
+            filetypes=(("EIS-fit JSON", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            results = load_ml_results(Path(path))
+        except (OSError, ValueError, TypeError) as error:
+            messagebox.showerror("ML initial parameters", str(error), parent=self.root)
+            return
+        self.ml_results = results
+        self.ml_results_directory = Path(path).resolve()
+        self.ml_results_status_var.set(
+            f"Loaded {len(results)} ML initial parameter results"
+            if results else "No ML initial parameters found"
+        )
+        self._attach_ml_initial_results_to_projects()
+        self._refresh_ml_visuals()
+
+    def load_and_apply_ml_initial_parameters(self) -> None:
+        self.load_ml_initial_parameters()
+        if self.ml_results:
+            self._apply_ml_initial_parameters_to_selected()
+
+    def _ml_result_for_spectrum(
+        self, dataset_id: str, loaded: LoadedProject, spectrum: SpectrumMetadata
+    ) -> MLResult | None:
+        cycle = int(spectrum.cycle)
+        control = str(loaded.state.control).casefold()
+        source_path = str(loaded.state.source_path.resolve()).casefold()
+        dataset_text = str(dataset_id).casefold()
+        try:
+            spectrum_key = spectrum_identifier(
+                (loaded_cycle := self._loaded_cycle_for_popup(loaded, cycle)).frequency_hz,
+                loaded_cycle.impedance.real,
+                loaded_cycle.impedance.imag,
+                cycle,
+                loaded.state.control,
+            )
+        except (TypeError, ValueError):
+            spectrum_key = ""
+        candidates = []
+        for result in self.ml_results.values():
+            if result.cycle != cycle:
+                continue
+            if result.control and result.control.casefold() != control:
+                continue
+            if spectrum_key and result.spectrum_key == spectrum_key:
+                return result
+            result_source = (result.source_name or "").casefold()
+            result_id = result.spectrum_id.casefold()
+            exact_source = result_source in {source_path, dataset_text}
+            source_in_id = source_path in result_id or dataset_text in result_id
+            if exact_source or source_in_id:
+                candidates.append(result)
+        if len(candidates) == 1:
+            return candidates[0]
+        # Legacy ML files include the project path before the dataset id.
+        basename = loaded.state.source_path.name.casefold()
+        candidates = [
+            result for result in self.ml_results.values()
+            if result.cycle == cycle
+            and (not result.control or result.control.casefold() == control)
+            and (
+                basename in (result.source_name or "").casefold()
+                or basename in result.spectrum_id.casefold()
+            )
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        stored = self._loaded_cycle_for_popup(loaded, cycle).custom_metadata.get(
+            "_ml_initial_eec"
+        )
+        if not isinstance(stored, dict):
+            return None
+        return MLResult(
+            spectrum_id=exact_id,
+            source_name=str(loaded.state.source_path),
+            cycle=cycle,
+            control=control,
+            model_circuit=stored.get("model_circuit"),
+            suggested_eec=stored.get("model_circuit"),
+            model_parameters=dict(stored.get("model_parameters", {})),
+            initial_sources=dict(stored.get("initial_sources", {})),
+            frequency_ranges=[tuple(value) for value in stored.get("frequency_ranges", [])],
+        )
+
+    def _preserve_ml_original_selection(self, cycle) -> None:
+        metadata = cycle.custom_metadata
+        metadata.setdefault(
+            "_ml_original_frequency_window",
+            list(cycle.frequency_window) if cycle.frequency_window is not None else None,
+        )
+        metadata.setdefault(
+            "_ml_original_manually_included",
+            cycle.manually_included.astype(bool).tolist(),
+        )
+        metadata.setdefault(
+            "_ml_original_outliers",
+            cycle.outliers.astype(bool).tolist(),
+        )
+
+    def apply_ml_frequency_to_selected(self) -> None:
+        if self.busy or self.state is None:
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        updated = 0
+        missing = 0
+        for dataset_id, loaded, spectrum in selected_rows:
+            result = self._ml_result_for_spectrum(dataset_id, loaded, spectrum)
+            if result is None or not result.frequency_ranges:
+                missing += 1
+                continue
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            self._preserve_ml_original_selection(cycle)
+            cycle.frequency_window = tuple(result.frequency_ranges[0])
+            cycle.clear_fit()
+            updated += 1
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        self._update_status(f"ML frequency selection applied to {updated} spectra; unavailable: {missing}")
+
+    def apply_ml_active_points_to_selected(self) -> None:
+        if self.busy or self.state is None:
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        updated = 0
+        missing = 0
+        for dataset_id, loaded, spectrum in selected_rows:
+            result = self._ml_result_for_spectrum(dataset_id, loaded, spectrum)
+            if result is None or result.active_mask is None:
+                missing += 1
+                continue
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            if result.active_mask.size != cycle.frequency_hz.size:
+                missing += 1
+                continue
+            self._preserve_ml_original_selection(cycle)
+            cycle.manually_included = result.active_mask.copy()
+            if result.outlier_mask is not None and result.outlier_mask.size == cycle.frequency_hz.size:
+                cycle.outliers = result.outlier_mask.copy()
+            else:
+                cycle.outliers = ~cycle.manually_included
+            cycle.clear_fit()
+            cycle.invalidate_drt_cache()
+            updated += 1
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        self._update_status(f"ML active-point selection applied to {updated} spectra; unavailable: {missing}")
+
+    def restore_ml_original_selection(self) -> None:
+        if self.busy or self.state is None:
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        restored = 0
+        for _dataset_id, loaded, spectrum in selected_rows:
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            metadata = cycle.custom_metadata
+            included = metadata.get("_ml_original_manually_included")
+            outliers = metadata.get("_ml_original_outliers")
+            if not isinstance(included, list) or not isinstance(outliers, list):
+                continue
+            if len(included) != cycle.frequency_hz.size or len(outliers) != cycle.frequency_hz.size:
+                continue
+            cycle.manually_included = np.asarray(included, dtype=bool)
+            cycle.outliers = np.asarray(outliers, dtype=bool)
+            window = metadata.get("_ml_original_frequency_window")
+            cycle.frequency_window = (
+                tuple(float(value) for value in window)
+                if isinstance(window, list) and len(window) == 2
+                else None
+            )
+            cycle.clear_fit()
+            cycle.invalidate_drt_cache()
+            restored += 1
+        self._restore_controls()
+        self._refresh_plot(rescale=True)
+        self._update_status(f"original selection restored for {restored} spectra")
+
+    def _apply_ml_initial_parameters_to_selected(self) -> None:
+        if self.busy or self.state is None:
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        updated = 0
+        missing_results = []
+        missing_parameters = []
+        for dataset_id, loaded, spectrum in selected_rows:
+            result = self._ml_result_for_spectrum(dataset_id, loaded, spectrum)
+            if result is None or not result.model_parameters:
+                missing_results.append(f"{dataset_id}:{spectrum.cycle}")
+                continue
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            circuit = suggested_eec(result) or result.model_circuit
+            if not circuit:
+                missing_results.append(f"{dataset_id}:{spectrum.cycle}")
+                continue
+            current_model = cycle.model(loaded.state.circuit)
+            if self._normalized_circuit(current_model) == self._normalized_circuit(circuit):
+                parameters = cycle.parameters
+            elif cycle.fit_parameters is not None:
+                missing_results.append(f"{dataset_id}:{spectrum.cycle} (model already fitted)")
+                continue
+            else:
+                parameters = circuit_parameters(circuit, self._eec_parameter_bounds)
+                cycle.circuit = circuit
+            by_name = {parameter.name: parameter for parameter in parameters}
+            for name, value in result.model_parameters.items():
+                parameter = by_name.get(name)
+                if parameter is not None:
+                    limits = result.parameter_limits.get(name)
+                    if limits is not None:
+                        parameter.lower, parameter.upper = limits
+                    parameter.initial = self._clamp_parameter_value(
+                        value, parameter.lower, parameter.upper
+                    )
+            missing = [name for name in by_name if name not in result.model_parameters]
+            if missing:
+                missing_parameters.extend(f"{spectrum.cycle}: {name}" for name in missing)
+            cycle.parameters = parameters
+            updated += 1
+            if loaded is self.loaded and cycle.cycle == self.state.active_cycle:
+                self.model_var.set(cycle.model(self.state.circuit))
+                self.parameter_table.set_parameters(parameters)
+        self._refresh_explorer_values()
+        self._refresh_plot(rescale=True)
+        message = f"ML initial parameters loaded for {updated} selected spectra; no fit was started"
+        if missing_results:
+            message += f"; unavailable: {', '.join(missing_results)}"
+        if missing_parameters:
+            message += f"; missing parameters: {', '.join(missing_parameters)}"
+        self._update_status(message)
+
+    def _attach_ml_initial_results_to_projects(self) -> None:
+        for loaded in self.loaded_projects.values():
+            source_name = loaded.state.source_path.name.casefold()
+            for spectrum in loaded.spectra:
+                candidates = [
+                    result for result in self.ml_results.values()
+                    if result.cycle == spectrum.cycle
+                    and (
+                        source_name in (result.source_name or "").casefold()
+                        or source_name in result.spectrum_id.casefold()
+                    )
+                    and (
+                        not result.control
+                        or result.control.casefold() == loaded.state.control.casefold()
+                    )
+                ]
+                if len(candidates) != 1:
+                    continue
+                result = candidates[0]
+                cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+                cycle.custom_metadata["_ml_initial_eec"] = {
+                    "model_circuit": result.model_circuit,
+                    "model_parameters": dict(result.model_parameters),
+                    "initial_sources": dict(result.initial_sources),
+                    "frequency_ranges": [list(value) for value in result.frequency_ranges],
+                }
+
+    def _current_ml_result(self) -> MLResult | None:
+        if not self.ml_results or self.state is None or self.loaded is None:
+            return None
+        cycle = self.state.active_cycle
+        control = self.state.control
+        current_spectrum = next(
+            (item for item in self.loaded.spectra if item.cycle == cycle), None
+        )
+        if current_spectrum is not None:
+            matched = self._ml_result_for_spectrum(
+                self.current_dataset_id or self.loaded.dataset_id,
+                self.loaded,
+                current_spectrum,
+            )
+            if matched is not None:
+                return matched
+        exact_ids = []
+        if self.project_path is not None:
+            exact_ids.append(
+                f"{self.project_path.resolve()}::{self.loaded.dataset_id}::{control}::{cycle}"
+            )
+        exact_ids.append(
+            f"{self.loaded.state.source_path.resolve()}::{control}::{cycle}"
+        )
+        for identifier in exact_ids:
+            for result_id, result in self.ml_results.items():
+                if result_id.casefold() == identifier.casefold():
+                    return result
+        candidates = []
+        if self.loaded.dataset_id.startswith("ml-results::"):
+            source_name = self.loaded.dataset_id.removeprefix("ml-results::").casefold()
+            candidates = [
+                result
+                for result in self.ml_results.values()
+                if result.cycle == cycle
+                and (result.source_name or "").casefold() == source_name
+            ]
+            if len(candidates) == 1:
+                return candidates[0]
+        project_names = {
+            path.name.casefold()
+            for path in (self.project_path, self.loaded.state.source_path)
+            if path is not None
+        }
+        for result in self.ml_results.values():
+            if result.cycle != cycle:
+                continue
+            identifier = result.spectrum_id.casefold()
+            if control.casefold() not in identifier:
+                continue
+            source_name = (
+                Path(result.source_project).name.casefold()
+                if result.source_project
+                else ""
+            )
+            if source_name in project_names or any(
+                name in identifier for name in project_names if name
+            ):
+                candidates.append(result)
+        if len(candidates) == 1:
+            return candidates[0]
+        stored = self.state.active.custom_metadata.get("_ml_initial_eec")
+        if isinstance(stored, dict):
+            return MLResult(
+                spectrum_id=f"{self.loaded.state.source_path.resolve()}::{control}::{cycle}",
+                source_name=str(self.loaded.state.source_path),
+                cycle=cycle,
+                source_project=str(self.loaded.state.source_path),
+                control=control,
+                model_circuit=stored.get("model_circuit"),
+                suggested_eec=stored.get("model_circuit"),
+                model_parameters=dict(stored.get("model_parameters", {})),
+                initial_sources=dict(stored.get("initial_sources", {})),
+                frequency_ranges=[tuple(value) for value in stored.get("frequency_ranges", [])],
+            )
+        return None
+
+    @staticmethod
+    def _ml_model_curve(result: MLResult, frequency: np.ndarray):
+        if not result.model_circuit:
+            return None
+        try:
+            from impedance.models.circuits import CustomCircuit
+
+            circuit = circuit_parameters(result.model_circuit)
+            values = [result.model_parameters[p.name] for p in circuit]
+            model = CustomCircuit(result.model_circuit, initial_guess=values)
+            return np.asarray(model.predict(frequency), dtype=complex)
+        except (KeyError, TypeError, ValueError, ImportError):
+            return None
+
+    def _refresh_ml_visuals(self) -> None:
+        if not hasattr(self, "ml_model_artist"):
+            return
+        for patch in getattr(self, "_ml_range_patches", []):
+            patch.remove()
+        self._ml_range_patches = []
+        self.ml_range_artist.set_data([], [])
+        self.ml_active_artist.set_data([], [])
+        self.ml_rejected_artist.set_data([], [])
+        self.ml_model_artist.set_data([], [])
+        self.ml_residual_artist.set_segments([])
+        for artist in (
+            self.ml_phase_active_artist,
+            self.ml_phase_rejected_artist,
+            self.ml_phase_model_artist,
+        ):
+            if artist is not None:
+                artist.set_data([], [])
+        if self.ml_phase_residual_artist is not None:
+            self.ml_phase_residual_artist.set_segments([])
+        result = self._current_ml_result()
+        if result is None or self.state is None:
+            if self.ml_results:
+                self.ml_results_status_var.set("No ML results available")
+            return
+        cycle = self.state.active
+        frequency = np.asarray(cycle.frequency_hz, dtype=float)
+        impedance = np.asarray(cycle.impedance, dtype=complex)
+        range_mask = np.zeros(frequency.size, dtype=bool)
+        for minimum, maximum in result.frequency_ranges:
+            range_mask |= (frequency >= minimum) & (frequency <= maximum)
+            if self.show_ml_frequency_ranges_var.get() and self.plot_mode == "bode":
+                self._ml_range_patches.append(
+                    self.axes.axvspan(
+                        minimum, maximum, color="#80cbc4", alpha=0.12,
+                        label="ML frequency range",
+                    )
+                )
+                if self.phase_axes is not None:
+                    self._ml_range_patches.append(
+                        self.phase_axes.axvspan(
+                            minimum, maximum, color="#80cbc4", alpha=0.08,
+                        )
+                    )
+        if self.show_ml_frequency_ranges_var.get():
+            self.ml_range_artist.set_data(
+                impedance.real[range_mask], -impedance.imag[range_mask]
+            )
+        mask = None
+        if result.active_mask is not None and result.active_mask.size == frequency.size:
+            mask = result.active_mask
+        elif result.frequency_ranges:
+            mask = range_mask
+        if self.show_ml_active_points_var.get() and mask is not None:
+            self.ml_active_artist.set_data(
+                impedance.real[mask], -impedance.imag[mask]
+            )
+            self.ml_rejected_artist.set_data(
+                impedance.real[~mask], -impedance.imag[~mask]
+            )
+            if self.phase_axes is not None:
+                phase = self._phase_degrees(impedance)
+                self.ml_phase_active_artist.set_data(frequency[mask], phase[mask])
+                self.ml_phase_rejected_artist.set_data(frequency[~mask], phase[~mask])
+        model_at_data = self._ml_model_curve(result, frequency)
+        if self.show_ml_model_var.get() and model_at_data is not None:
+            smooth_frequency = np.geomspace(
+                float(np.min(frequency[frequency > 0])),
+                float(np.max(frequency[frequency > 0])),
+                300,
+            )
+            smooth_model = self._ml_model_curve(result, smooth_frequency)
+            if smooth_model is not None:
+                if self.plot_mode == "bode":
+                    self.ml_model_artist.set_data(smooth_frequency, np.abs(smooth_model))
+                    if self.ml_phase_model_artist is not None:
+                        self.ml_phase_model_artist.set_data(
+                            smooth_frequency, self._phase_degrees(smooth_model)
+                        )
+                else:
+                    self.ml_model_artist.set_data(smooth_model.real, -smooth_model.imag)
+            if self.show_ml_residuals_var.get():
+                if self.plot_mode == "bode":
+                    magnitude_segments = np.stack(
+                        (
+                            np.column_stack((frequency, np.abs(impedance))),
+                            np.column_stack((frequency, np.abs(model_at_data))),
+                        ),
+                        axis=1,
+                    )
+                    self.ml_residual_artist.set_segments(magnitude_segments)
+                    if self.ml_phase_residual_artist is not None:
+                        phase_segments = np.stack(
+                            (
+                                np.column_stack((frequency, self._phase_degrees(impedance))),
+                                np.column_stack((frequency, self._phase_degrees(model_at_data))),
+                            ),
+                            axis=1,
+                        )
+                        self.ml_phase_residual_artist.set_segments(phase_segments)
+                else:
+                    residual_segments = np.stack(
+                        (
+                            np.column_stack((impedance.real, -impedance.imag)),
+                            np.column_stack((model_at_data.real, -model_at_data.imag)),
+                        ),
+                        axis=1,
+                    )
+                    self.ml_residual_artist.set_segments(residual_segments)
+        self.ml_range_artist.set_visible(self.show_ml_frequency_ranges_var.get())
+        self.ml_active_artist.set_visible(self.show_ml_active_points_var.get())
+        self.ml_rejected_artist.set_visible(self.show_ml_active_points_var.get())
+        self.ml_model_artist.set_visible(
+            self.show_ml_model_var.get() and model_at_data is not None
+        )
+        if self.ml_phase_active_artist is not None:
+            self.ml_phase_active_artist.set_visible(self.show_ml_active_points_var.get())
+            self.ml_phase_rejected_artist.set_visible(self.show_ml_active_points_var.get())
+            self.ml_phase_model_artist.set_visible(
+                self.show_ml_model_var.get() and model_at_data is not None
+            )
+        self.ml_residual_artist.set_visible(self.show_ml_residuals_var.get())
+        if self.ml_phase_residual_artist is not None:
+            self.ml_phase_residual_artist.set_visible(self.show_ml_residuals_var.get())
+        details = []
+        if result.topology_prediction:
+            details.append(f"model={result.topology_prediction}")
+        if result.frequency_ranges:
+            details.append(f"{len(result.frequency_ranges)} range(s)")
+        if result.active_mask is not None:
+            details.append("active points")
+        if not result.has_eec_model:
+            details.append("no ML EEC parameters")
+        self.ml_results_status_var.set("ML: " + ", ".join(details) if details else "ML result available")
+        self._update_legend_visibility()
+        self.canvas.draw_idle()
+
+    def _refresh_simulator_plot(self, rescale: bool = False) -> None:
+        spectrum = self.simulator_spectrum
+        if spectrum is None:
+            self.included_artist.set_data([], [])
+            self.excluded_artist.set_data([], [])
+            self.fit_artist.set_data([], [])
+            self.axes.set_title("Spectra Simulator")
+            self.canvas.draw_idle()
+            return
+        frequency = spectrum.frequency_hz
+        impedance = spectrum.impedance
+        ideal = spectrum.ideal_impedance
+        if self.plot_mode == "bode":
+            self.included_artist.set_data(frequency, np.abs(impedance))
+            self.excluded_artist.set_data([], [])
+            if self.phase_included_artist is not None:
+                self.phase_included_artist.set_data(frequency, self._phase_degrees(impedance))
+                self.phase_excluded_artist.set_data([], [])
+            self.fit_artist.set_data(frequency, np.abs(ideal))
+            if self.phase_fit_artist is not None:
+                self.phase_fit_artist.set_data(frequency, self._phase_degrees(ideal))
+            self.axes.set_title("Spectra Simulator · Bode")
+        else:
+            self.included_artist.set_data(impedance.real, -impedance.imag)
+            self.excluded_artist.set_data([], [])
+            self.fit_artist.set_data(ideal.real, -ideal.imag)
+            self.axes.set_title("Spectra Simulator · Nyquist")
+        self.fit_artist.set_visible(self.show_eec_fit_var.get())
+        self.included_artist.set_visible(True)
+        self.excluded_artist.set_visible(False)
+        if self.phase_fit_artist is not None:
+            self.phase_fit_artist.set_visible(self.show_eec_fit_var.get())
+        if self.drt_artist is not None and self.drt_axes is not None:
+            result = self.simulator_drt_result
+            if self.show_drt_var.get() and result is not None:
+                self.drt_artist.set_data(result.tau_s, result.gamma_ohm)
+                self.drt_artist.set_visible(True)
+                self.drt_axes.set_title(self.simulator_drt_mode_var.get())
+            else:
+                self.drt_artist.set_data([], [])
+                self.drt_artist.set_visible(False)
+        if rescale:
+            if self.plot_mode == "bode":
+                self.axes.relim()
+                self.axes.autoscale_view()
+                if self.phase_axes is not None:
+                    self.phase_axes.relim()
+                    self.phase_axes.autoscale_view()
+            else:
+                self.axes.relim()
+                self.axes.autoscale_view()
+            if self.drt_axes is not None and self.drt_artist is not None:
+                self.drt_axes.relim()
+                self.drt_axes.autoscale_view()
+        self.canvas.draw_idle()
+
     def _refresh_plot(self, rescale: bool = False) -> None:
+        if self.analysis_mode_var.get() == "Spectra Simulator":
+            self._refresh_simulator_plot(rescale)
+            return
         if self.state is None:
             return
         cycle = self.state.active
@@ -5213,6 +6520,7 @@ class EISApplication:
                 self._autoscale_kk(cycle)
             if self.drt_artist is not None and self.drt_axes is not None:
                 self._autoscale_drt(cycle)
+        self._refresh_ml_visuals()
         self._refresh_explorer_values()
         self.canvas.draw_idle()
 
@@ -6249,6 +7557,10 @@ class EISApplication:
             self.kk_axes.set_xlim(float(np.min(frequency)), float(np.max(frequency)))
 
     def reset_plot_view(self) -> None:
+        if self.analysis_mode_var.get() == "Spectra Simulator":
+            self._refresh_plot(rescale=True)
+            self._update_status("zoom reset to simulated spectrum")
+            return
         if self.state is None:
             return
         self._refresh_plot(rescale=True)
@@ -6257,6 +7569,10 @@ class EISApplication:
     def toggle_plot_mode(self) -> None:
         self.plot_mode = "bode" if self.plot_mode == "nyquist" else "nyquist"
         self._configure_plot_layout()
+        if self.state is None and self.analysis_mode_var.get() == "Spectra Simulator":
+            self._refresh_plot(rescale=True)
+            self._update_status(f"{self.plot_mode.title()} view")
+            return
         if self.state is None:
             self.axes.set_title("No spectrum loaded")
             if self.drt_axes is not None:
@@ -6318,6 +7634,10 @@ class EISApplication:
 
     def toggle_drt_view(self) -> None:
         self._configure_plot_layout()
+        if self.analysis_mode_var.get() == "Spectra Simulator":
+            self._refresh_plot(rescale=True)
+            self.canvas.draw_idle()
+            return
         if self.state is None:
             self.axes.set_title("No spectrum loaded")
             if self.drt_axes is not None:
@@ -6328,6 +7648,10 @@ class EISApplication:
 
     def toggle_spectrum_view(self) -> None:
         self._configure_plot_layout()
+        if self.analysis_mode_var.get() == "Spectra Simulator":
+            self._refresh_plot(rescale=True)
+            self.canvas.draw_idle()
+            return
         if self.state is None:
             self.axes.set_title("No spectrum loaded")
             if self.drt_axes is not None:
@@ -7100,6 +8424,25 @@ class EISApplication:
             f"frequency range applied to {updated} selected spectra"
         )
 
+    def _configure_cycle_model(self, cycle, circuit: str, parameters=None) -> None:
+        if parameters is None:
+            parameters = circuit_parameters(circuit, self._eec_parameter_bounds)
+        cycle.circuit = circuit
+        cycle.parameters = [
+            ParameterValue(
+                parameter.name,
+                parameter.unit,
+                parameter.initial,
+                parameter.lower,
+                parameter.upper,
+                parameter.error_percent,
+                parameter.fixed,
+            )
+            for parameter in parameters
+        ]
+        cycle.clear_fit()
+        cycle.invalidate_drt_cache()
+
     def apply_model(self) -> None:
         if self.state is None or self.busy:
             return
@@ -7119,10 +8462,7 @@ class EISApplication:
             )
             self.model_var.set(self.state.active.model(self.state.circuit))
             return
-        self.state.active.circuit = circuit
-        self.state.active.parameters = parameters
-        self.state.active.clear_fit()
-        self.state.active.invalidate_drt_cache()
+        self._configure_cycle_model(self.state.active, circuit, parameters)
         self.circuit = circuit
         self.parameter_table.set_parameters(
             self.state.parameters_for(self.state.active_cycle)
@@ -7155,26 +8495,84 @@ class EISApplication:
         updated = 0
         for _dataset_id, loaded, spectrum in selected_rows:
             cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
-            cycle.circuit = circuit
-            cycle.parameters = [
-                ParameterValue(
-                    parameter.name,
-                    parameter.unit,
-                    parameter.initial,
-                    parameter.lower,
-                    parameter.upper,
-                    parameter.error_percent,
-                    parameter.fixed,
-                )
-                for parameter in parameters
-            ]
-            cycle.clear_fit()
-            cycle.invalidate_drt_cache()
+            self._configure_cycle_model(cycle, circuit, parameters)
             updated += 1
         self._restore_controls()
         self._refresh_explorer_values()
         self._refresh_plot(rescale=True)
         self._update_status(f"model applied to {updated} selected spectra")
+
+    def apply_ml_eec_to_selected(self) -> None:
+        if self.busy or self.state is None:
+            return
+        if self.analysis_mode_var.get() != "EEC":
+            self.analysis_mode_var.set("EEC")
+            self._on_analysis_mode_selected()
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        assignments = []
+        missing = []
+        invalid = []
+        for dataset_id, loaded, spectrum in selected_rows:
+            result = self._ml_result_for_spectrum(dataset_id, loaded, spectrum)
+            if result is None:
+                missing.append(f"{dataset_id}:{spectrum.cycle}")
+                continue
+            circuit = suggested_eec(result)
+            if circuit is None:
+                invalid.append(f"{dataset_id}:{spectrum.cycle}")
+                continue
+            try:
+                parameters = circuit_parameters(circuit, self._eec_parameter_bounds)
+            except Exception:
+                invalid.append(f"{dataset_id}:{spectrum.cycle}")
+                continue
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            assignments.append((cycle, circuit, parameters, result))
+        if not assignments:
+            messagebox.showerror(
+                "ML EEC model",
+                "No ML EEC topology is available for the selected spectra.",
+                parent=self.root,
+            )
+            return
+        if any(cycle.fit_parameters is not None or cycle.circuit for cycle, *_ in assignments):
+            if not messagebox.askyesno(
+                "Replace EEC model?",
+                "Applying ML models will replace the selected EEC models and clear their existing fits. Continue?",
+                parent=self.root,
+            ):
+                return
+        for cycle, circuit, parameters, _result in assignments:
+            self._configure_cycle_model(cycle, circuit, parameters)
+        active_result = next(
+            (result for cycle, _circuit, _parameters, result in assignments
+             if cycle is self.state.active),
+            None,
+        )
+        if active_result is not None:
+            self.model_var.set(self.state.active.model(self.state.circuit))
+            self.parameter_table.set_parameters(
+                self.state.parameters_for(self.state.active_cycle)
+            )
+        self._refresh_explorer_values()
+        self._refresh_plot(rescale=True)
+        details = []
+        for _cycle, circuit, _parameters, result in assignments:
+            confidence = (
+                f", confidence {result.confidence:.2f}"
+                if result.confidence is not None
+                else ""
+            )
+            details.append(f"{result.cycle}: {circuit}{confidence}")
+        message = "EEC model suggested by ML: " + ", ".join(details)
+        if missing:
+            message += f"; no prediction for {len(missing)} spectrum(s)"
+        if invalid:
+            message += f"; invalid prediction for {len(invalid)} spectrum(s)"
+        self._update_status(message)
 
     def auto_select_model(self) -> None:
         if self.state is None or self.busy:
@@ -7308,19 +8706,6 @@ class EISApplication:
         cycle.invalidate_drt_cache()
         return True
 
-    def switch_parameter_blocks(self) -> None:
-        if self.busy or self.state is None or not self._capture_controls():
-            return
-        changed = self._switch_parameter_blocks(self.state, self.state.active)
-        self._restore_controls()
-        self._refresh_explorer_values()
-        self._refresh_plot(rescale=True)
-        self._update_status(
-            "parameter blocks switched"
-            if changed
-            else "switch blocks requires R0-L0-p(R1,CPE1)-p(R2,CPE2)"
-        )
-
     def switch_selected_parameter_blocks(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
@@ -7418,16 +8803,6 @@ class EISApplication:
                 dtype=float,
             )
         return True
-
-    def sort_parameters_by_tau(self) -> None:
-        if self.busy or self.state is None or not self._capture_controls():
-            return
-        changed = self._sort_cycle_parameters_by_tau(self.state, self.state.active)
-        self._restore_controls()
-        self._refresh_plot(rescale=True)
-        self._update_status(
-            "parameters sorted by tau" if changed else "parameters are already sorted by tau"
-        )
 
     def sort_selected_parameters_by_tau(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
@@ -8842,12 +10217,160 @@ class EISApplication:
                     try:
                         numeric_value = float(value)
                     except (TypeError, ValueError):
+                        if value is not None:
+                            record[name] = value
                         continue
                     if np.isfinite(numeric_value):
                         record[name] = numeric_value
                 record.setdefault("Cycle mod 15", int(spectrum.cycle) % 15)
                 records.append(_externalize_record(record))
         return records
+
+    def _open_parameter_explorer_filter(
+        self,
+        title: str,
+        records: list[dict[str, object]],
+        definition: FilterDefinition,
+        on_apply: Callable[[FilterDefinition], None],
+    ) -> None:
+        popup = tk.Toplevel(self.root)
+        popup.title(title)
+        popup.transient(self.root)
+        popup.geometry("680x360")
+        popup.minsize(560, 260)
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+        fields = sorted(
+            {key for record in records for key in record},
+            key=lambda value: str(value).casefold(),
+        )
+        ttk.Label(
+            popup,
+            text="Keep records matching the following conditions:",
+        ).grid(row=0, column=0, padx=10, pady=(10, 4), sticky="w")
+        rows_frame = ttk.Frame(popup, padding=(10, 0))
+        rows_frame.grid(row=1, column=0, sticky="nsew")
+        rows_frame.columnconfigure(0, weight=1)
+        rows_frame.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(rows_frame, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(rows_frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        condition_frame = ttk.Frame(canvas)
+        canvas_window = canvas.create_window((0, 0), window=condition_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        condition_frame.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event: canvas.itemconfigure(canvas_window, width=event.width),
+        )
+        condition_frame.columnconfigure(0, weight=1)
+        condition_frame.columnconfigure(1, weight=0)
+        condition_frame.columnconfigure(2, weight=1)
+        rows: list[tuple[tk.StringVar, tk.StringVar, tk.StringVar, ttk.Combobox, ttk.Combobox, ttk.Entry, ttk.Button]] = []
+
+        def add_condition(condition: FilterCondition | None = None) -> None:
+            row = len(rows)
+            field_var = tk.StringVar(value=condition.field if condition else (fields[0] if fields else ""))
+            operators = field_operators(records, field_var.get()) if fields else ("=", "!=")
+            operator_var = tk.StringVar(
+                value=condition.operator if condition and condition.operator in operators else operators[0]
+            )
+            value_var = tk.StringVar(value=condition.value if condition else "")
+            field_box = ttk.Combobox(condition_frame, textvariable=field_var, values=fields, state="readonly")
+            operator_box = ttk.Combobox(condition_frame, textvariable=operator_var, values=operators, state="readonly", width=16)
+            value_entry = ttk.Entry(condition_frame, textvariable=value_var)
+            remove_button = ttk.Button(condition_frame, text="Remove", width=9)
+
+            def update_operators(_event=None) -> None:
+                values = field_operators(records, field_var.get())
+                operator_box.configure(values=values)
+                if operator_var.get() not in values:
+                    operator_var.set(values[0])
+
+            def remove() -> None:
+                index = next(index for index, item in enumerate(rows) if item[0] is field_var)
+                rows.pop(index)
+                for widget in (field_box, operator_box, value_entry, remove_button):
+                    widget.destroy()
+                for index, item in enumerate(rows):
+                    for widget in item[3:]:
+                        widget.grid_configure(row=index)
+
+            field_box.bind("<<ComboboxSelected>>", update_operators)
+            remove_button.configure(command=remove)
+            field_box.grid(row=row, column=0, padx=(0, 5), pady=3, sticky="ew")
+            operator_box.grid(row=row, column=1, padx=5, pady=3, sticky="ew")
+            value_entry.grid(row=row, column=2, padx=5, pady=3, sticky="ew")
+            remove_button.grid(row=row, column=3, padx=(5, 0), pady=3)
+            rows.append((field_var, operator_var, value_var, field_box, operator_box, value_entry, remove_button))
+
+        for condition in definition.conditions:
+            if condition.field in fields:
+                add_condition(condition)
+        if not rows:
+            add_condition()
+
+        options = ttk.Frame(popup, padding=10)
+        options.grid(row=2, column=0, sticky="ew")
+        match_var = tk.StringVar(value=definition.match if definition.match in {"all", "any"} else "all")
+        ttk.Label(options, text="Match:").pack(side=tk.LEFT)
+        ttk.Radiobutton(options, text="All conditions", variable=match_var, value="all").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Radiobutton(options, text="Any condition", variable=match_var, value="any").pack(side=tk.LEFT, padx=(8, 0))
+
+        buttons = ttk.Frame(popup, padding=(10, 0, 10, 10))
+        buttons.grid(row=3, column=0, sticky="e")
+
+        def collect() -> FilterDefinition:
+            conditions = [
+                FilterCondition(field.get(), operator.get(), value.get())
+                for field, operator, value, *_widgets in rows
+                if field.get() and value.get().strip() != ""
+            ]
+            return FilterDefinition(conditions, match_var.get())
+
+        def apply_and_close() -> None:
+            on_apply(collect())
+            popup.destroy()
+
+        def clear_and_close() -> None:
+            on_apply(FilterDefinition())
+            popup.destroy()
+
+        ttk.Button(buttons, text="Add condition", command=add_condition).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="Clear", command=clear_and_close).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="Apply", command=apply_and_close).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="Cancel", command=popup.destroy).pack(side=tk.LEFT, padx=3)
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+        popup.grab_set()
+        popup.focus_force()
+
+    def _apply_drt_explorer_filter(
+        self,
+        definition: FilterDefinition,
+        button_text: tk.StringVar,
+        refresh: Callable[[], None],
+    ) -> None:
+        self._drt_explorer_filter = definition
+        button_text.set(
+            "Filter" if not definition.active else f"Filter ({len(definition.conditions)})"
+        )
+        refresh()
+
+    def _apply_fit_explorer_filter(
+        self,
+        definition: FilterDefinition,
+        button_text: tk.StringVar,
+        refresh: Callable[[], None],
+    ) -> None:
+        self._fit_explorer_filter = definition
+        button_text.set(
+            "Filter" if not definition.active else f"Filter ({len(definition.conditions)})"
+        )
+        refresh()
 
     def open_drt_parameters_explorer(self) -> None:
         if self.busy or self.state is None:
@@ -8863,6 +10386,9 @@ class EISApplication:
         if not records:
             self._update_status(f"no {mode} parameters are available")
             return
+
+        def filtered_records() -> list[dict[str, object]]:
+            return apply_filters(records, self._drt_explorer_filter)
 
         def numeric_fields() -> list[str]:
             return [
@@ -8935,6 +10461,10 @@ class EISApplication:
         x_log = tk.BooleanVar(value=False)
         y_log = tk.BooleanVar(value=False)
         hide_legend = tk.BooleanVar(value=False)
+        filter_text = tk.StringVar(
+            value="Filter" if not self._drt_explorer_filter.active
+            else f"Filter ({len(self._drt_explorer_filter.conditions)})"
+        )
         y_rows_frame = ttk.Frame(controls)
         y_rows_frame.grid(row=1, column=1, columnspan=2, padx=3, sticky="ew")
         for column in range(3):
@@ -9041,7 +10571,7 @@ class EISApplication:
 
         def bounds(field: str) -> tuple[float, float]:
             values = []
-            for record in records:
+            for record in filtered_records():
                 try:
                     value = float(record[field])
                 except (KeyError, TypeError, ValueError):
@@ -9134,7 +10664,7 @@ class EISApplication:
                 selected_fields = [x_field, y_field]
                 if split_field not in {"None", "Spectrum"} and split_field in fields:
                     selected_fields.append(split_field)
-                for record in records:
+                for record in filtered_records():
                     try:
                         if any(
                             field not in record
@@ -9305,6 +10835,16 @@ class EISApplication:
         self._drt_parameters_refresh_callback = refresh_data
         ttk.Button(controls, text="Refresh", command=refresh_data).grid(row=4, column=0, pady=(6, 0), sticky="w")
         ttk.Button(controls, text="Active view", command=active_view).grid(row=4, column=1, pady=(6, 0), sticky="w")
+        ttk.Button(
+            controls,
+            textvariable=filter_text,
+            command=lambda: self._open_parameter_explorer_filter(
+                "DRT Parameters Filter",
+                records,
+                self._drt_explorer_filter,
+                lambda definition: self._apply_drt_explorer_filter(definition, filter_text, refresh_ranges),
+            ),
+        ).grid(row=4, column=3, pady=(6, 0), sticky="w")
         refresh_ranges()
 
     def open_fit_parameters_explorer(self) -> None:
@@ -9369,6 +10909,9 @@ class EISApplication:
         if not records:
             self._update_status("no fitted spectra are available")
             return
+
+        def filtered_records() -> list[dict[str, object]]:
+            return apply_filters(records, self._fit_explorer_filter)
 
         numeric_fields = []
         for field in dict.fromkeys(
@@ -9437,6 +10980,10 @@ class EISApplication:
         x_log = tk.BooleanVar(value=False)
         y_log = tk.BooleanVar(value=False)
         hide_legend = tk.BooleanVar(value=False)
+        filter_text = tk.StringVar(
+            value="Filter" if not self._fit_explorer_filter.active
+            else f"Filter ({len(self._fit_explorer_filter.conditions)})"
+        )
         y_rows_frame = ttk.Frame(controls)
         y_rows_frame.grid(row=1, column=1, columnspan=2, padx=3, sticky="ew")
         for column in range(3):
@@ -9548,7 +11095,7 @@ class EISApplication:
 
         def field_bounds(field: str) -> tuple[float, float]:
             values = np.asarray(
-                [float(record[field]) for record in records if field in record and np.isfinite(float(record[field]))],
+                [float(record[field]) for record in filtered_records() if field in record and np.isfinite(float(record[field]))],
                 dtype=float,
             )
             if values.size == 0:
@@ -9640,7 +11187,7 @@ class EISApplication:
                 selected_fields = [x_field, y_field]
                 if split_field not in {"None", "Spectrum"} and split_field in numeric_fields:
                     selected_fields.append(split_field)
-                for record in records:
+                for record in filtered_records():
                     try:
                         if any(
                             field not in record
@@ -9768,6 +11315,16 @@ class EISApplication:
         add_y_row()
         self._fit_parameters_refresh_callback = refresh_data
         ttk.Button(controls, text="Active view", command=active_view).grid(row=4, column=1, pady=(6, 0), sticky="w")
+        ttk.Button(
+            controls,
+            textvariable=filter_text,
+            command=lambda: self._open_parameter_explorer_filter(
+                "Fit Parameters Filter",
+                records,
+                self._fit_explorer_filter,
+                lambda definition: self._apply_fit_explorer_filter(definition, filter_text, refresh_ranges),
+            ),
+        ).grid(row=4, column=3, pady=(6, 0), sticky="w")
         refresh_ranges()
 
     def refresh_fit_parameters_explorer(self, popup: tk.Toplevel) -> None:
@@ -10065,11 +11622,92 @@ class EISApplication:
         self._update_status(f"metadata column '{column_name}' added")
 
     def reset_points(self) -> None:
-        if self.state is None:
+        if self.state is None and self.analysis_mode_var.get() != "Spectra Simulator":
             return
         self.state.active.reset_selection()
         self._refresh_plot(rescale=True)
         self._update_status("selection reset")
+
+    def remove_deterministic_outliers(self) -> None:
+        if self.busy or self.state is None or self.loaded is None:
+            return
+        try:
+            threshold = float(self.deterministic_threshold_var.get())
+            if not np.isfinite(threshold) or threshold <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(
+                "Invalid threshold",
+                "Enter a positive finite deterministic-outlier threshold.",
+                parent=self.root,
+            )
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            current_spectrum = next(
+                (
+                    spectrum
+                    for spectrum in self.loaded.spectra
+                    if spectrum.cycle == self.state.active_cycle
+                ),
+                None,
+            )
+            if current_spectrum is None:
+                self._update_status("no active spectrum is available")
+                return
+            selected_rows = [(self.loaded.dataset_id, self.loaded, current_spectrum)]
+        targets = [
+            self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            for _dataset_id, loaded, spectrum in selected_rows
+        ]
+        unique_targets = list(dict.fromkeys(id(cycle) for cycle in targets))
+        targets = [
+            next(cycle for cycle in targets if id(cycle) == cycle_id)
+            for cycle_id in unique_targets
+        ]
+        self.status_var.set(
+            f"Detecting deterministic outliers in {len(targets)} spectrum(s)…"
+        )
+
+        def detect() -> list[tuple[object, np.ndarray | None, str | None]]:
+            results = []
+            for cycle in targets:
+                try:
+                    indices, _diagnostics = detect_outliers_in_active_points(
+                        cycle.frequency_hz,
+                        cycle.impedance,
+                        cycle.included,
+                        threshold=threshold,
+                    )
+                    results.append((cycle, indices, None))
+                except Exception as error:
+                    results.append((cycle, None, f"{type(error).__name__}: {error}"))
+            return results
+
+        self._submit(
+            detect,
+            lambda results: self._finish_deterministic_outliers(results),
+            "Deterministic outlier detection failed",
+        )
+
+    def _finish_deterministic_outliers(self, results) -> None:
+        removed = 0
+        processed = 0
+        errors = []
+        for cycle, indices, error in results:
+            if error is not None:
+                errors.append(f"Cycle {cycle.cycle}: {error}")
+                continue
+            cycle.apply_outliers(indices)
+            removed += int(indices.size)
+            processed += 1
+        self._restore_controls()
+        self._refresh_explorer_values()
+        self._refresh_plot(rescale=True)
+        message = f"deterministic outliers: processed {processed} spectrum(s), removed {removed} point(s)"
+        if errors:
+            message += "; " + " | ".join(errors)
+        self._update_status(message)
 
     def delete_selected_spectrum(self) -> None:
         if self.busy or self.state is None:
@@ -10731,7 +12369,11 @@ class EISApplication:
             parent=self.root,
             title="Add BioLogic impedance data",
             initialdir=str(self._current_directory()),
-            filetypes=[("BioLogic MPT", "*.mpt"), ("All files", "*.*")],
+            filetypes=[
+                ("BioLogic MPT", "*.mpt"),
+                ("BioLogic MPR", "*.mpr"),
+                ("All files", "*.*"),
+            ],
         )
         if not selected:
             return
@@ -10758,10 +12400,62 @@ class EISApplication:
         control = self.state.control if self.state is not None else self.control
         self.status_var.set(f"Importing {len(new_paths)} data files…")
         self._submit(
-            lambda: load_projects(new_paths, control, circuit),
+            lambda: [
+                (path, inspect_eis_file_spectrum_kinds(path)) for path in new_paths
+            ],
+            lambda inspections: self._finish_import_inspection(
+                inspections, new_paths, control, circuit
+            ),
+            "Data import failed",
+        )
+
+    def _finish_import_inspection(
+        self,
+        inspections: list[tuple[Path, list[str]]],
+        paths: list[Path],
+        control: str,
+        circuit: str,
+    ) -> None:
+        selected_kinds = self._select_import_spectrum_kinds(inspections)
+        if selected_kinds is None:
+            self._update_status("data import cancelled")
+            return
+        self.status_var.set(f"Importing {len(paths)} data files…")
+        self._submit(
+            lambda: load_projects(
+                paths,
+                control,
+                circuit,
+                spectrum_kinds_by_path=selected_kinds,
+            ),
             self._finish_imports,
             "Data import failed",
         )
+
+    def _select_import_spectrum_kinds(
+        self, inspections: list[tuple[Path, list[str]]]
+    ) -> dict[Path, list[str]] | None:
+        selected_kinds: dict[Path, list[str]] = {}
+        apply_to_all_selection: list[str] | None = None
+        for path, available in inspections:
+            if len(available) <= 1:
+                continue
+            if apply_to_all_selection is not None:
+                compatible = _compatible_spectrum_selection(
+                    apply_to_all_selection, available
+                )
+                if compatible is not None:
+                    selected_kinds[path.resolve()] = compatible
+                    continue
+            dialog = ElectrodeSelectionDialog(self.root, path, available)
+            self.root.wait_window(dialog)
+            if dialog.result is None:
+                return None
+            selection, apply_to_all = dialog.result
+            selected_kinds[path.resolve()] = selection
+            if apply_to_all:
+                apply_to_all_selection = selection
+        return selected_kinds
 
     def _finish_imports(self, report: ProjectImportReport) -> None:
         for dataset_id, loaded in report.loaded:
@@ -10909,6 +12603,130 @@ class EISApplication:
             self.save_project_quick(event)
         return "break"
 
+    def load_relaxis_project(self) -> None:
+        if self.busy:
+            return
+        selected = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load RelaxIS 3 project",
+            initialdir=str(self._current_directory()),
+            filetypes=[("RelaxIS 3 project", "*.eis3"), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        source_path = Path(selected).resolve()
+        self.status_var.set(f"Loading RelaxIS 3 project {source_path.name}â€¦")
+        self._submit(
+            lambda: self._convert_relaxis_project(source_path),
+            lambda result: self._finish_relaxis_project_load(result, source_path),
+            "RelaxIS project load failed",
+        )
+
+    def _convert_relaxis_project(
+        self, source_path: Path
+    ) -> tuple[list[tuple[str, LoadedProject, ProjectState]], Path]:
+        temporary_directory = Path(
+            tempfile.mkdtemp(prefix="eis_fitting_relaxis_")
+        )
+        try:
+            converted_path = export_to_eisfit_json(
+                source_path,
+                temporary_directory,
+                model_conflict_handler=self._resolve_relaxis_model_conflict,
+            )
+            result = self._load_saved_project(converted_path)
+            return result, temporary_directory
+        except Exception:
+            shutil.rmtree(temporary_directory, ignore_errors=True)
+            raise
+
+    def _resolve_relaxis_model_conflict(
+        self, datasource: str, instances: list[dict]
+    ) -> list[dict] | int | str:
+        result: dict[str, object] = {}
+        finished = threading.Event()
+
+        def show_dialog() -> None:
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Resolve duplicate RelaxIS spectrum")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            dialog.resizable(False, False)
+            ttk.Label(
+                dialog,
+                text=f"Multiple EEC models were found for:\n{datasource}",
+                justify=tk.LEFT,
+            ).pack(anchor="w", padx=16, pady=(16, 10))
+            choice = tk.StringVar(value="all")
+            ttk.Radiobutton(
+                dialog,
+                text="Load all model instances",
+                variable=choice,
+                value="all",
+            ).pack(anchor="w", padx=16, pady=3)
+            ttk.Radiobutton(
+                dialog,
+                text="Load only this model:",
+                variable=choice,
+                value="one",
+            ).pack(anchor="w", padx=16, pady=(8, 2))
+            models = [
+                f"{item.get('model', '')} (file {item.get('file_id', '')})"
+                for item in instances
+            ]
+            selected_model = tk.StringVar(value=models[0] if models else "")
+            ttk.Combobox(
+                dialog,
+                textvariable=selected_model,
+                values=models,
+                state="readonly",
+                width=48,
+            ).pack(anchor="w", padx=32, pady=(0, 12))
+
+            def accept() -> None:
+                if choice.get() == "all":
+                    result["value"] = "all"
+                else:
+                    result["value"] = next(
+                        index
+                        for index, label in enumerate(models)
+                        if label == selected_model.get()
+                    )
+                dialog.destroy()
+
+            ttk.Button(dialog, text="Continue", command=accept).pack(
+                anchor="e", padx=16, pady=(0, 14)
+            )
+            dialog.protocol("WM_DELETE_WINDOW", accept)
+            dialog.wait_window()
+            finished.set()
+
+        self.root.after(0, show_dialog)
+        finished.wait()
+        return result.get("value", "all")
+
+    def _finish_relaxis_project_load(
+        self,
+        result: tuple[list[tuple[str, LoadedProject, ProjectState]], Path],
+        source_path: Path,
+    ) -> None:
+        loaded_result, temporary_directory = result
+        converted_path = temporary_directory / f"{source_path.stem}.eisfit.json"
+        try:
+            self._finish_project_load(loaded_result, converted_path)
+            # The converted file is temporary; the imported state is an unsaved
+            # native project and can be saved through the normal Save command.
+            self.project_path = None
+            self._project_title_path = source_path
+            self._saved_project_signature = self._project_signature()
+            self._update_window_title()
+            spectrum_count = sum(len(loaded.spectra) for _, loaded, _ in loaded_result)
+            self._update_status(
+                f"Loaded {spectrum_count} spectra from RelaxIS project {source_path.name}"
+            )
+        finally:
+            shutil.rmtree(temporary_directory, ignore_errors=True)
+
     def load_project(self) -> None:
         if self.busy:
             return
@@ -10934,10 +12752,118 @@ class EISApplication:
         )
 
     @staticmethod
+    def _load_ml_results_project(
+        path: Path, payload: dict
+    ) -> list[tuple[str, LoadedProject, ProjectState]]:
+        import pandas as pd
+
+        root = payload.get("ml_results", payload)
+        spectra = root.get("spectra") if isinstance(root, dict) else None
+        if not isinstance(spectra, list) or not spectra:
+            raise ValueError("The ML-results file contains no spectra")
+        grouped: dict[str, list[dict]] = {}
+        for spectrum in spectra:
+            if not isinstance(spectrum, dict):
+                continue
+            spectrum_id = str(spectrum.get("spectrum_id") or "")
+            source_name = str(spectrum.get("source_name") or "").strip()
+            if not source_name:
+                parts = spectrum_id.split("::")
+                source_name = parts[1] if len(parts) >= 4 else str(root.get("source_file") or path.name)
+            grouped.setdefault(source_name, []).append(spectrum)
+        restored = []
+        for source_name, source_spectra in grouped.items():
+            rows = []
+            circuit = None
+            metadata_by_cycle: dict[int, dict[str, object]] = {}
+            for spectrum in source_spectra:
+                frequency = np.asarray(spectrum.get("frequency", []), dtype=float)
+                real = np.asarray(spectrum.get("z_real", []), dtype=float)
+                imaginary = np.asarray(spectrum.get("z_imag", []), dtype=float)
+                if frequency.size == 0 or frequency.size != real.size or real.size != imaginary.size:
+                    continue
+                cycle = int(spectrum.get("cycle", len(metadata_by_cycle) + 1))
+                if cycle in metadata_by_cycle:
+                    raise ValueError(f"Duplicate ML spectrum key ({source_name!r}, {cycle})")
+                circuit = circuit or str(spectrum.get("existing_eec_topology") or "").strip()
+                metadata = dict(spectrum.get("metadata") or {})
+                metadata.setdefault("source_name", source_name)
+                metadata_by_cycle[cycle] = metadata
+                for frequency_value, real_value, imaginary_value in zip(frequency, real, imaginary):
+                    rows.append({
+                        "freq_hz": frequency_value,
+                        "cycle_number": cycle,
+                        "time_s": spectrum.get("time"),
+                        "i_ma": spectrum.get("current"),
+                        "ewe_v": spectrum.get("voltage"),
+                        "re_z_ohm": real_value,
+                        "minus_im_z_ohm": -imaginary_value,
+                    })
+            if not rows:
+                continue
+            circuit = circuit or "R0-L0-p(R1,CPE1)"
+            dataframe = pd.DataFrame(rows)
+            loaded = load_project_from_dataframe(
+                dataframe,
+                path,
+                min(dataframe["cycle_number"].astype(int)),
+                "working",
+                circuit,
+                technique="ML results",
+            )
+            loaded.dataset_id = f"ml-results::{source_name}"
+            loaded.dataset_label = f"{source_name} [ML results]"
+            for spectrum in source_spectra:
+                cycle_number = int(spectrum.get("cycle", -1))
+                if cycle_number not in loaded.state.available_cycles:
+                    continue
+                cycle = load_cycle(dataframe, cycle_number, "working")
+                cycle.circuit = circuit
+                cycle.parameters = loaded.state.parameters_for(cycle_number)
+                cycle.custom_metadata.update(metadata_by_cycle.get(cycle_number, {}))
+                for key in ("ml_envelope_mask", "stage2_active_mask", "stage1_active_mask"):
+                    mask = spectrum.get(key)
+                    if mask is not None and len(mask) == cycle.frequency_hz.size:
+                        cycle.manually_included = np.asarray(mask, dtype=bool)
+                        break
+                minimum = spectrum.get("predicted_f_min")
+                maximum = spectrum.get("predicted_f_max")
+                try:
+                    if float(minimum) > 0 and float(maximum) > 0:
+                        cycle.frequency_window = tuple(sorted((float(minimum), float(maximum))))
+                except (TypeError, ValueError):
+                    pass
+                loaded.state.cycles[cycle_number] = cycle
+                for metadata_row in loaded.spectra:
+                    if metadata_row.cycle == cycle_number:
+                        metadata_row.custom_metadata.update(cycle.custom_metadata)
+                        break
+            loaded.state.active_cycle = min(loaded.state.available_cycles)
+            restored.append((loaded.dataset_id, loaded, loaded.state))
+        if not restored:
+            raise ValueError("The ML-results file contains no usable impedance data")
+        return restored
+
+    @staticmethod
     def _load_saved_project(
         path: Path,
     ) -> list[tuple[str, LoadedProject, ProjectState]]:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("format") == "eis-fitting-ml-results":
+            raise ValueError(
+                "This is an ML-results sidecar, not an EIS-fit project. "
+                "Open the associated .eisfit project and load the sidecar from the ML controls."
+            )
+        is_ml_results = (
+            payload.get("format") != "eis-fitting-project"
+            and "ml_results" in payload
+        ) or (
+            isinstance(payload.get("spectra"), list)
+            and "source_path" not in payload
+            and "datasets" not in payload
+        )
+        if is_ml_results:
+            return EISApplication._load_ml_results_project(path, payload)
         embedded_datasets = payload.get("datasets")
         if embedded_datasets:
             restored_projects = []
@@ -11028,6 +12954,25 @@ class EISApplication:
         self.circuit = restored.circuit
         self.model_var.set(restored.circuit)
         self.cycle_var.set(str(restored.active_cycle))
+        associated_results = path
+        if path.name.endswith(".eisfit.json"):
+            associated_results = path.with_name(
+                path.name.removesuffix(".eisfit.json") + "_ml_results.json"
+            )
+        if "ml_results" in json.loads(path.read_text(encoding="utf-8")):
+            associated_results = path
+        if associated_results.is_file():
+            self.ml_results = load_ml_results(associated_results)
+            self.ml_results_directory = associated_results.resolve()
+            self.ml_results_status_var.set(
+                f"Loaded {len(self.ml_results)} ML results"
+                if self.ml_results
+                else "No ML results found"
+            )
+        else:
+            self.ml_results = {}
+            self.ml_results_directory = None
+            self.ml_results_status_var.set("No ML results loaded")
         self._populate_explorer()
         self._highlight_explorer_cycle(restored.active_cycle)
         self._restore_controls()
