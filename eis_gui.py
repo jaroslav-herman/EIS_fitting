@@ -81,6 +81,7 @@ from explorer_filter import (
     field_is_numeric,
     field_operators,
 )
+from circuit_structure import circuits_equivalent, map_parameter_name, parameter_name_mapping
 
 MODEL_PRESETS = (
     "R0-L0-p(R1,CPE1)",
@@ -585,6 +586,9 @@ class EISApplication:
         self.busy = False
         self._fit_cancel_requested = False
         self._fit_parameter_snapshot = None
+        self._stop_event = threading.Event()
+        self._operation_labels: list[str] = []
+        self._operation_name = "operation"
         self.drt_peak_parameters: list[dict[str, float]] = []
         self._drt_peak_cycle_key = None
         self._drt_peak_artists = []
@@ -4314,7 +4318,7 @@ class EISApplication:
             row=4, column=0, columnspan=2, pady=3, sticky="ew"
         )
         self.stop_fit_button = ttk.Button(
-            actions, text="Stop fit", command=self._cancel_fit, state="disabled"
+            actions, text="Stop", command=self._cancel_fit, state="disabled"
         )
         self.stop_fit_button.grid(row=6, column=0, columnspan=2, pady=3, sticky="ew")
         self.drt_tools_group = ttk.LabelFrame(parent, text="DRT analysis", padding=8)
@@ -4642,7 +4646,7 @@ class EISApplication:
         cycle = self.state.active
         current_model = cycle.model(self.state.circuit)
         simulator_model = self.simulator_circuit_var.get().strip()
-        if self._normalized_circuit(current_model) != self._normalized_circuit(simulator_model):
+        if not circuits_equivalent(current_model, simulator_model):
             messagebox.showerror(
                 "Different EEC models",
                 "Current spectrum and simulator EEC models are different. "
@@ -4663,6 +4667,13 @@ class EISApplication:
             for parameter, value in zip(cycle.parameters, cycle.fit_parameters)
             if np.isfinite(value)
         }
+        mapping = parameter_name_mapping(current_model, simulator_model)
+        if mapping is not None:
+            fitted_by_name = {
+                mapped_name: value
+                for name, value in fitted_by_name.items()
+                if (mapped_name := map_parameter_name(name, mapping)) is not None
+            }
         simulator_parameters = self.simulator_parameter_table.values()
         missing = [parameter.name for parameter in simulator_parameters
                    if parameter.name not in fitted_by_name]
@@ -5136,11 +5147,16 @@ class EISApplication:
         work: Callable[[], object],
         success: Callable[[object], None],
         error_title: str,
+        *,
+        operation_labels: list[str] | None = None,
+        operation_name: str = "operation",
     ) -> None:
         if self.busy:
             return
         self._fit_cancel_requested = False
-        self._fit_parameter_snapshot = copy.deepcopy(self.state)
+        self._stop_event.clear()
+        self._operation_labels = list(operation_labels or [])
+        self._operation_name = operation_name
         self.busy = True
         if hasattr(self, "stop_fit_button"):
             self.stop_fit_button.configure(state="normal")
@@ -5163,22 +5179,16 @@ class EISApplication:
         try:
             result = future.result()
         except Exception as error:
+            self._operation_labels = []
             self._set_controls_enabled(self.state is not None)
             self.status_var.set(f"Error: {error}")
             messagebox.showerror(
                 error_title, f"{type(error).__name__}: {error}", parent=self.root
             )
             return
-        if self._fit_cancel_requested:
-            if self._fit_parameter_snapshot is not None and self.state is not None:
-                self.state = copy.deepcopy(self._fit_parameter_snapshot)
-                refresh = getattr(self, "_refresh_parameter_table", None)
-                if refresh is not None:
-                    refresh()
-            self._update_status("fit cancelled")
-        else:
-            success(result)
+        success(result)
         self._fit_parameter_snapshot = None
+        self._operation_labels = []
         self._set_controls_enabled(self.state is not None)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
@@ -5970,7 +5980,8 @@ class EISApplication:
                 missing_results.append(f"{dataset_id}:{spectrum.cycle}")
                 continue
             current_model = cycle.model(loaded.state.circuit)
-            if self._normalized_circuit(current_model) == self._normalized_circuit(circuit):
+            equivalent = circuits_equivalent(current_model, circuit)
+            if equivalent:
                 parameters = cycle.parameters
             elif cycle.fit_parameters is not None:
                 missing_results.append(f"{dataset_id}:{spectrum.cycle} (model already fitted)")
@@ -5980,7 +5991,11 @@ class EISApplication:
                 cycle.circuit = circuit
             by_name = {parameter.name: parameter for parameter in parameters}
             for name, value in result.model_parameters.items():
-                parameter = by_name.get(name)
+                target_name = name
+                if equivalent:
+                    mapping = parameter_name_mapping(circuit, current_model)
+                    target_name = map_parameter_name(name, mapping or {}) or name
+                parameter = by_name.get(target_name)
                 if parameter is not None:
                     limits = result.parameter_limits.get(name)
                     if limits is not None:
@@ -8424,9 +8439,35 @@ class EISApplication:
             f"frequency range applied to {updated} selected spectra"
         )
 
-    def _configure_cycle_model(self, cycle, circuit: str, parameters=None) -> None:
+    def _configure_cycle_model(
+        self,
+        cycle,
+        circuit: str,
+        parameters=None,
+        fallback_circuit: str | None = None,
+    ) -> None:
         if parameters is None:
             parameters = circuit_parameters(circuit, self._eec_parameter_bounds)
+        old_circuit = cycle.model(fallback_circuit or circuit)
+        equivalent = circuits_equivalent(old_circuit, circuit)
+        element_mapping = (
+            parameter_name_mapping(old_circuit, circuit) if equivalent else None
+        )
+        old_parameters = list(cycle.parameters)
+        old_fit = (
+            np.asarray(cycle.fit_parameters, dtype=float).copy()
+            if cycle.fit_parameters is not None
+            else None
+        )
+        old_by_target_name = {}
+        if element_mapping is not None:
+            for index, old_parameter in enumerate(old_parameters):
+                target_name = map_parameter_name(old_parameter.name, element_mapping)
+                if target_name is not None:
+                    old_by_target_name[target_name] = (
+                        old_parameter,
+                        old_fit[index] if old_fit is not None and index < old_fit.size else None,
+                    )
         cycle.circuit = circuit
         cycle.parameters = [
             ParameterValue(
@@ -8440,6 +8481,34 @@ class EISApplication:
             )
             for parameter in parameters
         ]
+        if equivalent and old_by_target_name:
+            for parameter in cycle.parameters:
+                previous = old_by_target_name.get(parameter.name)
+                if previous is None:
+                    continue
+                old_parameter, fitted_value = previous
+                parameter.initial = old_parameter.initial
+                parameter.lower = old_parameter.lower
+                parameter.upper = old_parameter.upper
+                parameter.error_percent = old_parameter.error_percent
+                parameter.fixed = old_parameter.fixed
+            fitted_values = [
+                old_by_target_name[parameter.name][1]
+                for parameter in cycle.parameters
+            ] if all(parameter.name in old_by_target_name for parameter in cycle.parameters) else []
+            if old_fit is not None and fitted_values and all(
+                value is not None for value in fitted_values
+            ):
+                cycle.fit_parameters = np.asarray(
+                    fitted_values,
+                    dtype=float,
+                )
+            elif old_fit is not None:
+                cycle.fit_parameters = None
+                cycle.fit_frequency_hz = None
+                cycle.fit_impedance = None
+                cycle.fit_at_data_impedance = None
+            return
         cycle.clear_fit()
         cycle.invalidate_drt_cache()
 
@@ -8462,7 +8531,9 @@ class EISApplication:
             )
             self.model_var.set(self.state.active.model(self.state.circuit))
             return
-        self._configure_cycle_model(self.state.active, circuit, parameters)
+        self._configure_cycle_model(
+            self.state.active, circuit, parameters, self.state.circuit
+        )
         self.circuit = circuit
         self.parameter_table.set_parameters(
             self.state.parameters_for(self.state.active_cycle)
@@ -8495,7 +8566,7 @@ class EISApplication:
         updated = 0
         for _dataset_id, loaded, spectrum in selected_rows:
             cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
-            self._configure_cycle_model(cycle, circuit, parameters)
+            self._configure_cycle_model(cycle, circuit, parameters, loaded.state.circuit)
             updated += 1
         self._restore_controls()
         self._refresh_explorer_values()
@@ -8546,7 +8617,7 @@ class EISApplication:
             ):
                 return
         for cycle, circuit, parameters, _result in assignments:
-            self._configure_cycle_model(cycle, circuit, parameters)
+            self._configure_cycle_model(cycle, circuit, parameters, loaded.state.circuit)
         active_result = next(
             (result for cycle, _circuit, _parameters, result in assignments
              if cycle is self.state.active),
@@ -8572,6 +8643,11 @@ class EISApplication:
             message += f"; no prediction for {len(missing)} spectrum(s)"
         if invalid:
             message += f"; invalid prediction for {len(invalid)} spectrum(s)"
+        if self._stop_event.is_set():
+            message = (
+                f"Automatic model selection stopped: processed {updated}, "
+                f"skipped {max(len(self._operation_labels) - updated, 0)} spectra"
+            )
         self._update_status(message)
 
     def auto_select_model(self) -> None:
@@ -8594,20 +8670,30 @@ class EISApplication:
         self.status_var.set(
             f"Selecting EEC models with Hybrid DRT for {len(targets)} spectra..."
         )
-        self._submit(
-            lambda: [
-                (
-                    dataset_id,
-                    cycle_number,
-                    select_eec_model_from_hybrid_drt(
-                        cycle,
-                        settings=copy.deepcopy(self._auto_model_settings),
-                    ),
+
+        def select_models():
+            results = []
+            for dataset_id, cycle_number, cycle in targets:
+                if self._stop_event.is_set():
+                    break
+                results.append(
+                    (
+                        dataset_id,
+                        cycle_number,
+                        select_eec_model_from_hybrid_drt(
+                            cycle,
+                            settings=copy.deepcopy(self._auto_model_settings),
+                        ),
+                    )
                 )
-                for dataset_id, cycle_number, cycle in targets
-            ],
+            return results
+
+        self._submit(
+            select_models,
             self._finish_auto_model_selection,
             "Automatic model selection failed",
+            operation_labels=[f"cycle {cycle_number}" for _dataset_id, cycle_number, _cycle in targets],
+            operation_name="Automatic EEC model selection",
         )
 
     def _finish_auto_model_selection(
@@ -8882,9 +8968,12 @@ class EISApplication:
                 self.loaded.dataframe,
                 self.state,
                 threshold,
+                self._stop_event,
             ),
             self._finish_all_outliers,
             "File-wide outlier search failed",
+            operation_labels=[f"cycle {cycle}" for cycle in self.state.available_cycles],
+            operation_name="Outlier search",
         )
 
     def _finish_all_outliers(self, results) -> None:
@@ -8905,10 +8994,16 @@ class EISApplication:
             peak_count += analysis.peak_count
         self._restore_controls()
         self._refresh_plot(rescale=True)
-        self._update_status(
-            f"outliers and ridge initial values calculated for {len(results)} cycles "
-            f"({peak_count} peaks)"
-        )
+        if self._stop_event.is_set():
+            self._update_status(
+                f"outlier search stopped: processed {len(results)}, "
+                f"skipped {max(len(self._operation_labels) - len(results), 0)} cycles"
+            )
+        else:
+            self._update_status(
+                f"outliers and ridge initial values calculated for {len(results)} cycles "
+                f"({peak_count} peaks)"
+            )
 
     def find_outliers_for_selected(self) -> None:
         if self.state is None or self.loaded is None or not self._capture_controls():
@@ -8960,11 +9055,17 @@ class EISApplication:
                     loaded.dataframe,
                     project,
                     threshold,
+                    self._stop_event,
                 )
                 for dataset_id, (loaded, project) in selected_projects.items()
             },
             self._finish_all_outliers,
             "Selected-spectra outlier search failed",
+            operation_labels=[
+                f"{loaded.dataset_label}, cycle {spectrum.cycle}"
+                for _dataset_id, loaded, spectrum in selected_rows
+            ],
+            operation_name="Selected outlier search",
         )
 
     def _finish_all_outliers(self, results) -> None:
@@ -8972,6 +9073,7 @@ class EISApplication:
             return
         peak_count = 0
         spectra_count = 0
+        outlier_count = 0
         for dataset_id, dataset_results in results.items():
             loaded = self.loaded_projects.get(dataset_id)
             if loaded is None:
@@ -8988,13 +9090,20 @@ class EISApplication:
                 cycle.apply_outliers(analysis.outlier_indices)
                 cycle.parameters = analysis.parameters
                 peak_count += analysis.peak_count
+                outlier_count += int(np.count_nonzero(analysis.outlier_indices))
                 spectra_count += 1
         self._restore_controls()
         self._refresh_plot(rescale=True)
-        self._update_status(
-            f"outliers and ridge initial values calculated for {spectra_count} spectra "
-            f"({peak_count} peaks)"
-        )
+        if self._stop_event.is_set():
+            self._update_status(
+                f"outlier search stopped: processed {spectra_count}, "
+                f"skipped {max(len(self._operation_labels) - spectra_count, 0)} spectra"
+            )
+        else:
+            self._update_status(
+                f"outlier search complete for {spectra_count} spectra "
+                f"({outlier_count} points excluded)"
+            )
 
     def initialize_from_ridge(self) -> None:
         if self.state is None or not self._capture_controls():
@@ -9267,28 +9376,35 @@ class EISApplication:
         self.status_var.set(
             f"Finding outliers in {spectrum_count} selected spectra..."
         )
-        self._submit(
-            lambda: {
-                dataset_id: {
-                    cycle_number: (
-                        project.cycles[cycle_number],
+        def calculate():
+            results = {}
+            for dataset_id, (_loaded, project) in selected_projects.items():
+                dataset_results = {}
+                results[dataset_id] = dataset_results
+                for cycle_number in project.available_cycles:
+                    if self._stop_event.is_set():
+                        return results
+                    cycle = project.cycles[cycle_number]
+                    dataset_results[cycle_number] = (
+                        cycle,
                         self._cached_ridge_analysis(
-                            project.cycles[cycle_number],
-                            threshold,
-                            project.parameters_for(cycle_number),
+                            cycle, threshold, project.parameters_for(cycle_number)
                         )
                         or analyze_outliers(
-                            project.cycles[cycle_number],
-                            threshold,
-                            project.parameters_for(cycle_number),
-                        )
+                            cycle, threshold, project.parameters_for(cycle_number)
+                        ),
                     )
-                    for cycle_number in project.available_cycles
-                }
-                for dataset_id, (loaded, project) in selected_projects.items()
-            },
+            return results
+
+        self._submit(
+            calculate,
             self._finish_selected_outliers,
             "Selected-spectra outlier search failed",
+            operation_labels=[
+                f"{loaded.dataset_label}, cycle {spectrum.cycle}"
+                for _dataset_id, loaded, spectrum in selected_rows
+            ],
+            operation_name="Selected outlier search",
         )
 
     def _finish_selected_outliers(self, results) -> None:
@@ -9324,10 +9440,16 @@ class EISApplication:
                 spectra_count += 1
         self._restore_controls()
         self._refresh_plot(rescale=True)
-        self._update_status(
-            f"outlier search complete for {spectra_count} spectra "
-            f"({outlier_count} points excluded)"
-        )
+        if self._stop_event.is_set():
+            self._update_status(
+                f"outlier search stopped: processed {spectra_count}, "
+                f"skipped {max(len(self._operation_labels) - spectra_count, 0)} spectra"
+            )
+        else:
+            self._update_status(
+                f"outlier search complete for {spectra_count} spectra "
+                f"({outlier_count} points excluded)"
+            )
 
     def calculate_selected_ridge_drts(self) -> None:
         if self.state is None or not self._capture_controls():
@@ -9345,20 +9467,32 @@ class EISApplication:
             return
         spectrum_count = sum(len(project.available_cycles) for _loaded, project in batches.values())
         self.status_var.set(f"Calculating ridge DRT for {spectrum_count} selected spectra...")
-        self._submit(
-            lambda: {
-                dataset_id: {
-                    cycle_number: analyze_outliers(
+
+        def calculate() -> dict[str, dict[int, RidgeInitialization]]:
+            results: dict[str, dict[int, RidgeInitialization]] = {}
+            for dataset_id, (_loaded, project) in batches.items():
+                dataset_results: dict[int, RidgeInitialization] = {}
+                results[dataset_id] = dataset_results
+                for cycle_number in project.available_cycles:
+                    if self._stop_event.is_set():
+                        return results
+                    dataset_results[cycle_number] = analyze_outliers(
                         project.cycles[cycle_number],
                         threshold,
                         project.parameters_for(cycle_number),
                     )
-                    for cycle_number in project.available_cycles
-                }
-                for dataset_id, (_loaded, project) in batches.items()
-            },
+            return results
+
+        self._submit(
+            calculate,
             self._finish_selected_ridge_drts,
             "Selected ridge DRT calculation failed",
+            operation_labels=[
+                f"{loaded.dataset_label}, cycle {cycle}"
+                for loaded, project in batches.values()
+                for cycle in project.available_cycles
+            ],
+            operation_name="Selected Ridge DRT",
         )
 
     def _finish_selected_ridge_drts(self, results) -> None:
@@ -9386,7 +9520,13 @@ class EISApplication:
                 )
                 spectra_count += 1
         self._refresh_plot(rescale=True)
-        self._update_status(f"ridge DRT recalculated for {spectra_count} selected spectra")
+        if self._stop_event.is_set():
+            self._update_status(
+                f"Ridge DRT stopped: processed {spectra_count}, "
+                f"skipped {max(len(self._operation_labels) - spectra_count, 0)} spectra"
+            )
+        else:
+            self._update_status(f"ridge DRT recalculated for {spectra_count} selected spectra")
 
     def calculate_selected_hybrid_drts(self) -> None:
         if self.state is None or not self._capture_controls():
@@ -9397,16 +9537,30 @@ class EISApplication:
             return
         spectrum_count = sum(len(project.available_cycles) for _loaded, project in batches.values())
         self.status_var.set(f"Calculating hybrid DRT for {spectrum_count} selected spectra...")
+
+        def calculate() -> dict[str, dict[int, DRTComputation]]:
+            results: dict[str, dict[int, DRTComputation]] = {}
+            for dataset_id, (_loaded, project) in batches.items():
+                dataset_results: dict[int, DRTComputation] = {}
+                results[dataset_id] = dataset_results
+                for cycle_number in project.available_cycles:
+                    if self._stop_event.is_set():
+                        return results
+                    dataset_results[cycle_number] = calculate_hybrid_drt(
+                        project.cycles[cycle_number]
+                    )
+            return results
+
         self._submit(
-            lambda: {
-                dataset_id: {
-                    cycle_number: calculate_hybrid_drt(project.cycles[cycle_number])
-                    for cycle_number in project.available_cycles
-                }
-                for dataset_id, (_loaded, project) in batches.items()
-            },
+            calculate,
             self._finish_selected_hybrid_drts,
             "Selected hybrid DRT calculation failed",
+            operation_labels=[
+                f"{loaded.dataset_label}, cycle {cycle}"
+                for loaded, project in batches.values()
+                for cycle in project.available_cycles
+            ],
+            operation_name="Selected Hybrid DRT",
         )
 
     def _finish_selected_hybrid_drts(self, results) -> None:
@@ -9429,7 +9583,13 @@ class EISApplication:
                 )
                 spectra_count += 1
         self._refresh_plot(rescale=True)
-        self._update_status(f"hybrid DRT recalculated for {spectra_count} selected spectra")
+        if self._stop_event.is_set():
+            self._update_status(
+                f"Hybrid DRT stopped: processed {spectra_count}, "
+                f"skipped {max(len(self._operation_labels) - spectra_count, 0)} spectra"
+            )
+        else:
+            self._update_status(f"hybrid DRT recalculated for {spectra_count} selected spectra")
 
     def fit(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
@@ -9493,9 +9653,12 @@ class EISApplication:
                 targets,
                 parameters,
                 use_target_initial_parameters=True,
+                stop_event=self._stop_event,
             ),
             self._finish_explorer_batch_fit,
             "Selected fit failed",
+            operation_labels=[target.label for target in targets],
+            operation_name="Selected fit",
         )
 
     def refine_fit_selected(self) -> None:
@@ -9554,23 +9717,31 @@ class EISApplication:
             return
 
         self.status_var.set(f"Refining fit for {len(targets)} selected spectra…")
-        self._submit(
-            lambda: [
-                (
-                    dataset_id,
-                    cycle_number,
-                    refine_fit_cycle(
-                        cycle,
-                        circuit,
-                        parameters,
-                        z_threshold,
-                        max_iterations,
-                    ),
+        def refine():
+            results = []
+            for dataset_id, _loaded, cycle_number, cycle, parameters, circuit in targets:
+                if self._stop_event.is_set():
+                    break
+                results.append(
+                    (
+                        dataset_id,
+                        cycle_number,
+                        refine_fit_cycle(
+                            cycle, circuit, parameters, z_threshold, max_iterations
+                        ),
+                    )
                 )
-                for dataset_id, _loaded, cycle_number, cycle, parameters, circuit in targets
-            ],
+            return results
+
+        self._submit(
+            refine,
             self._finish_refine_fit,
             "Refine fit failed",
+            operation_labels=[
+                f"{loaded.dataset_label}, cycle {cycle_number}"
+                for _dataset_id, loaded, cycle_number, *_rest in targets
+            ],
+            operation_name="Refine fit",
         )
 
     def _finish_refine_fit(self, results) -> None:
@@ -9617,10 +9788,16 @@ class EISApplication:
             self.state.parameters_for(self.state.active_cycle)
         )
         self._refresh_plot(rescale=True)
-        self._update_status(
-            f"refine fit completed: {removed_count} points deactivated in "
-            f"{iteration_count} iterations"
-        )
+        if self._stop_event.is_set():
+            self._update_status(
+                f"Refine fit stopped: processed {len(results)}, "
+                f"skipped {max(len(self._operation_labels) - len(results), 0)} spectra"
+            )
+        else:
+            self._update_status(
+                f"refine fit completed: {removed_count} points deactivated in "
+                f"{iteration_count} iterations"
+            )
 
     def batch_fit(self) -> None:
         if self.state is None or self.loaded is None or not self._capture_controls():
@@ -9641,9 +9818,18 @@ class EISApplication:
                 self.state,
                 start_cycle,
                 parameters,
+                self._stop_event,
+                self.state.circuit,
             ),
             self._finish_batch_fit,
             "Batch fit failed",
+            operation_labels=[
+                f"cycle {cycle}"
+                for cycle in self.state.available_cycles[
+                    self.state.available_cycles.index(start_cycle) :
+                ]
+            ],
+            operation_name="Batch fit",
         )
 
     def _finish_batch_fit(self, report: BatchFitReport) -> None:
@@ -9660,17 +9846,27 @@ class EISApplication:
         self._restore_controls()
         self._refresh_plot(rescale=True)
         self._refresh_open_parameter_explorers()
+        if report.stopped:
+            self._update_status(
+                f"batch fit stopped: processed {len(report.fits)}, "
+                f"skipped {len(report.skipped_cycles)} cycles"
+            )
+            return
         if report.failed_cycle is None:
             self._update_status(f"batch fit completed for {len(report.fits)} cycles")
             return
         self._update_status(
             f"batch fit stopped at cycle {report.failed_cycle}; "
-            f"{len(report.fits)} cycles completed"
+            f"{len(report.fits)} cycles completed, "
+            f"{len(report.skipped_cycles)} cycles skipped"
         )
         messagebox.showwarning(
             "Batch fit stopped",
             f"Cycle {report.failed_cycle}: {report.error}\n\n"
-            f"The {len(report.fits)} successful fits were retained.",
+            f"Completed: {len(report.fits)}\n"
+            f"Failed: 1\n"
+            f"Skipped: {len(report.skipped_cycles)}\n\n"
+            f"The successful fits were retained.",
             parent=self.root,
         )
 
@@ -9745,9 +9941,16 @@ class EISApplication:
             f"{target_description}…"
         )
         self._submit(
-            lambda: batch_fit_spectra(targets, parameters),
+            lambda: batch_fit_spectra(
+                targets,
+                parameters,
+                stop_event=self._stop_event,
+                initial_circuit=self.state.active.model(self.state.circuit),
+            ),
             self._finish_explorer_batch_fit,
             "Explorer batch fit failed",
+            operation_labels=[target.label for target in targets],
+            operation_name="Explorer batch fit",
         )
 
     def _start_drt_peak_batch(self, direction: int) -> None:
@@ -9917,9 +10120,16 @@ class EISApplication:
             f"Batch fitting {len(targets)} selected spectra {direction_name}..."
         )
         self._submit(
-            lambda: batch_fit_spectra(targets, parameters),
+            lambda: batch_fit_spectra(
+                targets,
+                parameters,
+                stop_event=self._stop_event,
+                initial_circuit=self.state.active.model(self.state.circuit),
+            ),
             self._finish_explorer_batch_fit,
             "Selected batch fit failed",
+            operation_labels=[target.label for target in targets],
+            operation_name="Selected batch fit",
         )
 
     def _finish_explorer_batch_fit(self, report: SpectrumBatchReport) -> None:
@@ -9936,6 +10146,31 @@ class EISApplication:
         self._restore_controls()
         self._refresh_plot(rescale=True)
         self._refresh_open_parameter_explorers()
+        if getattr(self, "_batch_fit_both_pending", False):
+            if getattr(self, "_batch_fit_both_stage", "") == "up":
+                self._batch_fit_both_up_completed = len(report.fits)
+            else:
+                self._batch_fit_both_down_completed = len(report.fits)
+                self._batch_fit_both_pending = False
+                if report.stopped or self._stop_event.is_set():
+                    self._update_status(
+                        "Batch fit up and down stopped by user. "
+                        f"Up: {self._batch_fit_both_up_completed} completed. "
+                        f"Down: {self._batch_fit_both_down_completed} completed."
+                    )
+                else:
+                    self._update_status(
+                        "Batch fit up and down completed. "
+                        f"Up: {self._batch_fit_both_up_completed} completed. "
+                        f"Down: {self._batch_fit_both_down_completed} completed."
+                    )
+                return
+        if report.stopped:
+            self._update_status(
+                f"explorer batch fit stopped: processed {len(report.fits)}, "
+                f"skipped {len(report.skipped_labels)} spectra"
+            )
+            return
         if report.failed_label is None:
             self._update_status(
                 f"explorer batch fit completed for {len(report.fits)} spectra"
@@ -9943,12 +10178,15 @@ class EISApplication:
             return
         self._update_status(
             f"explorer batch stopped at {report.failed_label}; "
-            f"{len(report.fits)} spectra completed"
+            f"{len(report.fits)} completed, {len(report.skipped_labels)} skipped"
         )
         messagebox.showwarning(
             "Explorer batch fit stopped",
             f"{report.failed_label}: {report.error}\n\n"
-            f"The {len(report.fits)} successful fits were retained.",
+            f"Completed: {len(report.fits)}\n"
+            f"Failed: 1\n"
+            f"Skipped: {len(report.skipped_labels)}\n\n"
+            f"The successful fits were retained.",
             parent=self.root,
         )
 
@@ -9960,6 +10198,9 @@ class EISApplication:
             self._update_status("select one or more spectra in the explorer first")
             return
         self._batch_fit_both_pending = True
+        self._batch_fit_both_stage = "up"
+        self._batch_fit_both_up_completed = 0
+        self._batch_fit_both_down_completed = 0
         self.batch_fit_selected_down(1)
         if not self.busy:
             self._batch_fit_both_pending = False
@@ -9972,8 +10213,18 @@ class EISApplication:
         if self.busy:
             self.root.after(100, self._continue_batch_fit_selected_up_down)
             return
-        self._batch_fit_both_pending = False
+        if self._stop_event.is_set():
+            self._batch_fit_both_pending = False
+            self._update_status(
+                "Batch fit up and down stopped by user. "
+                f"Up: {self._batch_fit_both_up_completed} completed. "
+                "Down: not started."
+            )
+            return
+        self._batch_fit_both_stage = "down"
         self.batch_fit_selected_down(-1)
+        if not self.busy:
+            self._batch_fit_both_pending = False
 
     def copy_neighbor_drt_peaks(self, direction: int) -> None:
         if self.state is None or self.busy:
@@ -10032,15 +10283,24 @@ class EISApplication:
             return
         current_model = self.state.active.model(self.state.circuit)
         source_model = source.model(source_loaded.state.circuit)
-        if source_model != current_model:
+        mapping = parameter_name_mapping(source_model, current_model)
+        if mapping is None:
             self._update_status("neighboring spectrum uses a different fitting model")
             return
         current_parameters = self.state.parameters_for(self.state.active_cycle)
+        source_parameters = source_loaded.state.parameters_for(source_spectrum.cycle)
         fitted = np.asarray(source.fit_parameters).reshape(-1)
-        if fitted.size != len(current_parameters):
+        source_by_target = {
+            map_parameter_name(parameter.name, mapping): (parameter, value)
+            for parameter, value in zip(source_parameters, fitted)
+        }
+        if fitted.size != len(source_parameters) or any(
+            parameter.name not in source_by_target for parameter in current_parameters
+        ):
             self._update_status("neighboring fit uses incompatible parameters")
             return
-        for parameter, value in zip(current_parameters, fitted):
+        for parameter in current_parameters:
+            _source_parameter, value = source_by_target[parameter.name]
             parameter.initial = float(value)
         self.state.active.parameters = current_parameters
         self.state.active.clear_fit()
@@ -10074,24 +10334,25 @@ class EISApplication:
             return
         current_model = self.state.active.model(self.state.circuit)
         source_model = source.model(source_loaded.state.circuit)
-        if source_model != current_model:
+        mapping = parameter_name_mapping(source_model, current_model)
+        if mapping is None:
             self._update_status("neighboring spectrum uses a different fitting model")
             return
         current_parameters = self.state.parameters_for(self.state.active_cycle)
         source_parameters = source_loaded.state.parameters_for(source_spectrum.cycle)
         fitted = np.asarray(source.fit_parameters).reshape(-1)
-        if (
-            fitted.size != len(current_parameters)
-            or len(source_parameters) != len(current_parameters)
-            or [parameter.name for parameter in source_parameters]
-            != [parameter.name for parameter in current_parameters]
+        source_by_target = {
+            map_parameter_name(parameter.name, mapping): (parameter, value)
+            for parameter, value in zip(source_parameters, fitted)
+        }
+        if fitted.size != len(source_parameters) or any(
+            parameter.name not in source_by_target for parameter in current_parameters
         ):
             self._update_status("neighboring fit uses incompatible parameters")
             return
         copied_parameters = []
-        for target, source_parameter, value in zip(
-            current_parameters, source_parameters, fitted
-        ):
+        for target in current_parameters:
+            source_parameter, value = source_by_target[target.name]
             copied_parameters.append(
                 ParameterValue(
                     target.name,
@@ -11672,6 +11933,8 @@ class EISApplication:
         def detect() -> list[tuple[object, np.ndarray | None, str | None]]:
             results = []
             for cycle in targets:
+                if self._stop_event.is_set():
+                    break
                 try:
                     indices, _diagnostics = detect_outliers_in_active_points(
                         cycle.frequency_hz,
@@ -11688,6 +11951,8 @@ class EISApplication:
             detect,
             lambda results: self._finish_deterministic_outliers(results),
             "Deterministic outlier detection failed",
+            operation_labels=[f"cycle {cycle.cycle}" for cycle in targets],
+            operation_name="Deterministic outlier detection",
         )
 
     def _finish_deterministic_outliers(self, results) -> None:
@@ -11859,31 +12124,48 @@ class EISApplication:
         if mode == "ridge":
             threshold = self._require_threshold_value()
             self.status_var.set(f"Calculating ridge DRT for {len(missing)} spectra...")
-            self._submit(
-                lambda: [
-                    (
-                        loaded,
-                        cycle.cycle,
-                        analyze_outliers(
-                            cycle,
-                            threshold,
-                            loaded.state.parameters_for(cycle.cycle),
-                        ),
+            def calculate_ridge():
+                results = []
+                for loaded, cycle in missing:
+                    if self._stop_event.is_set():
+                        break
+                    results.append(
+                        (
+                            loaded,
+                            cycle.cycle,
+                            analyze_outliers(
+                                cycle,
+                                threshold,
+                                loaded.state.parameters_for(cycle.cycle),
+                            ),
+                        )
                     )
-                    for loaded, cycle in missing
-                ],
+                return results
+
+            self._submit(
+                calculate_ridge,
                 lambda results: self._finish_saved_ridge_batch(results, on_ready),
                 "Ridge DRT calculation failed",
+                operation_labels=[f"cycle {cycle.cycle}" for _loaded, cycle in missing],
+                operation_name="Ridge DRT calculation",
             )
             return
         self.status_var.set(f"Calculating hybrid DRT for {len(missing)} spectra...")
+
+        def calculate_hybrid():
+            results = []
+            for loaded, cycle in missing:
+                if self._stop_event.is_set():
+                    break
+                results.append((loaded, cycle.cycle, calculate_hybrid_drt(cycle)))
+            return results
+
         self._submit(
-            lambda: [
-                (loaded, cycle.cycle, calculate_hybrid_drt(cycle))
-                for loaded, cycle in missing
-            ],
+            calculate_hybrid,
             lambda results: self._finish_saved_hybrid_batch(results, on_ready),
             "Hybrid DRT calculation failed",
+            operation_labels=[f"cycle {cycle.cycle}" for _loaded, cycle in missing],
+            operation_name="Hybrid DRT calculation",
         )
 
     def _finish_saved_ridge_batch(self, results, on_ready: Callable[[], None]) -> None:
@@ -12529,12 +12811,8 @@ class EISApplication:
         if not self.busy:
             return
         self._fit_cancel_requested = True
-        if self._fit_parameter_snapshot is not None and self.state is not None:
-            self.state = copy.deepcopy(self._fit_parameter_snapshot)
-            refresh = getattr(self, "_refresh_parameter_table", None)
-            if refresh is not None:
-                refresh()
-        self._update_status("fit cancellation requested")
+        self._stop_event.set()
+        self._update_status("Stop requested - finishing the current spectrum")
 
     def save_project(self, path: Path | None = None) -> None:
         if self.busy or self.state is None or not self._capture_controls():

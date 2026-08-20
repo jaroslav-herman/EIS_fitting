@@ -16,6 +16,7 @@ from eis_model import (
     copy_parameter_values,
     sort_spectrum,
 )
+from circuit_structure import circuits_equivalent, map_parameter_name, parameter_name_mapping
 
 SPECTRUM_KIND_COLUMN_MAP = {
     "working": ("re_z_ohm", "minus_im_z_ohm", "ewe_v"),
@@ -115,6 +116,8 @@ class BatchFitReport:
     fits: list[BatchCycleFit]
     failed_cycle: int | None = None
     error: str | None = None
+    stopped: bool = False
+    skipped_cycles: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -135,6 +138,8 @@ class SpectrumBatchReport:
     fits: list[SpectrumBatchFit]
     failed_label: str | None = None
     error: str | None = None
+    stopped: bool = False
+    skipped_labels: list[str] = field(default_factory=list)
 
 
 def _safe_unique_ints(values: Iterable[object]) -> list[int]:
@@ -807,9 +812,13 @@ def find_outliers_for_all_cycles(
     dataframe,
     project: ProjectState,
     threshold: float,
+    stop_event=None,
 ) -> dict[int, tuple[CycleState, RidgeInitialization]]:
     results: dict[int, tuple[CycleState, RidgeInitialization]] = {}
-    for cycle_number in project.available_cycles:
+    cycle_numbers = list(project.available_cycles)
+    for index, cycle_number in enumerate(cycle_numbers):
+        if stop_event is not None and stop_event.is_set():
+            break
         cycle = project.cycles.get(cycle_number)
         if cycle is None:
             cycle = load_cycle(dataframe, cycle_number, project.control)
@@ -1164,8 +1173,18 @@ def refine_fit_cycle(
 def _batch_parameters_with_initials(
     target_parameters: list[ParameterValue],
     source_parameters: list[ParameterValue],
+    source_circuit: str | None = None,
+    target_circuit: str | None = None,
 ) -> list[ParameterValue]:
-    source_by_name = {parameter.name: parameter for parameter in source_parameters}
+    element_mapping = (
+        parameter_name_mapping(source_circuit, target_circuit)
+        if source_circuit and target_circuit
+        else None
+    )
+    source_by_name = {
+        map_parameter_name(parameter.name, element_mapping) if element_mapping else parameter.name: parameter
+        for parameter in source_parameters
+    }
     copied = []
     for target in target_parameters:
         source = source_by_name.get(target.name)
@@ -1189,6 +1208,8 @@ def batch_fit_from_cycle(
     project: ProjectState,
     start_cycle: int,
     initial_parameters: list[ParameterValue],
+    stop_event=None,
+    initial_circuit: str | None = None,
 ) -> BatchFitReport:
     start_index = project.available_cycles.index(start_cycle)
     cycle_numbers = project.available_cycles[start_index:]
@@ -1198,8 +1219,15 @@ def batch_fit_from_cycle(
         )
         for p in initial_parameters
     ]
+    next_circuit = initial_circuit or project.circuit
     completed: list[BatchCycleFit] = []
-    for cycle_number in cycle_numbers:
+    for index, cycle_number in enumerate(cycle_numbers):
+        if stop_event is not None and stop_event.is_set():
+            return BatchFitReport(
+                fits=completed,
+                stopped=True,
+                skipped_cycles=cycle_numbers[index:],
+            )
         cycle = project.cycles.get(cycle_number)
         if cycle is None:
             cycle = load_cycle(dataframe, cycle_number, project.control)
@@ -1210,17 +1238,18 @@ def batch_fit_from_cycle(
             cycle.circuit = project.circuit
         cycle_circuit = cycle.model(project.circuit)
         cycle_parameters = project.parameters_for(cycle_number)
-        if [parameter.name for parameter in cycle_parameters] != [
-            parameter.name for parameter in next_parameters
-        ]:
+        if not circuits_equivalent(next_circuit, cycle_circuit):
             return BatchFitReport(
                 fits=completed,
                 failed_cycle=cycle_number,
                 error="The spectrum uses a different fitting model",
+                skipped_cycles=cycle_numbers[index + 1 :],
             )
         fit_parameters = _batch_parameters_with_initials(
             cycle_parameters,
             next_parameters,
+            next_circuit,
+            cycle_circuit,
         )
         try:
             fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
@@ -1233,6 +1262,7 @@ def batch_fit_from_cycle(
                 fits=completed,
                 failed_cycle=cycle_number,
                 error=f"{type(error).__name__}: {error}",
+                skipped_cycles=cycle_numbers[index + 1 :],
             )
         fitted_parameters = [
             ParameterValue(
@@ -1260,6 +1290,13 @@ def batch_fit_from_cycle(
             )
         )
         next_parameters = fitted_parameters
+        next_circuit = cycle_circuit
+        if stop_event is not None and stop_event.is_set():
+            return BatchFitReport(
+                fits=completed,
+                stopped=True,
+                skipped_cycles=cycle_numbers[index + 1 :],
+            )
     return BatchFitReport(fits=completed)
 
 
@@ -1268,6 +1305,8 @@ def batch_fit_spectra(
     initial_parameters: list[ParameterValue],
     *,
     use_target_initial_parameters: bool = False,
+    stop_event=None,
+    initial_circuit: str | None = None,
 ) -> SpectrumBatchReport:
     if not targets:
         return SpectrumBatchReport([])
@@ -1278,15 +1317,21 @@ def batch_fit_spectra(
         if first_cycle is not None
         else first_project.circuit
     )
-    expected_names = [parameter.name for parameter in initial_parameters]
     next_parameters = [
         ParameterValue(
             p.name, p.unit, p.initial, p.lower, p.upper, p.error_percent, p.fixed
         )
         for p in initial_parameters
     ]
+    next_circuit = initial_circuit or expected_circuit
     completed: list[SpectrumBatchFit] = []
-    for target in targets:
+    for index, target in enumerate(targets):
+        if stop_event is not None and stop_event.is_set():
+            return SpectrumBatchReport(
+                completed,
+                stopped=True,
+                skipped_labels=[item.label for item in targets[index:]],
+            )
         project = target.loaded.state
         cycle = project.cycles.get(target.cycle)
         if cycle is None:
@@ -1300,22 +1345,33 @@ def batch_fit_spectra(
             fit_circuit = target_circuit
             fit_parameters = target_parameters
         else:
-            if target_circuit != expected_circuit:
+            if not circuits_equivalent(next_circuit, target_circuit):
                 return SpectrumBatchReport(
                     completed,
                     target.label,
                     "The spectrum uses a different fitting model",
+                    skipped_labels=[item.label for item in targets[index + 1 :]],
                 )
-            if [parameter.name for parameter in target_parameters] != expected_names:
+            element_mapping = parameter_name_mapping(
+                next_circuit, target_circuit
+            )
+            mapped_names = {
+                map_parameter_name(parameter.name, element_mapping)
+                for parameter in initial_parameters
+            }
+            if mapped_names != {parameter.name for parameter in target_parameters}:
                 return SpectrumBatchReport(
                     completed,
                     target.label,
                     "The spectrum has incompatible fitting parameters",
+                    skipped_labels=[item.label for item in targets[index + 1 :]],
                 )
-            fit_circuit = expected_circuit
+            fit_circuit = target_circuit
             fit_parameters = _batch_parameters_with_initials(
                 target_parameters,
                 next_parameters,
+                next_circuit,
+                target_circuit,
             )
         try:
             fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
@@ -1328,6 +1384,7 @@ def batch_fit_spectra(
                 completed,
                 target.label,
                 f"{type(error).__name__}: {error}",
+                skipped_labels=[item.label for item in targets[index + 1 :]],
             )
         fitted_parameters = [
             ParameterValue(
@@ -1359,4 +1416,11 @@ def batch_fit_spectra(
         )
         if not use_target_initial_parameters:
             next_parameters = fitted_parameters
+            next_circuit = target_circuit
+        if stop_event is not None and stop_event.is_set():
+            return SpectrumBatchReport(
+                completed,
+                stopped=True,
+                skipped_labels=[item.label for item in targets[index + 1 :]],
+            )
     return SpectrumBatchReport(completed)
