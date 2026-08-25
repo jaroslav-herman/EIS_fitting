@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import multiprocessing as mp
 from pathlib import Path
 import re
+import threading
 from typing import Iterable
 import warnings
 
@@ -140,6 +142,32 @@ class SpectrumBatchReport:
     error: str | None = None
     stopped: bool = False
     skipped_labels: list[str] = field(default_factory=list)
+
+
+class FitTimeoutError(TimeoutError):
+    """Raised when an impedance EEC fit exceeds its configured time limit."""
+
+
+_FIT_WORKER_PROCESS = None
+_FIT_WORKER_CONNECTION = None
+_FIT_WORKER_LOCK = threading.Lock()
+
+
+def _fit_cycle_process_entry(connection) -> None:
+    try:
+        while True:
+            task = connection.recv()
+            if task is None:
+                return
+            state, circuit, parameters = task
+            try:
+                connection.send((True, fit_cycle(state, circuit, parameters)))
+            except BaseException as error:
+                connection.send((False, f"{type(error).__name__}: {error}"))
+    except (EOFError, OSError):
+        return
+    finally:
+        connection.close()
 
 
 def _safe_unique_ints(values: Iterable[object]) -> list[int]:
@@ -1090,12 +1118,69 @@ def fit_cycle(
     )
 
 
+def fit_cycle_with_timeout(
+    state: CycleState,
+    circuit: str,
+    parameters: list[ParameterValue],
+    timeout_seconds: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Run one EEC fit in a reusable, terminable process with a hard limit."""
+    global _FIT_WORKER_PROCESS, _FIT_WORKER_CONNECTION
+    timeout_seconds = float(timeout_seconds)
+    if not np.isfinite(timeout_seconds) or timeout_seconds <= 0:
+        raise ValueError("The EEC fit time limit must be a positive finite number")
+
+    with _FIT_WORKER_LOCK:
+        context = mp.get_context("spawn")
+        if (
+            _FIT_WORKER_PROCESS is None
+            or not _FIT_WORKER_PROCESS.is_alive()
+            or _FIT_WORKER_CONNECTION is None
+        ):
+            if _FIT_WORKER_CONNECTION is not None:
+                _FIT_WORKER_CONNECTION.close()
+            receiver, sender = context.Pipe(duplex=True)
+            process = context.Process(target=_fit_cycle_process_entry, args=(sender,))
+            process.daemon = True
+            process.start()
+            sender.close()
+            _FIT_WORKER_PROCESS = process
+            _FIT_WORKER_CONNECTION = receiver
+
+        connection = _FIT_WORKER_CONNECTION
+        process = _FIT_WORKER_PROCESS
+        try:
+            connection.send((state, circuit, parameters))
+            if not connection.poll(timeout_seconds):
+                process.terminate()
+                process.join()
+                connection.close()
+                _FIT_WORKER_PROCESS = None
+                _FIT_WORKER_CONNECTION = None
+                raise FitTimeoutError(
+                    f"The EEC fit exceeded the {timeout_seconds:g} s time limit"
+                )
+            succeeded, payload = connection.recv()
+        except (EOFError, OSError) as error:
+            if process.is_alive():
+                process.terminate()
+                process.join()
+            connection.close()
+            _FIT_WORKER_PROCESS = None
+            _FIT_WORKER_CONNECTION = None
+            raise RuntimeError("The EEC fit worker stopped unexpectedly") from error
+    if not succeeded:
+        raise RuntimeError(str(payload))
+    return payload
+
+
 def refine_fit_cycle(
     state: CycleState,
     circuit: str,
     parameters: list[ParameterValue],
     z_threshold: float,
     max_iterations: int,
+    fit_timeout_seconds: float | None = None,
 ):
     from copy import deepcopy
 
@@ -1160,10 +1245,16 @@ def refine_fit_cycle(
         removed_indices.extend(int(index) for index in original_indices)
         for parameter, value in zip(working_parameters, current_result[0]):
             parameter.initial = float(value)
-        current_result = fit_cycle(
+        fit_function = (
+            fit_cycle_with_timeout
+            if fit_timeout_seconds is not None
+            else fit_cycle
+        )
+        current_result = fit_function(
             working_state,
             circuit,
             working_parameters,
+            **({"timeout_seconds": fit_timeout_seconds} if fit_timeout_seconds is not None else {}),
         )
         iterations += 1
 
@@ -1210,6 +1301,7 @@ def batch_fit_from_cycle(
     initial_parameters: list[ParameterValue],
     stop_event=None,
     initial_circuit: str | None = None,
+    fit_timeout_seconds: float | None = None,
 ) -> BatchFitReport:
     start_index = project.available_cycles.index(start_cycle)
     cycle_numbers = project.available_cycles[start_index:]
@@ -1252,10 +1344,18 @@ def batch_fit_from_cycle(
             cycle_circuit,
         )
         try:
-            fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
-                cycle,
-                cycle_circuit,
-                fit_parameters,
+            fit_function = (
+                fit_cycle_with_timeout
+                if fit_timeout_seconds is not None
+                else fit_cycle
+            )
+            fit_kwargs = (
+                {"timeout_seconds": fit_timeout_seconds}
+                if fit_timeout_seconds is not None
+                else {}
+            )
+            fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_function(
+                cycle, cycle_circuit, fit_parameters, **fit_kwargs
             )
         except Exception as error:
             return BatchFitReport(
@@ -1307,6 +1407,7 @@ def batch_fit_spectra(
     use_target_initial_parameters: bool = False,
     stop_event=None,
     initial_circuit: str | None = None,
+    fit_timeout_seconds: float | None = None,
 ) -> SpectrumBatchReport:
     if not targets:
         return SpectrumBatchReport([])
@@ -1374,10 +1475,18 @@ def batch_fit_spectra(
                 target_circuit,
             )
         try:
-            fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_cycle(
-                cycle,
-                fit_circuit,
-                fit_parameters,
+            fit_function = (
+                fit_cycle_with_timeout
+                if fit_timeout_seconds is not None
+                else fit_cycle
+            )
+            fit_kwargs = (
+                {"timeout_seconds": fit_timeout_seconds}
+                if fit_timeout_seconds is not None
+                else {}
+            )
+            fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_function(
+                cycle, fit_circuit, fit_parameters, **fit_kwargs
             )
         except Exception as error:
             return SpectrumBatchReport(

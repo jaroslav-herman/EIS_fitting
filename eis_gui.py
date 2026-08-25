@@ -44,6 +44,7 @@ from eis_services import (
     AutomaticEECModel,
     BatchFitReport,
     DRTComputation,
+    FitTimeoutError,
     KKResiduals,
     LoadedProject,
     ProjectImportReport,
@@ -63,6 +64,7 @@ from eis_services import (
     analyze_outliers,
     find_outliers_for_all_cycles,
     fit_cycle,
+    fit_cycle_with_timeout,
     inspect_eis_file_spectrum_kinds,
     refine_fit_cycle,
     load_cycle,
@@ -74,6 +76,12 @@ from eis_services import (
 from ml.gui_results import MLResult, load_ml_results, suggested_eec
 from ml.results_schema import spectrum_identifier
 from ml.point_validity import detect_outliers_in_active_points
+from ml.runtime_inference import (
+    discover_pretrained_artifacts,
+    infer_pretrained,
+    make_runtime_spectrum,
+    save_runtime_results,
+)
 from spectrum_simulator import logarithmic_frequencies, simulate_spectrum
 from extract_relaxis import export_to_eisfit_json
 from explorer_filter import (
@@ -626,6 +634,7 @@ class EISApplication:
         self.show_drt_var = tk.BooleanVar(value=False)
         self.show_kk_var = tk.BooleanVar(value=False)
         self.show_spectrum_var = tk.BooleanVar(value=True)
+        self.show_all_points_var = tk.BooleanVar(value=False)
         self.show_eec_fit_var = tk.BooleanVar(value=True)
         self.show_drt_fit_var = tk.BooleanVar(value=False)
         self.show_drt_recovered_var = tk.BooleanVar(value=False)
@@ -878,6 +887,9 @@ class EISApplication:
         return base / "EIS_fitting" / "preferences.json"
 
     def _load_preferences(self) -> tuple[str, ...]:
+        self._fit_timeout_seconds = 10.0
+        self._last_import_directory = Path.cwd()
+        self._last_project_directory = Path.cwd()
         self._fit_explorer_x_preference = "I_mA"
         self._drt_explorer_x_preference = "I_mA"
         self._fit_explorer_y_preference = "R0"
@@ -902,6 +914,18 @@ class EISApplication:
         }
         try:
             payload = json.loads(self._preferences_path.read_text(encoding="utf-8"))
+            saved_timeout = float(payload.get("fit_timeout_seconds", 10.0))
+            if np.isfinite(saved_timeout) and saved_timeout > 0:
+                self._fit_timeout_seconds = saved_timeout
+            for preference_name, attribute_name in (
+                ("last_import_directory", "_last_import_directory"),
+                ("last_project_directory", "_last_project_directory"),
+            ):
+                saved_directory = payload.get(preference_name)
+                if saved_directory:
+                    candidate = Path(str(saved_directory)).expanduser()
+                    if candidate.is_dir():
+                        setattr(self, attribute_name, candidate.resolve())
             self._fit_explorer_x_preference = str(
                 payload.get("fit_explorer_x", "I_mA")
             ).strip() or "I_mA"
@@ -954,6 +978,30 @@ class EISApplication:
             pass
         return MODEL_PRESETS
 
+    def _remember_dialog_directory(self, preference_name: str, selected: str) -> None:
+        directory = Path(selected).resolve().parent
+        setattr(self, f"_{preference_name}", directory)
+        try:
+            payload = json.loads(self._preferences_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            payload = {}
+        payload[preference_name] = str(directory)
+        try:
+            self._preferences_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self._preferences_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            temporary.replace(self._preferences_path)
+        except OSError:
+            # The current session still uses the selected folder even if the
+            # optional cross-session preference cannot be written.
+            pass
+
+    def _dialog_directory(self, preference_name: str) -> Path:
+        directory = getattr(self, f"_{preference_name}", None)
+        if isinstance(directory, Path) and directory.is_dir():
+            return directory
+        return Path.cwd()
+
     def _save_preferences(
         self,
         circuits: tuple[str, ...],
@@ -978,6 +1026,9 @@ class EISApplication:
                     "explorer_new_columns_position": explorer_new_columns_position,
                     "eec_parameter_bounds": self._eec_parameter_bounds,
                     "auto_model": self._auto_model_settings,
+                    "last_import_directory": str(self._last_import_directory),
+                    "last_project_directory": str(self._last_project_directory),
+                    "fit_timeout_seconds": self._fit_timeout_seconds,
                 },
                 indent=2,
             ),
@@ -995,7 +1046,7 @@ class EISApplication:
         popup = tk.Toplevel(self.root)
         self.preferences_popup = popup
         popup.title("Preferences")
-        popup.geometry("560x420")
+        popup.geometry("560x460")
         popup.minsize(440, 320)
         popup.transient(self.root)
         popup.columnconfigure(0, weight=1)
@@ -1195,6 +1246,7 @@ class EISApplication:
             value="" if self._auto_model_settings["min_l0"] is None
             else str(self._auto_model_settings["min_l0"])
         )
+        fit_timeout_var = tk.StringVar(value=f"{self._fit_timeout_seconds:g}")
         ttk.Label(
             auto_tab,
             text="These settings are used for every Auto model selection run.",
@@ -1245,6 +1297,12 @@ class EISApplication:
         )
         ttk.Entry(auto_tab, textvariable=min_l0_var).grid(
             row=8, column=1, sticky="ew", pady=(6, 0)
+        )
+        ttk.Label(auto_tab, text="EEC fit time limit (seconds)").grid(
+            row=9, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(auto_tab, textvariable=fit_timeout_var).grid(
+            row=9, column=1, sticky="ew", pady=(6, 0)
         )
 
         def add_circuit(_event=None) -> None:
@@ -1310,8 +1368,15 @@ class EISApplication:
                     "min_r0": optional_float(min_r0_var, "R0 threshold"),
                     "min_l0": optional_float(min_l0_var, "L0 threshold"),
                 }
+                fit_timeout_seconds = float(fit_timeout_var.get())
+                if (
+                    not np.isfinite(fit_timeout_seconds)
+                    or fit_timeout_seconds <= 0
+                ):
+                    raise ValueError("EEC fit time limit must be positive")
                 self._auto_model_settings = auto_settings
                 self._eec_parameter_bounds = parameter_bounds
+                self._fit_timeout_seconds = fit_timeout_seconds
                 self._save_preferences(
                     circuits,
                     fit_x_var.get().strip() or "I_mA",
@@ -1418,6 +1483,12 @@ class EISApplication:
         self.reset_view_button.pack(side=tk.LEFT, padx=(6, 0))
         ttk.Checkbutton(
             self.plot_controls,
+            text="Show all points",
+            variable=self.show_all_points_var,
+            command=self.toggle_show_all_points,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            self.plot_controls,
             text="Hide legends",
             variable=self.hide_legends_var,
             command=self._update_legend_visibility,
@@ -1474,6 +1545,11 @@ class EISApplication:
             text="Load ML results…",
             command=self.load_ml_results,
         ).pack(side=tk.LEFT)
+        ttk.Button(
+            self.ml_controls,
+            text="ML processing…",
+            command=self.open_ml_processing,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(
             self.ml_controls,
             text="Load ML results file",
@@ -1583,7 +1659,11 @@ class EISApplication:
                     return axes
             return None
 
-        def show_menu(event) -> str:
+        def show_menu(event) -> str | None:
+            if self.point_toggle_mode or self.point_auto_fit:
+                # Let Matplotlib deliver the right-click event to the point
+                # editor instead of opening the graph context menu.
+                return None
             axes = axes_at_event(event)
             if axes is None:
                 return "break"
@@ -2600,6 +2680,7 @@ class EISApplication:
         columns = (
             "fitted",
             "drt",
+            "model",
             "source",
             "cycle",
             "potential",
@@ -2619,6 +2700,7 @@ class EISApplication:
         self._explorer_headings = {
             "fitted": "Fitted",
             "drt": "DRT",
+            "model": "EEC model",
             "source": "Source file",
             "cycle": "Cycle",
             "potential": "Ecell_V",
@@ -2631,6 +2713,7 @@ class EISApplication:
         self._explorer_attributes = {
             "fitted": None,
             "drt": None,
+            "model": None,
             "source": None,
             "cycle": "cycle",
             "potential": "potential_v",
@@ -2647,6 +2730,7 @@ class EISApplication:
         widths = {
             "fitted": 62,
             "drt": 48,
+            "model": 220,
             "source": 190,
             "cycle": 65,
             "potential": 105,
@@ -2679,7 +2763,7 @@ class EISApplication:
         )
         self.explorer.grid(row=0, column=0, sticky="nsew")
         self.explorer.tag_configure(
-            "focus_row",
+            "current_row",
             background="#dff3df",
             font=("Segoe UI", 9, "bold"),
         )
@@ -2783,6 +2867,7 @@ class EISApplication:
         return (
             "fitted",
             "drt",
+            "model",
             "source",
             "cycle",
             "potential",
@@ -2864,6 +2949,7 @@ class EISApplication:
         headings = {
             "fitted": "Fitted",
             "drt": "DRT",
+            "model": "EEC model",
             "source": "Source file",
             "cycle": "Cycle",
             "potential": "Voltage (V)",
@@ -2876,6 +2962,7 @@ class EISApplication:
         widths = {
             "fitted": 62,
             "drt": 48,
+            "model": 220,
             "source": 190,
             "cycle": 65,
             "potential": 105,
@@ -2948,6 +3035,9 @@ class EISApplication:
             if cycle.saved_ridge_tau_s is not None and cycle.saved_ridge_gamma_ohm is not None:
                 return "R"
             return "N"
+        if column == "model":
+            cycle = loaded.state.cycles.get(spectrum.cycle)
+            return cycle.model(loaded.state.circuit) if cycle is not None else loaded.state.circuit
         if column == "source":
             return loaded.state.source_path.name
         if column == "cycle":
@@ -3161,6 +3251,9 @@ class EISApplication:
             if cycle.saved_ridge_tau_s is not None and cycle.saved_ridge_gamma_ohm is not None:
                 return (0, 1)
             return (0, 0)
+        elif column == "model":
+            cycle = loaded.state.cycles.get(spectrum.cycle)
+            value = cycle.model(loaded.state.circuit) if cycle is not None else loaded.state.circuit
         elif column == "source":
             value = loaded.state.source_path.name
         elif column == "cycle":
@@ -4151,9 +4244,25 @@ class EISApplication:
                 )
             start = visible_items.index(anchor)
             end = visible_items.index(item)
-            new_selection = visible_items[min(start, end) : max(start, end) + 1]
+            range_items = visible_items[min(start, end) : max(start, end) + 1]
+            if control_pressed:
+                selected_set = set(selected)
+                if all(candidate in selected_set for candidate in range_items):
+                    new_selection = [
+                        candidate
+                        for candidate in selected
+                        if candidate not in range_items
+                    ]
+                else:
+                    new_selection = list(dict.fromkeys([*selected, *range_items]))
+            else:
+                new_selection = range_items
         elif control_pressed:
-            new_selection = selected if item in selected else [*selected, item]
+            new_selection = (
+                [candidate for candidate in selected if candidate != item]
+                if item in selected
+                else [*selected, item]
+            )
         else:
             new_selection = [item]
 
@@ -4207,6 +4316,8 @@ class EISApplication:
         if not valid_items:
             self._explorer_anchor_item = None
             self._explorer_primary_item = None
+            self._refresh_explorer_focus_tag()
+            self._update_explorer_selection_status()
             return
         if primary not in valid_items:
             primary = valid_items[-1]
@@ -4231,9 +4342,13 @@ class EISApplication:
         for item in self._explorer_rows:
             if self.explorer.exists(item):
                 self.explorer.item(item, tags=())
-        primary = self._explorer_primary_item
-        if primary is not None and self.explorer.exists(primary):
-            self.explorer.item(primary, tags=("focus_row",))
+        current_item = None
+        if self.current_dataset_id is not None and self.state is not None:
+            current_item = self._explorer_lookup.get(
+                (self.current_dataset_id, self.state.active_cycle)
+            )
+        if current_item is not None and self.explorer.exists(current_item):
+            self.explorer.item(current_item, tags=("current_row",))
 
     def _activate_explorer_item(self, item: str) -> None:
         row = self._explorer_rows.get(item)
@@ -5391,12 +5506,18 @@ class EISApplication:
         try:
             result = future.result()
         except Exception as error:
+            if isinstance(error, FitTimeoutError):
+                self._restore_fit_initial_parameters()
+                self.status_var.set(f"Error: {error}")
+                messagebox.showerror("Fit timed out", str(error), parent=self.root)
+            else:
+                self.status_var.set(f"Error: {error}")
+                messagebox.showerror(
+                    error_title, f"{type(error).__name__}: {error}", parent=self.root
+                )
             self._operation_labels = []
             self._set_controls_enabled(self.state is not None)
-            self.status_var.set(f"Error: {error}")
-            messagebox.showerror(
-                error_title, f"{type(error).__name__}: {error}", parent=self.root
-            )
+            self._fit_parameter_snapshot = None
             return
         success(result)
         self._fit_parameter_snapshot = None
@@ -5957,6 +6078,257 @@ class EISApplication:
         else:
             self.ml_results_status_var.set("No ML results found")
 
+    def open_ml_processing(self) -> None:
+        """Open the staged ML application dialog for explorer-selected spectra."""
+        if self.busy or self.state is None:
+            return
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status("select one or more spectra in the explorer first")
+            return
+        existing = getattr(self, "ml_processing_popup", None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            return
+
+        popup = tk.Toplevel(self.root)
+        self.ml_processing_popup = popup
+        popup.title("ML processing")
+        popup.transient(self.root)
+        popup.grab_set()
+        popup.resizable(False, False)
+        frame = ttk.Frame(popup, padding=12)
+        frame.grid(sticky="nsew")
+        ttk.Label(
+            frame,
+            text=f"Selected spectra: {len(selected_rows)}\nChoose the operations to apply in order.",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        options = {
+            "frequency": tk.BooleanVar(value=True),
+            "active_points": tk.BooleanVar(value=True),
+            "model": tk.BooleanVar(value=True),
+            "initial_parameters": tk.BooleanVar(value=True),
+            "fit": tk.BooleanVar(value=True),
+        }
+        labels = (
+            ("frequency", "ML frequency selection"),
+            ("active_points", "ML active points / outliers"),
+            ("model", "ML EEC model selection"),
+            ("initial_parameters", "ML initial parameters"),
+            ("fit", "Run conventional EEC fit automatically"),
+        )
+        for row, (key, label) in enumerate(labels, start=1):
+            ttk.Checkbutton(frame, text=label, variable=options[key]).grid(
+                row=row, column=0, columnspan=2, sticky="w", pady=2
+            )
+        ttk.Label(
+            frame,
+            text="ML predictions are applied to the selected spectra; the final fit is the normal numerical EEC fit.",
+            wraplength=420,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 10))
+
+        def close() -> None:
+            try:
+                popup.grab_release()
+            except tk.TclError:
+                pass
+            self.ml_processing_popup = None
+            popup.destroy()
+
+        def run() -> None:
+            selected = {key for key, _label in labels if options[key].get()}
+            if not selected:
+                messagebox.showerror("ML processing", "Select at least one operation.", parent=popup)
+                return
+            destination = filedialog.asksaveasfilename(
+                parent=popup,
+                title="Save calculated ML results",
+                initialdir=str(self._current_directory()),
+                initialfile=f"{self._current_stem()}_ml_results.json",
+                defaultextension=".json",
+                filetypes=(("ML results JSON", "*_ml_results.json"), ("JSON", "*.json")),
+            )
+            if not destination:
+                return
+            close()
+            self._start_runtime_ml_processing(selected, selected_rows, Path(destination))
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e")
+        ttk.Button(buttons, text="Cancel", command=close).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Run", command=run).pack(side=tk.RIGHT, padx=(0, 8))
+        popup.protocol("WM_DELETE_WINDOW", close)
+
+    def _start_runtime_ml_processing(self, operations: set[str], selected_rows, destination: Path) -> None:
+        """Load the pretrained bundle and infer the selected open spectra."""
+        selected_keys = {(dataset_id, int(spectrum.cycle)) for dataset_id, _loaded, spectrum in selected_rows}
+        artifacts, missing_artifacts = discover_pretrained_artifacts()
+        if artifacts is None:
+            command = (
+                ".\\.venv\\Scripts\\python.exe -m ml.run_stage4a_parameters <six training projects>\n"
+                ".\\.venv\\Scripts\\python.exe -m ml.run_stage4b_parameters <six training projects>\n"
+                "Then regenerate the incompatible HGB artifacts with the current environment."
+            )
+            messagebox.showerror(
+                "ML model bundle unavailable",
+                "The pretrained ML bundle is incomplete:\n\n"
+                + "\n".join(missing_artifacts)
+                + "\n\nRequired training commands:\n"
+                + command,
+                parent=self.root,
+            )
+            return
+        targets = []
+        try:
+            for dataset_id in self._dataset_order:
+                loaded = self.loaded_projects[dataset_id]
+                for spectrum in loaded.spectra:
+                    cycle_number = int(spectrum.cycle)
+                    cycle = self._loaded_cycle_for_popup(loaded, cycle_number)
+                    key = (dataset_id, cycle_number)
+                    runtime = make_runtime_spectrum(
+                        f"{dataset_id}::{loaded.state.control}::{cycle_number}",
+                        cycle,
+                        cycle.model(loaded.state.circuit),
+                    )
+                    if key in selected_keys:
+                        targets.append(runtime)
+        except (TypeError, ValueError) as error:
+            messagebox.showerror("ML processing", str(error), parent=self.root)
+            return
+        if not targets:
+            self._update_status("no valid selected spectra available for ML processing")
+            return
+        self.status_var.set(f"Calculating ML predictions for {len(targets)} selected spectra…")
+
+        def work():
+            predictions = infer_pretrained(artifacts, targets, operations=operations)
+            save_runtime_results(destination, predictions, training_count=6, operations=operations)
+            return destination, predictions
+
+        self._submit(
+            work,
+            lambda result: self._finish_runtime_ml_processing(result, operations, selected_rows),
+            "ML processing failed",
+            operation_labels=[f"{loaded.dataset_label}, cycle {spectrum.cycle}" for _id, loaded, spectrum in selected_rows],
+            operation_name="ML inference",
+        )
+
+    def _finish_runtime_ml_processing(self, result, operations: set[str], selected_rows) -> None:
+        destination, _predictions = result
+        self.ml_results = load_ml_results(destination)
+        self.ml_results_directory = Path(destination).resolve()
+        self.ml_results_status_var.set(f"Calculated and saved {len(self.ml_results)} ML results")
+        self._run_ml_processing(operations, selected_rows)
+
+    def _run_ml_processing(self, operations: set[str], selected_rows=None) -> None:
+        """Apply loaded ML predictions, then optionally start the normal EEC fit."""
+        if self.busy or self.state is None:
+            return
+        selected_rows = selected_rows or self._selected_spectrum_rows()
+        if bool(operations & {"frequency", "active_points", "model", "initial_parameters"}) and any(
+            self._loaded_cycle_for_popup(loaded, spectrum.cycle).fit_parameters is not None
+            for _dataset_id, loaded, spectrum in selected_rows
+        ) and not messagebox.askyesno(
+            "Replace existing fits?",
+            "The selected ML operations will clear existing fits before recalculation. Continue?",
+            parent=self.root,
+        ):
+            return
+        assignments = []
+        missing: list[str] = []
+        for dataset_id, loaded, spectrum in selected_rows:
+            result = self._ml_result_for_spectrum(dataset_id, loaded, spectrum)
+            label = f"{loaded.dataset_label}, cycle {spectrum.cycle}"
+            if result is None:
+                missing.append(label)
+                continue
+            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+            if "frequency" in operations:
+                if not result.frequency_ranges:
+                    missing.append(f"{label} (frequency range unavailable)")
+                    continue
+                self._preserve_ml_original_selection(cycle)
+                cycle.frequency_window = tuple(result.frequency_ranges[0])
+                cycle.invalidate_drt_cache()
+                cycle.clear_fit()
+            if "active_points" in operations:
+                if result.active_mask is None or result.active_mask.size != cycle.frequency_hz.size:
+                    missing.append(f"{label} (active-point mask unavailable or misaligned)")
+                    continue
+                self._preserve_ml_original_selection(cycle)
+                cycle.manually_included = result.active_mask.copy()
+                if result.outlier_mask is not None and result.outlier_mask.size == cycle.frequency_hz.size:
+                    cycle.outliers = result.outlier_mask.copy()
+                else:
+                    cycle.outliers = ~cycle.manually_included
+                cycle.invalidate_drt_cache()
+                cycle.clear_fit()
+            if "model" in operations or "initial_parameters" in operations:
+                circuit = suggested_eec(result)
+                if not circuit:
+                    missing.append(f"{label} (EEC model unavailable)")
+                    continue
+                try:
+                    parameters = circuit_parameters(circuit, self._eec_parameter_bounds)
+                except Exception:
+                    missing.append(f"{label} (invalid EEC model)")
+                    continue
+                if "model" in operations:
+                    self._configure_cycle_model(cycle, circuit, parameters, loaded.state.circuit)
+                if "initial_parameters" in operations:
+                    by_name = {parameter.name: parameter for parameter in cycle.parameters}
+                    current_model = cycle.model(loaded.state.circuit)
+                    mapping = parameter_name_mapping(circuit, current_model) if circuits_equivalent(circuit, current_model) else {}
+                    for name, value in result.model_parameters.items():
+                        target_name = map_parameter_name(name, mapping) or name
+                        parameter = by_name.get(target_name)
+                        if parameter is not None:
+                            limits = result.parameter_limits.get(name)
+                            if limits is not None:
+                                parameter.lower, parameter.upper = limits
+                            parameter.initial = self._clamp_parameter_value(value, parameter.lower, parameter.upper)
+                    cycle.clear_fit()
+            assignments.append((dataset_id, loaded, spectrum, cycle))
+
+        if assignments and assignments[0][1] is self.loaded and assignments[0][3].cycle == self.state.active_cycle:
+            self.model_var.set(self.state.active.model(self.state.circuit))
+            self.parameter_table.set_parameters(self.state.parameters_for(self.state.active_cycle))
+        self._refresh_explorer_values()
+        self._refresh_plot(rescale=True)
+        if "fit" not in operations:
+            self._update_status(f"ML processing applied to {len(assignments)} spectra; unavailable: {len(missing)}")
+            return
+        targets = [
+            SpectrumFitTarget(loaded=loaded, cycle=spectrum.cycle, label=f"{loaded.dataset_label}, cycle {spectrum.cycle}")
+            for _dataset_id, loaded, spectrum, _cycle in assignments
+        ]
+        if not targets:
+            self._update_status(f"ML processing unavailable for {len(missing)} selected spectra")
+            return
+        self.status_var.set(f"ML processing and fitting {len(targets)} selected spectra…")
+        initial_parameters = assignments[0][3].parameters
+        self._submit(
+            lambda: batch_fit_spectra(
+                targets,
+                initial_parameters,
+                use_target_initial_parameters=True,
+                stop_event=self._stop_event,
+                fit_timeout_seconds=self._fit_timeout_seconds,
+            ),
+            lambda report: self._finish_ml_processing(report, len(missing)),
+            "ML EEC fit failed",
+            operation_labels=[target.label for target in targets],
+            operation_name="ML processing and fit",
+        )
+
+    def _finish_ml_processing(self, report: SpectrumBatchReport, unavailable: int) -> None:
+        self._finish_explorer_batch_fit(report)
+        self._update_status(
+            f"ML processing and fit completed for {len(report.fits)} spectra; unavailable: {unavailable}"
+        )
+
     def load_ml_results_file(self) -> None:
         path = filedialog.askopenfilename(
             parent=self.root,
@@ -6059,7 +6431,7 @@ class EISApplication:
         if not isinstance(stored, dict):
             return None
         return MLResult(
-            spectrum_id=exact_id,
+            spectrum_id=spectrum_key or f"{source_path}::{control}::{cycle}",
             source_name=str(loaded.state.source_path),
             cycle=cycle,
             control=control,
@@ -6752,9 +7124,12 @@ class EISApplication:
         self.canvas.draw_idle()
 
     def _autoscale_to_included(self, cycle) -> None:
-        included = cycle.included
-        if not np.any(included):
+        if self.show_all_points_var.get():
             included = np.ones(cycle.frequency_hz.size, dtype=bool)
+        else:
+            included = cycle.included
+            if not np.any(included):
+                included = np.ones(cycle.frequency_hz.size, dtype=bool)
         if self.plot_mode == "bode":
             frequency = cycle.frequency_hz[included]
             magnitude = np.abs(cycle.impedance[included])
@@ -7791,7 +8166,19 @@ class EISApplication:
         if self.state is None:
             return
         self._refresh_plot(rescale=True)
-        self._update_status("zoom reset to active points")
+        self._update_status(
+            "zoom reset to all measured points"
+            if self.show_all_points_var.get()
+            else "zoom reset to active points"
+        )
+
+    def toggle_show_all_points(self) -> None:
+        self._refresh_plot(rescale=True)
+        self._update_status(
+            "zooming to all measured points"
+            if self.show_all_points_var.get()
+            else "zooming to active points"
+        )
 
     def toggle_plot_mode(self) -> None:
         self.plot_mode = "bode" if self.plot_mode == "nyquist" else "nyquist"
@@ -8263,7 +8650,7 @@ class EISApplication:
         if (
             self.busy
             or self.state is None
-            or event.button != 1
+            or event.button not in (1, 3)
             or event.inaxes not in {self.axes, getattr(self, "phase_axes", None)}
             or not self.point_toggle_mode
         ):
@@ -8788,79 +9175,14 @@ class EISApplication:
     def apply_ml_eec_to_selected(self) -> None:
         if self.busy or self.state is None:
             return
-        if self.analysis_mode_var.get() != "EEC":
-            self.analysis_mode_var.set("EEC")
-            self._on_analysis_mode_selected()
         selected_rows = self._selected_spectrum_rows()
         if not selected_rows:
             self._update_status("select one or more spectra in the explorer first")
             return
-        assignments = []
-        missing = []
-        invalid = []
-        for dataset_id, loaded, spectrum in selected_rows:
-            result = self._ml_result_for_spectrum(dataset_id, loaded, spectrum)
-            if result is None:
-                missing.append(f"{dataset_id}:{spectrum.cycle}")
-                continue
-            circuit = suggested_eec(result)
-            if circuit is None:
-                invalid.append(f"{dataset_id}:{spectrum.cycle}")
-                continue
-            try:
-                parameters = circuit_parameters(circuit, self._eec_parameter_bounds)
-            except Exception:
-                invalid.append(f"{dataset_id}:{spectrum.cycle}")
-                continue
-            cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
-            assignments.append((cycle, circuit, parameters, result))
-        if not assignments:
-            messagebox.showerror(
-                "ML EEC model",
-                "No ML EEC topology is available for the selected spectra.",
-                parent=self.root,
-            )
-            return
-        if any(cycle.fit_parameters is not None or cycle.circuit for cycle, *_ in assignments):
-            if not messagebox.askyesno(
-                "Replace EEC model?",
-                "Applying ML models will replace the selected EEC models and clear their existing fits. Continue?",
-                parent=self.root,
-            ):
-                return
-        for cycle, circuit, parameters, _result in assignments:
-            self._configure_cycle_model(cycle, circuit, parameters, loaded.state.circuit)
-        active_result = next(
-            (result for cycle, _circuit, _parameters, result in assignments
-             if cycle is self.state.active),
-            None,
-        )
-        if active_result is not None:
-            self.model_var.set(self.state.active.model(self.state.circuit))
-            self.parameter_table.set_parameters(
-                self.state.parameters_for(self.state.active_cycle)
-            )
-        self._refresh_explorer_values()
-        self._refresh_plot(rescale=True)
-        details = []
-        for _cycle, circuit, _parameters, result in assignments:
-            confidence = (
-                f", confidence {result.confidence:.2f}"
-                if result.confidence is not None
-                else ""
-            )
-            details.append(f"{result.cycle}: {circuit}{confidence}")
-        message = "EEC model suggested by ML: " + ", ".join(details)
-        if missing:
-            message += f"; no prediction for {len(missing)} spectrum(s)"
-        if invalid:
-            message += f"; invalid prediction for {len(invalid)} spectrum(s)"
-        if self._stop_event.is_set():
-            message = (
-                f"Automatic model selection stopped: processed {updated}, "
-                f"skipped {max(len(self._operation_labels) - updated, 0)} spectra"
-            )
-        self._update_status(message)
+        if self.analysis_mode_var.get() != "EEC":
+            self.analysis_mode_var.set("EEC")
+            self._on_analysis_mode_selected()
+        self._run_ml_processing({"model"}, selected_rows)
 
     def auto_select_model(self) -> None:
         if self.state is None or self.busy:
@@ -9809,12 +10131,31 @@ class EISApplication:
         cycle_number = self.state.active_cycle
         cycle = self.state.active
         parameters = self.state.parameters_for(cycle_number)
+        self._fit_parameter_snapshot = (
+            parameters,
+            [parameter.initial for parameter in parameters],
+        )
         self.status_var.set(f"Cycle {cycle_number} · fitting…")
         self._submit(
-            lambda: fit_cycle(cycle, cycle.model(self.state.circuit), parameters),
+            lambda: fit_cycle_with_timeout(
+                cycle,
+                cycle.model(self.state.circuit),
+                parameters,
+                self._fit_timeout_seconds,
+            ),
             lambda result: self._finish_fit(cycle_number, parameters, result),
             "Fit failed",
         )
+
+    def _restore_fit_initial_parameters(self) -> None:
+        snapshot = self._fit_parameter_snapshot
+        if snapshot is None:
+            return
+        parameters, initial_values = snapshot
+        for parameter, initial in zip(parameters, initial_values):
+            parameter.initial = initial
+        if self.state is not None and self.state.active.parameters is parameters:
+            self.parameter_table.set_parameters(parameters)
 
     def _finish_fit(self, cycle_number, parameters, result) -> None:
         if self.state is None:
@@ -9866,6 +10207,7 @@ class EISApplication:
                 parameters,
                 use_target_initial_parameters=True,
                 stop_event=self._stop_event,
+                fit_timeout_seconds=self._fit_timeout_seconds,
             ),
             self._finish_explorer_batch_fit,
             "Selected fit failed",
@@ -9939,7 +10281,12 @@ class EISApplication:
                         dataset_id,
                         cycle_number,
                         refine_fit_cycle(
-                            cycle, circuit, parameters, z_threshold, max_iterations
+                            cycle,
+                            circuit,
+                            parameters,
+                            z_threshold,
+                            max_iterations,
+                            self._fit_timeout_seconds,
                         ),
                     )
                 )
@@ -10032,6 +10379,7 @@ class EISApplication:
                 parameters,
                 self._stop_event,
                 self.state.circuit,
+                fit_timeout_seconds=self._fit_timeout_seconds,
             ),
             self._finish_batch_fit,
             "Batch fit failed",
@@ -10158,6 +10506,7 @@ class EISApplication:
                 parameters,
                 stop_event=self._stop_event,
                 initial_circuit=self.state.active.model(self.state.circuit),
+                fit_timeout_seconds=self._fit_timeout_seconds,
             ),
             self._finish_explorer_batch_fit,
             "Explorer batch fit failed",
@@ -10337,6 +10686,7 @@ class EISApplication:
                 parameters,
                 stop_event=self._stop_event,
                 initial_circuit=self.state.active.model(self.state.circuit),
+                fit_timeout_seconds=self._fit_timeout_seconds,
             ),
             self._finish_explorer_batch_fit,
             "Selected batch fit failed",
@@ -12097,11 +12447,24 @@ class EISApplication:
         self._update_status(f"metadata column '{column_name}' added")
 
     def reset_points(self) -> None:
-        if self.state is None and self.analysis_mode_var.get() != "Spectra Simulator":
+        if self.busy:
             return
-        self.state.active.reset_selection()
+        selected_rows = self._selected_spectrum_rows()
+        if selected_rows:
+            reset_cycles = {
+                (dataset_id, spectrum.cycle): (loaded, spectrum.cycle)
+                for dataset_id, loaded, spectrum in selected_rows
+            }
+            for loaded, cycle_number in reset_cycles.values():
+                self._loaded_cycle_for_popup(loaded, cycle_number).reset_selection()
+            status = f"selection reset for {len(reset_cycles)} selected spectra"
+        else:
+            if self.state is None:
+                return
+            self.state.active.reset_selection()
+            status = "selection reset"
         self._refresh_plot(rescale=True)
-        self._update_status("selection reset")
+        self._update_status(status)
 
     def remove_deterministic_outliers(self) -> None:
         if self.busy or self.state is None or self.loaded is None:
@@ -12866,7 +13229,7 @@ class EISApplication:
         selected = filedialog.askopenfilenames(
             parent=self.root,
             title="Add BioLogic impedance data",
-            initialdir=str(self._current_directory()),
+            initialdir=str(self._dialog_directory("last_import_directory")),
             filetypes=[
                 ("BioLogic MPT", "*.mpt"),
                 ("BioLogic MPR", "*.mpr"),
@@ -12875,6 +13238,7 @@ class EISApplication:
         )
         if not selected:
             return
+        self._remember_dialog_directory("last_import_directory", selected[0])
         selected_paths = list(
             dict.fromkeys(Path(value).resolve() for value in selected)
         )
@@ -13301,11 +13665,12 @@ class EISApplication:
         selected = filedialog.askopenfilename(
             parent=self.root,
             title="Load EIS fitting project",
-            initialdir=str(self._current_directory()),
+            initialdir=str(self._dialog_directory("last_project_directory")),
             filetypes=[("EIS fitting project", "*.eisfit.json"), ("JSON", "*.json")],
         )
         if not selected:
             return
+        self._remember_dialog_directory("last_project_directory", selected)
         project_path = Path(selected)
         self.status_var.set(f"Loading project {project_path.name}…")
         self._submit(
