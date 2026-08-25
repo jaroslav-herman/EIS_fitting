@@ -1,20 +1,72 @@
-## EIS_fitting
+## EIS Fitting
 
-Responsive Nyquist editor for BioLogic `.mpt` (PEIS) files:
+EIS Fitting is a desktop application for exploring, cleaning, and fitting
+electrochemical impedance spectroscopy (EIS) data exported by BioLogic as
+`.mpt` (PEIS) files. It combines an interactive Nyquist plot with circuit
+parameter editing, cycle-aware analysis, DRT-assisted outlier detection, and
+batch fitting, so spectra can be reviewed and fitted without leaving the GUI.
 
-- Displays the spectrum beside an editable circuit-parameter table
-- Displays read-only percentage fit errors with shaded quality cells instead of units
-- Keeps point selections, parameter values, and fit curves for every visited cycle
-- Runs fitting and manual outlier detection without blocking the GUI
-- Lets you click points to include or exclude them
+The application:
+
+- Supports multiple files and multiple measurement cycles
+- Displays spectra beside an editable equivalent-circuit parameter table
+- Lets you include or exclude individual points while preserving cycle state
+- Runs fitting and outlier detection in the background so the GUI stays responsive
+- Uses `bayes-drt2` ridge analysis to identify outliers and initialize circuit fits
 - Compares measured and fitted points at identical frequencies with residual connectors
 - Provides a sortable spectra explorer for cycle and acquisition metadata
+- Exports fitted parameters and spectrum metadata to CSV and a ready-to-run Python script
 
-### Run
+## Installation
 
-Double-click `run_gui.ps1`, or run this from `EIS_fitting/`:
+### Requirements
 
-`python main.py PEIS_at_N2_flow_80_sccm_automated_01_PEIS.mpt --cycle 1 --threshold 1.0 --circuit "R0-L0-p(R1,CPE1)"`
+- Windows, macOS, or Linux with a desktop environment
+- Python 3.14 or newer
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/), the environment and dependency manager used by this project
+
+### Install from GitHub
+
+In PowerShell, Terminal, or a shell:
+
+```text
+git clone https://github.com/jaroslav-herman/EIS_fitting.git
+cd EIS_fitting
+uv sync
+```
+
+`uv sync` creates the project environment and installs the versions recorded
+in `uv.lock`, including the required EIS and DRT libraries. Re-run it after
+pulling changes to update the environment.
+
+### Start the application
+
+From the repository directory, run:
+
+```text
+uv run python main.py
+```
+
+To open a BioLogic file immediately and select a cycle:
+
+```text
+uv run python main.py PEIS_at_N2_flow_80_sccm_automated_01_PEIS.mpt --cycle 1
+```
+
+On Windows, `run_gui.cmd` can also be double-clicked. It checks that `uv` is
+available and starts the application from the repository directory.
+
+If `uv` is not available, install it using the official instructions linked
+above, then open a new terminal and repeat `uv sync`.
+
+## Run
+
+The command-line entry point also accepts options for the initial control
+channel, outlier threshold, and equivalent-circuit model:
+
+```text
+uv run python main.py PEIS_at_N2_flow_80_sccm_automated_01_PEIS.mpt --cycle 1 --threshold 1.0 --circuit "R0-L0-p(R1,CPE1)"
+```
 
 ### GUI controls
 
