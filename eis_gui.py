@@ -81,6 +81,7 @@ from explorer_filter import (
     field_is_numeric,
     field_operators,
 )
+from plot_export import extract_displayed_series, write_displayed_csv
 from circuit_structure import circuits_equivalent, map_parameter_name, parameter_name_mapping
 
 MODEL_PRESETS = (
@@ -1521,6 +1522,7 @@ class EISApplication:
         self.canvas.mpl_connect("button_release_event", self._on_plot_button_release)
         self.canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
         self.canvas.mpl_connect("scroll_event", self._on_plot_scroll)
+        self._attach_plot_export_menu(self.canvas, self.plot_frame)
         self._configure_plot_layout()
 
     def _create_toolbar(
@@ -1548,6 +1550,73 @@ class EISApplication:
             pack_toolbar=False,
             home_callback=home_callback,
         )
+
+    def _attach_plot_export_menu(self, canvas, owner: tk.Misc | None = None) -> None:
+        """Add the common displayed-data export menu to a Matplotlib canvas."""
+        if getattr(canvas, "_eis_plot_export_bound", False):
+            return
+        canvas._eis_plot_export_bound = True
+        menu_owner = owner or self.root
+        widget = canvas.get_tk_widget()
+
+        def axes_at_event(event):
+            figure_width, figure_height = canvas.figure.canvas.get_width_height()
+            widget_width = max(widget.winfo_width(), 1)
+            widget_height = max(widget.winfo_height(), 1)
+            display_x = event.x * figure_width / widget_width
+            display_y = (widget_height - event.y) * figure_height / widget_height
+            for axes in reversed(canvas.figure.axes):
+                if axes.get_visible() and axes.bbox.contains(display_x, display_y):
+                    return axes
+            return None
+
+        def show_menu(event) -> str:
+            axes = axes_at_event(event)
+            if axes is None:
+                return "break"
+            menu = tk.Menu(menu_owner, tearoff=False)
+            menu.add_command(
+                label="Export data",
+                command=lambda: self._export_displayed_plot_data(axes, menu_owner),
+            )
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return "break"
+
+        widget.bind("<Button-3>", show_menu, add="+")
+
+    def _export_displayed_plot_data(self, axes, owner: tk.Misc | None = None) -> None:
+        series = extract_displayed_series(axes)
+        if not series:
+            messagebox.showinfo(
+                "Export data",
+                "There are no displayed data series to export.",
+                parent=owner or self.root,
+            )
+            return
+        title = axes.get_title().strip() or "plot"
+        title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("_") or "plot"
+        path = filedialog.asksaveasfilename(
+            parent=owner or self.root,
+            title="Export displayed plot data",
+            initialfile=f"{title}_data.csv",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            rows = write_displayed_csv(axes, path)
+        except OSError as error:
+            messagebox.showerror(
+                "Export data",
+                f"Could not write the export file:\n{error}",
+                parent=owner or self.root,
+            )
+            return
+        self._update_status(f"exported {rows} displayed plot points to {Path(path).name}")
 
     @staticmethod
     def _phase_degrees(values: np.ndarray) -> np.ndarray:
@@ -10821,6 +10890,7 @@ class EISApplication:
         figure = Figure(figsize=(8.5, 5.8), dpi=100, constrained_layout=True)
         axes = figure.add_subplot(111)
         canvas = FigureCanvasTkAgg(figure, master=chart_frame)
+        self._attach_plot_export_menu(canvas, popup)
         canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         toolbar = NavigationToolbar2Tk(canvas, chart_frame, pack_toolbar=False)
         toolbar.update()
@@ -11345,6 +11415,7 @@ class EISApplication:
         figure = Figure(figsize=(8.5, 5.8), dpi=100, constrained_layout=True)
         axes = figure.add_subplot(111)
         canvas = FigureCanvasTkAgg(figure, master=chart_frame)
+        self._attach_plot_export_menu(canvas, popup)
         canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         toolbar = NavigationToolbar2Tk(canvas, chart_frame, pack_toolbar=False)
         toolbar.update()
@@ -12218,6 +12289,7 @@ class EISApplication:
 
         figure = Figure(figsize=(8.2, 6.2), dpi=100, constrained_layout=True)
         canvas = FigureCanvasTkAgg(figure, master=popup)
+        self._attach_plot_export_menu(canvas, popup)
         popup_axes: dict[str, object | None] = {"main": None, "phase": None}
 
         def _render_popup() -> None:
@@ -12405,6 +12477,7 @@ class EISApplication:
 
         figure = Figure(figsize=(8.2, 6.2), dpi=100, constrained_layout=True)
         canvas = FigureCanvasTkAgg(figure, master=popup)
+        self._attach_plot_export_menu(canvas, popup)
         popup_axes: dict[str, object | None] = {"main": None}
 
         def _drt_limits(selected_mode: str):
