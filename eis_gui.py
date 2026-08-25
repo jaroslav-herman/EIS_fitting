@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 import copy
+from io import BytesIO
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
@@ -91,6 +93,16 @@ MODEL_PRESETS = (
     "R0-p(R1,C1)",
     "R0-p(R1,CPE1)-W1",
 )
+
+
+def _configure_matplotlib_without_tex() -> None:
+    """Keep plotting self-contained and independent of a TeX installation."""
+    import matplotlib
+
+    # A user matplotlibrc may enable the external LaTeX renderer globally.
+    # The GUI uses ordinary Matplotlib text, including Unicode unit labels,
+    # and must not spawn latex when drawing or exporting a plot.
+    matplotlib.rcParams["text.usetex"] = False
 
 
 class ParameterTable(ttk.Frame):
@@ -635,6 +647,7 @@ class EISApplication:
 
         self._configure_window()
         self._build_menu()
+        _configure_matplotlib_without_tex()
         self._build_interface()
         self._base_refresh_plot = self._refresh_plot
         self._refresh_plot = self._refresh_plot_with_drt_recovery
@@ -1576,6 +1589,19 @@ class EISApplication:
                 return "break"
             menu = tk.Menu(menu_owner, tearoff=False)
             menu.add_command(
+                label="Save graph",
+                command=lambda: self._save_plot_graph(
+                    canvas.figure, axes, menu_owner
+                ),
+            )
+            menu.add_command(
+                label="Copy to Clipboard",
+                command=lambda: self._copy_plot_to_clipboard(
+                    canvas.figure, menu_owner
+                ),
+            )
+            menu.add_separator()
+            menu.add_command(
                 label="Export data",
                 command=lambda: self._export_displayed_plot_data(axes, menu_owner),
             )
@@ -1586,6 +1612,123 @@ class EISApplication:
             return "break"
 
         widget.bind("<Button-3>", show_menu, add="+")
+
+    def _save_plot_graph(self, figure, axes, owner: tk.Misc | None = None) -> None:
+        title = axes.get_title().strip() or "plot"
+        title = re.sub(r"[^A-Za-z0-9._-]+", "_", title).strip("_") or "plot"
+        path = filedialog.asksaveasfilename(
+            parent=owner or self.root,
+            title="Save graph",
+            initialfile=f"{title}.png",
+            defaultextension=".png",
+            filetypes=[
+                ("PNG image", "*.png"),
+                ("PDF document", "*.pdf"),
+                ("SVG image", "*.svg"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            figure.savefig(path, bbox_inches="tight")
+        except (OSError, ValueError) as error:
+            messagebox.showerror(
+                "Save graph",
+                f"Could not save the graph:\n{error}",
+                parent=owner or self.root,
+            )
+            return
+        self._update_status(f"saved graph to {Path(path).name}")
+
+    def _copy_plot_to_clipboard(
+        self, figure, owner: tk.Misc | None = None
+    ) -> None:
+        """Copy a rendered PNG to the native clipboard on Windows."""
+        if os.name != "nt":
+            messagebox.showinfo(
+                "Copy to Clipboard",
+                "Graph image clipboard copying is currently supported on Windows only.",
+                parent=owner or self.root,
+            )
+            return
+        try:
+            from PIL import Image
+
+            image_buffer = BytesIO()
+            figure.savefig(image_buffer, format="png", dpi=figure.dpi)
+            image_buffer.seek(0)
+            image = Image.open(image_buffer).convert("RGBA")
+            width, height = image.size
+            pixels = image.tobytes("raw", "BGRA")
+            dib = struct.pack(
+                "<IiiHHIIiiII",
+                40,
+                width,
+                -height,
+                1,
+                32,
+                0,
+                len(pixels),
+                0,
+                0,
+                0,
+                0,
+            ) + pixels
+
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
+            handle_type = ctypes.c_void_p
+            kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+            kernel32.GlobalAlloc.restype = handle_type
+            kernel32.GlobalLock.argtypes = [handle_type]
+            kernel32.GlobalLock.restype = handle_type
+            kernel32.GlobalUnlock.argtypes = [handle_type]
+            kernel32.GlobalUnlock.restype = ctypes.c_bool
+            kernel32.GlobalFree.argtypes = [handle_type]
+            kernel32.GlobalFree.restype = handle_type
+            user32.OpenClipboard.argtypes = [handle_type]
+            user32.OpenClipboard.restype = ctypes.c_bool
+            user32.EmptyClipboard.argtypes = []
+            user32.EmptyClipboard.restype = ctypes.c_bool
+            user32.SetClipboardData.argtypes = [ctypes.c_uint, handle_type]
+            user32.SetClipboardData.restype = handle_type
+            user32.CloseClipboard.argtypes = []
+            user32.CloseClipboard.restype = ctypes.c_bool
+            GMEM_MOVEABLE = 0x0002
+            GMEM_ZEROINIT = 0x0040
+            CF_DIB = 8
+            handle = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, len(dib))
+            if not handle:
+                raise OSError("Windows could not allocate clipboard memory")
+            locked = kernel32.GlobalLock(handle)
+            if not locked:
+                kernel32.GlobalFree(handle)
+                raise OSError("Windows could not lock clipboard memory")
+            try:
+                ctypes.memmove(locked, dib, len(dib))
+            finally:
+                kernel32.GlobalUnlock(handle)
+            if not user32.OpenClipboard(self.root.winfo_id()):
+                kernel32.GlobalFree(handle)
+                raise OSError("Windows could not open the clipboard")
+            try:
+                user32.EmptyClipboard()
+                if not user32.SetClipboardData(CF_DIB, handle):
+                    kernel32.GlobalFree(handle)
+                    raise OSError("Windows could not set the clipboard image")
+                handle = None
+            finally:
+                user32.CloseClipboard()
+            self._update_status("copied graph to clipboard")
+        except (ImportError, OSError, ValueError) as error:
+            messagebox.showerror(
+                "Copy to Clipboard",
+                f"Could not copy the graph image:\n{error}",
+                parent=owner or self.root,
+            )
 
     def _export_displayed_plot_data(self, axes, owner: tk.Misc | None = None) -> None:
         series = extract_displayed_series(axes)
