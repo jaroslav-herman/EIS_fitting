@@ -45,6 +45,7 @@ from eis_services import (
     BatchFitReport,
     DRTComputation,
     FitTimeoutError,
+    FitOptions,
     KKResiduals,
     LoadedProject,
     ProjectImportReport,
@@ -630,6 +631,12 @@ class EISApplication:
         self.deterministic_threshold_var = tk.StringVar(value="4")
         self.refine_z_threshold_var = tk.StringVar(value="3.5")
         self.refine_max_iterations_var = tk.StringVar(value="5")
+        self.fit_pipeline_var = tk.StringVar(value=self._fit_pipeline_preference)
+        self.fit_seed_var = tk.StringVar(value=self._fit_seed_preference)
+        self.fit_population_var = tk.StringVar(value=self._fit_population_preference)
+        self.fit_iterations_var = tk.StringVar(value=self._fit_iterations_preference)
+        self.fit_weight_modulus_var = tk.BooleanVar(value=self._fit_weight_modulus_preference)
+        self._last_fit_result = None
         self.model_var = tk.StringVar(value=circuit)
         self.show_drt_var = tk.BooleanVar(value=False)
         self.show_kk_var = tk.BooleanVar(value=False)
@@ -888,6 +895,11 @@ class EISApplication:
 
     def _load_preferences(self) -> tuple[str, ...]:
         self._fit_timeout_seconds = 10.0
+        self._fit_pipeline_preference = "local only"
+        self._fit_seed_preference = ""
+        self._fit_population_preference = "30"
+        self._fit_iterations_preference = "200"
+        self._fit_weight_modulus_preference = False
         self._last_import_directory = Path.cwd()
         self._last_project_directory = Path.cwd()
         self._fit_explorer_x_preference = "I_mA"
@@ -917,6 +929,15 @@ class EISApplication:
             saved_timeout = float(payload.get("fit_timeout_seconds", 10.0))
             if np.isfinite(saved_timeout) and saved_timeout > 0:
                 self._fit_timeout_seconds = saved_timeout
+            optimizer = payload.get("eec_optimizer", {})
+            if isinstance(optimizer, dict):
+                pipeline = str(optimizer.get("pipeline", "local only"))
+                if pipeline in {"local only", "PSO → local", "GA → local", "PSO only", "GA only"}:
+                    self._fit_pipeline_preference = pipeline
+                self._fit_seed_preference = str(optimizer.get("seed", ""))
+                self._fit_population_preference = str(optimizer.get("population", "30"))
+                self._fit_iterations_preference = str(optimizer.get("iterations", "200"))
+                self._fit_weight_modulus_preference = bool(optimizer.get("weight_by_modulus", False))
             for preference_name, attribute_name in (
                 ("last_import_directory", "_last_import_directory"),
                 ("last_project_directory", "_last_project_directory"),
@@ -1029,6 +1050,13 @@ class EISApplication:
                     "last_import_directory": str(self._last_import_directory),
                     "last_project_directory": str(self._last_project_directory),
                     "fit_timeout_seconds": self._fit_timeout_seconds,
+                    "eec_optimizer": {
+                        "pipeline": self.fit_pipeline_var.get(),
+                        "seed": self.fit_seed_var.get(),
+                        "population": self.fit_population_var.get(),
+                        "iterations": self.fit_iterations_var.get(),
+                        "weight_by_modulus": bool(self.fit_weight_modulus_var.get()),
+                    },
                 },
                 indent=2,
             ),
@@ -1046,8 +1074,8 @@ class EISApplication:
         popup = tk.Toplevel(self.root)
         self.preferences_popup = popup
         popup.title("Preferences")
-        popup.geometry("560x460")
-        popup.minsize(440, 320)
+        popup.geometry("620x560")
+        popup.minsize(500, 380)
         popup.transient(self.root)
         popup.columnconfigure(0, weight=1)
         popup.rowconfigure(0, weight=1)
@@ -1055,17 +1083,54 @@ class EISApplication:
         notebook = ttk.Notebook(popup)
         notebook.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         eec_tab = ttk.Frame(notebook, padding=10)
+        optimizer_tab = ttk.Frame(notebook, padding=10)
         explorer_tab = ttk.Frame(notebook, padding=10)
         auto_tab = ttk.Frame(notebook, padding=10)
         notebook.add(eec_tab, text="EEC models")
+        notebook.add(optimizer_tab, text="EEC optimizer")
         notebook.add(explorer_tab, text="Explorers")
         notebook.add(auto_tab, text="Auto model selection")
 
         eec_tab.columnconfigure(0, weight=1)
         eec_tab.rowconfigure(1, weight=1)
+        optimizer_tab.columnconfigure(1, weight=1)
         explorer_tab.columnconfigure(1, weight=1)
         explorer_tab.rowconfigure(5, weight=1)
         auto_tab.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            optimizer_tab,
+            text="These settings control single, selected, and batch EEC fitting.",
+            wraplength=480,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        ttk.Label(optimizer_tab, text="Pipeline").grid(row=1, column=0, sticky="w")
+        ttk.Combobox(
+            optimizer_tab,
+            textvariable=self.fit_pipeline_var,
+            state="readonly",
+            values=("local only", "PSO → local", "GA → local", "PSO only", "GA only"),
+        ).grid(row=1, column=1, sticky="ew")
+        ttk.Label(optimizer_tab, text="Random seed (blank = random)").grid(
+            row=2, column=0, sticky="w", pady=(8, 0)
+        )
+        ttk.Entry(optimizer_tab, textvariable=self.fit_seed_var).grid(
+            row=2, column=1, sticky="ew", pady=(8, 0)
+        )
+        ttk.Label(optimizer_tab, text="Population / iterations").grid(
+            row=3, column=0, sticky="w", pady=(8, 0)
+        )
+        limits = ttk.Frame(optimizer_tab)
+        limits.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        limits.columnconfigure(0, weight=1)
+        limits.columnconfigure(1, weight=1)
+        ttk.Entry(limits, textvariable=self.fit_population_var).grid(row=0, column=0, sticky="ew")
+        ttk.Entry(limits, textvariable=self.fit_iterations_var).grid(row=0, column=1, padx=(8, 0), sticky="ew")
+        ttk.Checkbutton(
+            optimizer_tab, text="Weight residuals by |Z|", variable=self.fit_weight_modulus_var
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(
+            optimizer_tab, text="Show last fit diagnostics", command=self._show_fit_diagnostics
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0))
 
         fit_x_values = {"I_mA", "Ecell_V", "time_s", "cycle"}
         drt_x_values = set(fit_x_values) | {"R0", "L0"}
@@ -1374,6 +1439,7 @@ class EISApplication:
                     or fit_timeout_seconds <= 0
                 ):
                     raise ValueError("EEC fit time limit must be positive")
+                self._fit_options_from_controls()
                 self._auto_model_settings = auto_settings
                 self._eec_parameter_bounds = parameter_bounds
                 self._fit_timeout_seconds = fit_timeout_seconds
@@ -10125,12 +10191,53 @@ class EISApplication:
         else:
             self._update_status(f"hybrid DRT recalculated for {spectra_count} selected spectra")
 
+    def _fit_options_from_controls(self) -> FitOptions:
+        names = {
+            "local only": ("least_squares",),
+            "PSO → local": ("pso", "least_squares"),
+            "GA → local": ("ga", "least_squares"),
+            "PSO only": ("pso",),
+            "GA only": ("ga",),
+        }
+        seed_text = self.fit_seed_var.get().strip()
+        return FitOptions(
+            pipeline=names.get(self.fit_pipeline_var.get(), ("least_squares",)),
+            seed=int(seed_text) if seed_text else None,
+            population_size=int(self.fit_population_var.get()),
+            iterations=int(self.fit_iterations_var.get()),
+            weight_by_modulus=bool(self.fit_weight_modulus_var.get()),
+        ).validated()
+
+    def _show_fit_diagnostics(self) -> None:
+        result = self._last_fit_result
+        if result is None:
+            self._update_status("no fit diagnostics are available yet")
+            return
+        stages = "\n".join(
+            f"{stage['method']}: objective={stage['objective']:.6g}, "
+            f"converged={stage['converged']}"
+            for stage in result.stages
+        ) or "least_squares: completed"
+        messagebox.showinfo(
+            "EEC fit diagnostics",
+            f"Pipeline: {' → '.join(result.options.stages())}\n"
+            f"RMSE: {result.rmse:.6g}\n"
+            f"Objective: {result.objective:.6g}\n"
+            f"Elapsed: {result.elapsed_seconds:.3f} s\n\n{stages}",
+            parent=self.root,
+        )
+
     def fit(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
         cycle_number = self.state.active_cycle
         cycle = self.state.active
         parameters = self.state.parameters_for(cycle_number)
+        try:
+            fit_options = self._fit_options_from_controls()
+        except (TypeError, ValueError) as error:
+            messagebox.showerror("Invalid optimizer settings", str(error), parent=self.root)
+            return
         self._fit_parameter_snapshot = (
             parameters,
             [parameter.initial for parameter in parameters],
@@ -10142,6 +10249,7 @@ class EISApplication:
                 cycle.model(self.state.circuit),
                 parameters,
                 self._fit_timeout_seconds,
+                fit_options,
             ),
             lambda result: self._finish_fit(cycle_number, parameters, result),
             "Fit failed",
@@ -10160,6 +10268,7 @@ class EISApplication:
     def _finish_fit(self, cycle_number, parameters, result) -> None:
         if self.state is None:
             return
+        self._last_fit_result = result
         (
             fitted_parameters,
             errors_percent,
@@ -10172,6 +10281,16 @@ class EISApplication:
         cycle.fit_frequency_hz = fit_frequency
         cycle.fit_impedance = fit_impedance
         cycle.fit_at_data_impedance = fit_at_data
+        if hasattr(result, "options"):
+            cycle.fit_provenance = {
+                "pipeline": list(result.options.stages()),
+                "seed": result.options.seed,
+                "objective": result.objective,
+                "rmse": result.rmse,
+                "converged": result.converged,
+                "elapsed_seconds": result.elapsed_seconds,
+                "stages": result.stages,
+            }
         for parameter, fitted, error_percent in zip(
             parameters, fitted_parameters, errors_percent
         ):
@@ -10200,6 +10319,11 @@ class EISApplication:
             for _dataset_id, loaded, spectrum in selected_rows
         ]
         parameters = self.state.parameters_for(self.state.active_cycle)
+        try:
+            fit_options = self._fit_options_from_controls()
+        except (TypeError, ValueError) as error:
+            messagebox.showerror("Invalid optimizer settings", str(error), parent=self.root)
+            return
         self.status_var.set(f"Fitting {len(targets)} selected spectra…")
         self._submit(
             lambda: batch_fit_spectra(
@@ -10208,6 +10332,7 @@ class EISApplication:
                 use_target_initial_parameters=True,
                 stop_event=self._stop_event,
                 fit_timeout_seconds=self._fit_timeout_seconds,
+                fit_options=fit_options,
             ),
             self._finish_explorer_batch_fit,
             "Selected fit failed",
@@ -10380,6 +10505,7 @@ class EISApplication:
                 self._stop_event,
                 self.state.circuit,
                 fit_timeout_seconds=self._fit_timeout_seconds,
+                fit_options=self._fit_options_from_controls(),
             ),
             self._finish_batch_fit,
             "Batch fit failed",
@@ -10402,6 +10528,7 @@ class EISApplication:
             cycle.fit_frequency_hz = result.fit_frequency_hz
             cycle.fit_impedance = result.fit_impedance
             cycle.fit_at_data_impedance = result.fit_at_data_impedance
+            cycle.fit_provenance = dict(result.fit_provenance)
             self.state.cycles[cycle.cycle] = cycle
         self._restore_controls()
         self._refresh_plot(rescale=True)
@@ -10507,6 +10634,7 @@ class EISApplication:
                 stop_event=self._stop_event,
                 initial_circuit=self.state.active.model(self.state.circuit),
                 fit_timeout_seconds=self._fit_timeout_seconds,
+                fit_options=self._fit_options_from_controls(),
             ),
             self._finish_explorer_batch_fit,
             "Explorer batch fit failed",
@@ -10704,6 +10832,7 @@ class EISApplication:
             cycle.fit_frequency_hz = result.fit.fit_frequency_hz
             cycle.fit_impedance = result.fit.fit_impedance
             cycle.fit_at_data_impedance = result.fit.fit_at_data_impedance
+            cycle.fit_provenance = dict(result.fit.fit_provenance)
             result.loaded.state.cycles[cycle.cycle] = cycle
         self._restore_controls()
         self._refresh_plot(rescale=True)

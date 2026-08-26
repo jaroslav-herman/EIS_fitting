@@ -5,6 +5,7 @@ import multiprocessing as mp
 from pathlib import Path
 import re
 import threading
+import time
 from typing import Iterable
 import warnings
 
@@ -102,6 +103,74 @@ class KKResiduals:
     residual_imag: np.ndarray
 
 
+@dataclass(frozen=True)
+class FitOptions:
+    """Explicit, serializable controls for equivalent-circuit fitting."""
+
+    method: str = "least_squares"
+    pipeline: tuple[str, ...] = ()
+    seed: int | None = None
+    population_size: int = 30
+    iterations: int = 200
+    weight_by_modulus: bool = False
+    use_analytical_jacobian: bool = False
+    runtime_checks: bool = True
+
+    def stages(self) -> tuple[str, ...]:
+        stages = tuple(str(value).strip().casefold() for value in self.pipeline if str(value).strip())
+        if stages:
+            return stages
+        return (str(self.method).strip().casefold() or "least_squares",)
+
+    def validated(self) -> "FitOptions":
+        stages = self.stages()
+        allowed = {"least_squares", "basinhopping", "pso", "ga"}
+        if any(stage not in allowed for stage in stages):
+            raise ValueError("Unknown EEC optimizer; use least_squares, basinhopping, pso, or ga")
+        if self.seed is not None:
+            int(self.seed)
+        if int(self.population_size) < 4 or int(self.iterations) < 1:
+            raise ValueError("Optimizer population and iteration limits must be positive")
+        return self
+
+
+@dataclass
+class FitResult:
+    fitted_parameters: np.ndarray
+    errors_percent: np.ndarray
+    fit_frequency_hz: np.ndarray
+    fit_impedance: np.ndarray
+    fit_at_data_impedance: np.ndarray
+    objective: float
+    rmse: float
+    converged: bool
+    stages: list[dict[str, object]] = field(default_factory=list)
+    options: FitOptions = field(default_factory=FitOptions)
+    elapsed_seconds: float = 0.0
+
+    def __iter__(self):
+        """Backward-compatible unpacking for existing batch/refinement callers."""
+        yield self.fitted_parameters
+        yield self.errors_percent
+        yield self.fit_frequency_hz
+        yield self.fit_impedance
+        yield self.fit_at_data_impedance
+
+
+def _fit_provenance(result: FitResult) -> dict[str, object]:
+    if not isinstance(result, FitResult):
+        return {}
+    return {
+        "pipeline": list(result.options.stages()),
+        "seed": result.options.seed,
+        "objective": result.objective,
+        "rmse": result.rmse,
+        "converged": result.converged,
+        "elapsed_seconds": result.elapsed_seconds,
+        "stages": result.stages,
+    }
+
+
 @dataclass
 class BatchCycleFit:
     cycle: CycleState
@@ -111,6 +180,7 @@ class BatchCycleFit:
     fit_frequency_hz: np.ndarray
     fit_impedance: np.ndarray
     fit_at_data_impedance: np.ndarray
+    fit_provenance: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -159,9 +229,9 @@ def _fit_cycle_process_entry(connection) -> None:
             task = connection.recv()
             if task is None:
                 return
-            state, circuit, parameters = task
+            state, circuit, parameters, options = task
             try:
-                connection.send((True, fit_cycle(state, circuit, parameters)))
+                connection.send((True, fit_cycle(state, circuit, parameters, options)))
             except BaseException as error:
                 connection.send((False, f"{type(error).__name__}: {error}"))
     except (EOFError, OSError):
@@ -1042,51 +1112,196 @@ def fit_cycle(
     state: CycleState,
     circuit: str,
     parameters: list[ParameterValue],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    options: FitOptions | None = None,
+    stop_event=None,
+) -> FitResult:
     from impedance.models.circuits import CustomCircuit
-    from impedance.models.circuits.fitting import circuit_fit
+    from scipy.optimize import least_squares
     from wepy.eis import show_fit
 
+    options = (options or FitOptions()).validated()
     included = state.included
     frequency = state.frequency_hz[included]
     impedance = state.impedance[included]
     if frequency.size < 3:
         raise ValueError("At least three included points are required for fitting")
     frequency, impedance = sort_spectrum(frequency, impedance)
-    circuit_parameters_only = np.array(
+    initial_parameters = np.array(
         [parameter.initial for parameter in parameters],
         dtype=float,
     )
-    absolute_errors = np.zeros(len(parameters), dtype=float)
+    circuit_parameters_only = initial_parameters.copy()
     fixed_constants = {
         parameter.name: float(parameter.initial)
         for parameter in parameters
         if parameter.fixed
     }
     free_parameters = [parameter for parameter in parameters if not parameter.fixed]
+    started = time.perf_counter()
+    free_indices = [index for index, parameter in enumerate(parameters) if not parameter.fixed]
+
+    # Keep the default path identical to the pre-extension impedance.py path.
+    # This preserves curve_fit's optimizer, weighting, and uncertainty semantics.
+    if options.stages() == ("least_squares",):
+        from impedance.models.circuits.fitting import circuit_fit
+
+        fitted = initial_parameters.copy()
+        absolute_errors = np.zeros(len(parameters), dtype=float)
+        if free_parameters:
+            fitted_free, errors_free = circuit_fit(
+                frequency,
+                impedance,
+                circuit,
+                [parameter.initial for parameter in free_parameters],
+                constants=fixed_constants,
+                bounds=(
+                    [parameter.lower for parameter in free_parameters],
+                    [parameter.upper for parameter in free_parameters],
+                ),
+                weight_by_modulus=options.weight_by_modulus,
+            )
+            fitted_free = as_1d_array(fitted_free).astype(float)
+            errors_free = np.abs(as_1d_array(errors_free).astype(float))
+            fitted[free_indices] = fitted_free
+            absolute_errors[free_indices] = errors_free
+        magnitudes = np.abs(fitted)
+        errors_percent = np.zeros(fitted.size, dtype=float)
+        nonfixed = np.array([not parameter.fixed for parameter in parameters], dtype=bool)
+        finite = nonfixed & (magnitudes > np.finfo(float).eps)
+        errors_percent[finite] = absolute_errors[finite] / magnitudes[finite] * 100.0
+        near_zero = nonfixed & ~finite & (absolute_errors > np.finfo(float).eps)
+        errors_percent[near_zero] = np.inf
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Simulating circuit based on initial parameters", category=UserWarning)
+            fit_frequency, fit_impedance = show_fit(frequency, circuit, fitted, points=200)
+        fitted_model = CustomCircuit(circuit, initial_guess=fitted)
+        fitted_model.parameters_ = fitted
+        fit_at_data = as_1d_array(fitted_model.predict(state.frequency_hz))
+        difference = fit_at_data[included] - state.impedance[included]
+        if options.weight_by_modulus:
+            difference = difference / np.maximum(np.abs(state.impedance[included]), np.finfo(float).eps)
+        objective_value = float(np.sum(np.concatenate((difference.real, difference.imag)) ** 2))
+        return FitResult(
+            fitted_parameters=fitted,
+            errors_percent=errors_percent,
+            fit_frequency_hz=as_1d_array(fit_frequency),
+            fit_impedance=as_1d_array(fit_impedance),
+            fit_at_data_impedance=fit_at_data,
+            objective=objective_value,
+            rmse=float(np.sqrt(np.mean(np.concatenate((difference.real, difference.imag)) ** 2))),
+            converged=True,
+            stages=[{"method": "least_squares", "objective": objective_value, "converged": True}],
+            options=options,
+            elapsed_seconds=time.perf_counter() - started,
+        )
+
+    free_initial = initial_parameters[free_indices]
+    lower = np.array([parameter.lower for parameter in free_parameters], dtype=float)
+    upper = np.array([parameter.upper for parameter in free_parameters], dtype=float)
+
+    def predict(values: np.ndarray, frequencies=frequency) -> np.ndarray:
+        full = initial_parameters.copy()
+        full[free_indices] = values
+        model = CustomCircuit(circuit, initial_guess=full)
+        model.parameters_ = full
+        return as_1d_array(model.predict(frequencies)).astype(complex)
+
+    def residual(values: np.ndarray) -> np.ndarray:
+        if stop_event is not None and stop_event.is_set():
+            raise FitTimeoutError("EEC fit cancelled")
+        difference = predict(values) - impedance
+        if options.weight_by_modulus:
+            difference = difference / np.maximum(np.abs(impedance), np.finfo(float).eps)
+        return np.concatenate((difference.real, difference.imag))
+
+    def objective(values: np.ndarray) -> float:
+        values = np.clip(np.asarray(values, dtype=float), lower, upper)
+        return float(np.sum(residual(values) ** 2))
+
+    def from_unit(values: np.ndarray) -> np.ndarray:
+        if not np.all(np.isfinite(lower)) or not np.all(np.isfinite(upper)):
+            raise ValueError("PSO/GA fitting requires finite parameter bounds")
+        return lower + np.clip(np.asarray(values, dtype=float), 0.0, 1.0) * (upper - lower)
+
+    stages = []
+    current = np.clip(free_initial, lower, upper)
     if free_parameters:
-        free_initial = [parameter.initial for parameter in free_parameters]
-        free_bounds = (
-            [parameter.lower for parameter in free_parameters],
-            [parameter.upper for parameter in free_parameters],
-        )
-        fitted_free, errors_free = circuit_fit(
-            frequency,
-            impedance,
-            circuit,
-            free_initial,
-            constants=fixed_constants,
-            bounds=free_bounds,
-        )
-        fitted_free = as_1d_array(fitted_free).astype(float)
-        errors_free = np.abs(as_1d_array(errors_free).astype(float))
-        free_index = 0
-        for index, parameter in enumerate(parameters):
-            if parameter.fixed:
-                continue
-            circuit_parameters_only[index] = fitted_free[free_index]
-            absolute_errors[index] = errors_free[free_index]
-            free_index += 1
+        for stage in options.stages():
+            stage_started = time.perf_counter()
+            if stage == "least_squares":
+                result = least_squares(
+                    residual, current, bounds=(lower, upper),
+                    max_nfev=max(int(options.iterations) * 10, 100),
+                )
+                current = result.x
+                converged = bool(result.success)
+                detail = {"status": int(result.status), "message": str(result.message)}
+            elif stage == "basinhopping":
+                from scipy.optimize import basinhopping
+                result = basinhopping(
+                    objective, current, niter=int(options.iterations),
+                    seed=options.seed,
+                    minimizer_kwargs={"method": "L-BFGS-B", "bounds": list(zip(lower, upper))},
+                )
+                current = np.clip(result.x, lower, upper)
+                converged = bool(result.success)
+                detail = {"message": str(result.message)}
+            elif stage == "pso":
+                try:
+                    import pyswarms as ps
+                except ImportError as error:
+                    raise ImportError("PSO fitting requires the optional 'pyswarms' package") from error
+                rng = np.random.default_rng(options.seed)
+                def swarm_objective(points):
+                    return np.asarray([objective(from_unit(point)) for point in points])
+                optimizer = ps.single.GlobalBestPSO(
+                    n_particles=int(options.population_size), dimensions=len(current),
+                    options={"c1": 0.5, "c2": 0.3, "w": 0.9},
+                    bounds=(np.zeros_like(lower), np.ones_like(upper)),
+                    init_pos=rng.uniform(0.0, 1.0, (int(options.population_size), len(current))),
+                )
+                cost, position = optimizer.optimize(swarm_objective, iters=int(options.iterations), verbose=False)
+                current = from_unit(position)
+                converged = np.isfinite(cost)
+                detail = {"best_cost": float(cost)}
+            elif stage == "ga":
+                try:
+                    import pygad
+                except ImportError as error:
+                    raise ImportError("GA fitting requires the optional 'pygad' package") from error
+                def fitness(_ga, solution, _index):
+                    return -objective(np.asarray(solution, dtype=float))
+                ga = pygad.GA(
+                    num_generations=int(options.iterations),
+                    sol_per_pop=int(options.population_size),
+                    num_parents_mating=max(2, int(options.population_size) // 3),
+                    num_genes=len(current), fitness_func=fitness,
+                    gene_space=[{"low": 0.0, "high": 1.0} for _ in current],
+                    random_seed=options.seed,
+                    suppress_warnings=True,
+                )
+                ga.run()
+                _solution, fitness_value, _ = ga.best_solution()
+                current = from_unit(_solution)
+                converged = np.isfinite(fitness_value)
+                detail = {"best_cost": float(-fitness_value)}
+            stages.append({"method": stage, "objective": objective(current), "converged": converged,
+                           "elapsed_seconds": time.perf_counter() - stage_started, **detail})
+    absolute_errors = np.zeros(len(parameters), dtype=float)
+    if free_parameters:
+        circuit_parameters_only[free_indices] = current
+        # Estimate covariance from the local Jacobian when available.
+        try:
+            from scipy.optimize._numdiff import approx_derivative
+            jacobian = approx_derivative(residual, current, method="2-point", bounds=(lower, upper))
+            covariance = np.linalg.pinv(jacobian.T @ jacobian)
+            # Match scipy curve_fit's default absolute_sigma=False behavior:
+            # covariance is scaled by the residual variance (reduced chi-square).
+            degrees_of_freedom = max(len(residual(current)) - len(free_indices), 1)
+            covariance *= objective(current) / degrees_of_freedom
+            absolute_errors[free_indices] = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+        except Exception:
+            pass
     errors_percent = np.zeros(circuit_parameters_only.size, dtype=float)
     nonfixed = np.array([not parameter.fixed for parameter in parameters], dtype=bool)
     magnitudes = np.abs(circuit_parameters_only)
@@ -1094,6 +1309,9 @@ def fit_cycle(
     errors_percent[finite] = absolute_errors[finite] / magnitudes[finite] * 100.0
     near_zero = nonfixed & ~finite & (absolute_errors > np.finfo(float).eps)
     errors_percent[near_zero] = np.inf
+    if free_parameters and not any(stage.get("method") == "least_squares" for stage in stages):
+        # A global search has no statistically calibrated local covariance.
+        errors_percent[nonfixed] = np.nan
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -1109,12 +1327,20 @@ def fit_cycle(
     fitted_model = CustomCircuit(circuit, initial_guess=circuit_parameters_only)
     fitted_model.parameters_ = circuit_parameters_only
     fit_at_data = fitted_model.predict(state.frequency_hz)
-    return (
-        circuit_parameters_only,
-        errors_percent,
-        as_1d_array(fit_frequency),
-        as_1d_array(fit_impedance),
-        as_1d_array(fit_at_data),
+    final_residual = residual(current) if free_parameters else np.concatenate(((predict(np.array([])) - impedance).real, (predict(np.array([])) - impedance).imag))
+    objective_value = float(np.sum(final_residual ** 2))
+    return FitResult(
+        fitted_parameters=circuit_parameters_only,
+        errors_percent=errors_percent,
+        fit_frequency_hz=as_1d_array(fit_frequency),
+        fit_impedance=as_1d_array(fit_impedance),
+        fit_at_data_impedance=as_1d_array(fit_at_data),
+        objective=objective_value,
+        rmse=float(np.sqrt(np.mean(final_residual ** 2))),
+        converged=not stages or bool(stages[-1]["converged"]),
+        stages=stages,
+        options=options,
+        elapsed_seconds=time.perf_counter() - started,
     )
 
 
@@ -1123,7 +1349,8 @@ def fit_cycle_with_timeout(
     circuit: str,
     parameters: list[ParameterValue],
     timeout_seconds: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    options: FitOptions | None = None,
+) -> FitResult:
     """Run one EEC fit in a reusable, terminable process with a hard limit."""
     global _FIT_WORKER_PROCESS, _FIT_WORKER_CONNECTION
     timeout_seconds = float(timeout_seconds)
@@ -1150,7 +1377,7 @@ def fit_cycle_with_timeout(
         connection = _FIT_WORKER_CONNECTION
         process = _FIT_WORKER_PROCESS
         try:
-            connection.send((state, circuit, parameters))
+            connection.send((state, circuit, parameters, options or FitOptions()))
             if not connection.poll(timeout_seconds):
                 process.terminate()
                 process.join()
@@ -1181,6 +1408,7 @@ def refine_fit_cycle(
     z_threshold: float,
     max_iterations: int,
     fit_timeout_seconds: float | None = None,
+    fit_options: FitOptions | None = None,
 ):
     from copy import deepcopy
 
@@ -1255,6 +1483,7 @@ def refine_fit_cycle(
             circuit,
             working_parameters,
             **({"timeout_seconds": fit_timeout_seconds} if fit_timeout_seconds is not None else {}),
+            **({"options": fit_options} if fit_options is not None else {}),
         )
         iterations += 1
 
@@ -1302,6 +1531,7 @@ def batch_fit_from_cycle(
     stop_event=None,
     initial_circuit: str | None = None,
     fit_timeout_seconds: float | None = None,
+    fit_options: FitOptions | None = None,
 ) -> BatchFitReport:
     start_index = project.available_cycles.index(start_cycle)
     cycle_numbers = project.available_cycles[start_index:]
@@ -1354,9 +1584,12 @@ def batch_fit_from_cycle(
                 if fit_timeout_seconds is not None
                 else {}
             )
-            fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_function(
+            if fit_options is not None:
+                fit_kwargs["options"] = fit_options
+            fit_result = fit_function(
                 cycle, cycle_circuit, fit_parameters, **fit_kwargs
             )
+            fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_result
         except Exception as error:
             return BatchFitReport(
                 fits=completed,
@@ -1387,6 +1620,7 @@ def batch_fit_from_cycle(
                 fit_frequency_hz=fit_frequency,
                 fit_impedance=fit_impedance,
                 fit_at_data_impedance=fit_at_data,
+                fit_provenance=_fit_provenance(fit_result),
             )
         )
         next_parameters = fitted_parameters
@@ -1408,6 +1642,7 @@ def batch_fit_spectra(
     stop_event=None,
     initial_circuit: str | None = None,
     fit_timeout_seconds: float | None = None,
+    fit_options: FitOptions | None = None,
 ) -> SpectrumBatchReport:
     if not targets:
         return SpectrumBatchReport([])
@@ -1485,9 +1720,12 @@ def batch_fit_spectra(
                 if fit_timeout_seconds is not None
                 else {}
             )
-            fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_function(
+            if fit_options is not None:
+                fit_kwargs["options"] = fit_options
+            fit_result = fit_function(
                 cycle, fit_circuit, fit_parameters, **fit_kwargs
             )
+            fitted, errors_percent, fit_frequency, fit_impedance, fit_at_data = fit_result
         except Exception as error:
             return SpectrumBatchReport(
                 completed,
@@ -1519,7 +1757,8 @@ def batch_fit_spectra(
                     fitted_errors_percent=errors_percent,
                     fit_frequency_hz=fit_frequency,
                     fit_impedance=fit_impedance,
-                    fit_at_data_impedance=fit_at_data,
+                fit_at_data_impedance=fit_at_data,
+                fit_provenance=_fit_provenance(fit_result),
                 ),
             )
         )

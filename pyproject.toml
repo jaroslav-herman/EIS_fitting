@@ -1,8 +1,23 @@
 [project]
-name = "eis-fitting"
+name = "eisyfit"
 version = "0.1.0"
 description = "Interactive desktop application for exploring, cleaning, and fitting BioLogic electrochemical impedance spectra."
 readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Jaroslav Herman" },
+]
+keywords = ["electrochemistry", "impedance spectroscopy", "EIS", "BioLogic", "equivalent circuit"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering",
+]
 requires-python = ">=3.14"
 dependencies = [
     "bayes-drt2",
@@ -14,10 +29,45 @@ dependencies = [
     "pandas>=3.0.3",
     "scipy>=1.18.0",
     "pyarrow>=25.0.1",
+    "scikit-learn>=1.5.0",
+    "pygad>=3.6.0",
+    "pyswarms>=1.3",
     "wepy",
 ]
+
+[project.urls]
+Homepage = "https://github.com/jaroslav-herman/EIS_fitting"
+Repository = "https://github.com/jaroslav-herman/EIS_fitting"
+Issues = "https://github.com/jaroslav-herman/EIS_fitting/issues"
+
+[project.scripts]
+eisyfit = "main:main"
+
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+    "circuit_structure",
+    "eis_gui",
+    "eis_model",
+    "eis_project",
+    "eis_services",
+    "explorer_filter",
+    "extract_relaxis",
+    "main",
+    "plot_export",
+    "spectrum_simulator",
+]
+
+[tool.setuptools.packages.find]
+include = ["ml*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.ico", "*.png", "*.svg"]
 
 [tool.uv.sources]
 bayes-drt2 = { git = "https://github.com/jaroslav-herman/bayes-drt2.git" }
 hybrid-drt = { git = "https://github.com/jdhuang-csm/hybrid-drt.git" }
-wepy = { git = "https://github.com/jaroslav-herman/wepy" }
+wepy = { git = "https://github.com/jaroslav-herman/wepy.git" }

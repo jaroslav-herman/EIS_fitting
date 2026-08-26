@@ -205,6 +205,7 @@ def _cycle_to_dict(cycle: CycleState) -> dict[str, object]:
         ),
         "fit_impedance": fit_impedance,
         "fit_at_data_impedance": fit_at_data,
+        "fit_provenance": dict(cycle.fit_provenance),
         "ridge_tau_s": (
             cycle.ridge_tau_s.tolist() if cycle.ridge_tau_s is not None else None
         ),
@@ -407,6 +408,8 @@ def load_project_file(
                     f"Cycle {cycle_number} has invalid fitted data-point values"
                 )
             cycle.fit_at_data_impedance = real + 1j * imaginary
+        saved_provenance = saved.get("fit_provenance", {})
+        cycle.fit_provenance = dict(saved_provenance) if isinstance(saved_provenance, dict) else {}
         cycle.ridge_tau_s = _optional_array(saved.get("ridge_tau_s"))
         cycle.ridge_gamma_ohm = _optional_array(saved.get("ridge_gamma_ohm"))
         if (

@@ -61,6 +61,7 @@ class CycleState:
     fit_frequency_hz: np.ndarray | None = None
     fit_impedance: np.ndarray | None = None
     fit_at_data_impedance: np.ndarray | None = None
+    fit_provenance: dict[str, object] = field(default_factory=dict)
     ridge_tau_s: np.ndarray | None = None
     ridge_gamma_ohm: np.ndarray | None = None
     drt_label: str | None = None
