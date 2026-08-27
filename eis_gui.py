@@ -105,13 +105,13 @@ MODEL_PRESETS = (
 
 
 def _configure_matplotlib_without_tex() -> None:
-    """Keep plotting self-contained and independent of a TeX installation."""
+    """Use the application's plain, non-LaTeX plot text style."""
     import matplotlib
 
-    # A user matplotlibrc may enable the external LaTeX renderer globally.
-    # The GUI uses ordinary Matplotlib text, including Unicode unit labels,
-    # and must not spawn latex when drawing or exporting a plot.
+    # Do not inherit external TeX or Matplotlib math-text rendering from a
+    # user's matplotlibrc. Plot labels in this application are plain text.
     matplotlib.rcParams["text.usetex"] = False
+    matplotlib.rcParams["text.parse_math"] = False
 
 
 class ParameterTable(ttk.Frame):
@@ -636,6 +636,7 @@ class EISApplication:
         self.fit_population_var = tk.StringVar(value=self._fit_population_preference)
         self.fit_iterations_var = tk.StringVar(value=self._fit_iterations_preference)
         self.fit_weight_modulus_var = tk.BooleanVar(value=self._fit_weight_modulus_preference)
+        self.fit_jacobian_mode_var = tk.StringVar(value=self._fit_jacobian_mode_preference)
         self._last_fit_result = None
         self.model_var = tk.StringVar(value=circuit)
         self.show_drt_var = tk.BooleanVar(value=False)
@@ -900,6 +901,7 @@ class EISApplication:
         self._fit_population_preference = "30"
         self._fit_iterations_preference = "200"
         self._fit_weight_modulus_preference = False
+        self._fit_jacobian_mode_preference = "Numerical only"
         self._last_import_directory = Path.cwd()
         self._last_project_directory = Path.cwd()
         self._fit_explorer_x_preference = "I_mA"
@@ -938,6 +940,9 @@ class EISApplication:
                 self._fit_population_preference = str(optimizer.get("population", "30"))
                 self._fit_iterations_preference = str(optimizer.get("iterations", "200"))
                 self._fit_weight_modulus_preference = bool(optimizer.get("weight_by_modulus", False))
+                jacobian_mode = str(optimizer.get("jacobian_mode", "Numerical only"))
+                if jacobian_mode in {"Automatic", "Analytical when supported", "Numerical only"}:
+                    self._fit_jacobian_mode_preference = jacobian_mode
             for preference_name, attribute_name in (
                 ("last_import_directory", "_last_import_directory"),
                 ("last_project_directory", "_last_project_directory"),
@@ -1056,6 +1061,7 @@ class EISApplication:
                         "population": self.fit_population_var.get(),
                         "iterations": self.fit_iterations_var.get(),
                         "weight_by_modulus": bool(self.fit_weight_modulus_var.get()),
+                        "jacobian_mode": self.fit_jacobian_mode_var.get(),
                     },
                 },
                 indent=2,
@@ -1128,9 +1134,16 @@ class EISApplication:
         ttk.Checkbutton(
             optimizer_tab, text="Weight residuals by |Z|", variable=self.fit_weight_modulus_var
         ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(optimizer_tab, text="Local Jacobian").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            optimizer_tab,
+            textvariable=self.fit_jacobian_mode_var,
+            state="readonly",
+            values=("Numerical only", "Automatic", "Analytical when supported"),
+        ).grid(row=5, column=1, sticky="ew", pady=(8, 0))
         ttk.Button(
             optimizer_tab, text="Show last fit diagnostics", command=self._show_fit_diagnostics
-        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(14, 0))
 
         fit_x_values = {"I_mA", "Ecell_V", "time_s", "cycle"}
         drt_x_values = set(fit_x_values) | {"R0", "L0"}
@@ -2375,8 +2388,8 @@ class EISApplication:
 
     def _configure_nyquist_plot(self) -> None:
         self.phase_axes = None
-        self.axes.set_xlabel("Re(Z) / Ω")
-        self.axes.set_ylabel("−Im(Z) / Ω")
+        self.axes.set_xlabel("Re(Z) / Ohm")
+        self.axes.set_ylabel("-Im(Z) / Ohm")
         self.axes.set_aspect("equal", adjustable="box")
         self.axes.grid(True, alpha=0.25)
         self.axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
@@ -2440,10 +2453,10 @@ class EISApplication:
     def _configure_bode_plot(self) -> None:
         self.axes.set_xscale("log")
         self.axes.set_xlabel("Frequency / Hz")
-        self.axes.set_ylabel("|Z| / Ω")
+        self.axes.set_ylabel("|Z| / Ohm")
         self.axes.grid(True, alpha=0.25)
         self.phase_axes = self.axes.twinx()
-        self.phase_axes.set_ylabel("−Phase / °")
+        self.phase_axes.set_ylabel("-Phase / deg")
         self.phase_axes.grid(False)
         (self.included_artist,) = self.axes.plot(
             [], [], "o", color="#1769aa", markersize=5, label="|Z| included"
@@ -2473,13 +2486,13 @@ class EISApplication:
             label="_nolegend_",
         )
         (self.phase_included_artist,) = self.phase_axes.plot(
-            [], [], "s", color="#6a1b9a", markersize=4, alpha=0.85, label="−Phase included"
+            [], [], "s", color="#6a1b9a", markersize=4, alpha=0.85, label="-Phase included"
         )
         (self.phase_excluded_artist,) = self.phase_axes.plot(
-            [], [], "x", color="#ab47bc", markersize=4.5, alpha=0.45, label="−Phase excluded"
+            [], [], "x", color="#ab47bc", markersize=4.5, alpha=0.45, label="-Phase excluded"
         )
         (self.phase_fit_artist,) = self.phase_axes.plot(
-            [], [], "-", color="#4a148c", linewidth=1.8, alpha=0.8, label="−Phase fit"
+            [], [], "-", color="#4a148c", linewidth=1.8, alpha=0.8, label="-Phase fit"
         )
         (self.phase_fit_points_included_artist,) = self.phase_axes.plot(
             [],
@@ -2488,7 +2501,7 @@ class EISApplication:
             color="#8e24aa",
             markersize=2.5,
             alpha=0.55,
-            label="−Phase fit at measured frequencies",
+            label="-Phase fit at measured frequencies",
         )
         (self.phase_fit_points_excluded_artist,) = self.phase_axes.plot(
             [],
@@ -2524,7 +2537,7 @@ class EISApplication:
             linestyles="dashed",
             alpha=0.26,
             zorder=1,
-            label="−Phase measured-to-fit difference",
+            label="-Phase measured-to-fit difference",
         )
         self.phase_excluded_residual_artist = self._line_collection_class(
             [],
@@ -2628,7 +2641,7 @@ class EISApplication:
         self.ml_phase_residual_artist = None
         if self.phase_axes is not None:
             (self.drt_phase_fit_artist,) = self.phase_axes.plot(
-                [], [], "-", color="#00897b", linewidth=1.6, alpha=0.9, label="−Phase DRT fit"
+                [], [], "-", color="#00897b", linewidth=1.6, alpha=0.9, label="-Phase DRT fit"
             )
         if self.phase_axes is not None:
             (self.ml_phase_active_artist,) = self.phase_axes.plot(
@@ -10206,6 +10219,11 @@ class EISApplication:
             population_size=int(self.fit_population_var.get()),
             iterations=int(self.fit_iterations_var.get()),
             weight_by_modulus=bool(self.fit_weight_modulus_var.get()),
+            jacobian_mode={
+                "Numerical only": "numerical",
+                "Automatic": "automatic",
+                "Analytical when supported": "analytical",
+            }.get(self.fit_jacobian_mode_var.get(), "numerical"),
         ).validated()
 
     def _show_fit_diagnostics(self) -> None:
@@ -10223,6 +10241,9 @@ class EISApplication:
             f"Pipeline: {' → '.join(result.options.stages())}\n"
             f"RMSE: {result.rmse:.6g}\n"
             f"Objective: {result.objective:.6g}\n"
+            f"Jacobian: {result.jacobian_mode}"
+            + (f" (fallback: {result.jacobian_fallback_reason})" if result.jacobian_fallback_reason else "")
+            + "\n"
             f"Elapsed: {result.elapsed_seconds:.3f} s\n\n{stages}",
             parent=self.root,
         )
@@ -12935,8 +12956,8 @@ class EISApplication:
                 phase_axes = axes.twinx()
                 axes.set_xscale("log")
                 axes.set_xlabel("Frequency / Hz")
-                axes.set_ylabel("|Z| / Ω")
-                phase_axes.set_ylabel("−Phase / °")
+                axes.set_ylabel("|Z| / Ohm")
+                phase_axes.set_ylabel("-Phase / deg")
                 axes.grid(True, alpha=0.25)
                 for index, (loaded, cycle) in enumerate(plotted_cycles):
                     color = color_scale(index / max(len(plotted_cycles) - 1, 1))
