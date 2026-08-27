@@ -20,8 +20,8 @@ classifiers = [
 ]
 requires-python = ">=3.14"
 dependencies = [
-    "bayes-drt2",
-    "hybrid-drt",
+    "eisyfit-bayes-drt2>=0.2",
+    "eisyfit-hybrid-drt>=0.1",
     "impedance>=1.7.1",
     "matplotlib>=3.11.1",
     "natsort>=8.4.0",
@@ -32,7 +32,7 @@ dependencies = [
     "scikit-learn>=1.5.0",
     "pygad>=3.6.0",
     "pyswarms>=1.3",
-    "wepy",
+    "eisyfit-wepy>=0.1.0",
 ]
 
 [project.urls]
@@ -66,8 +66,3 @@ include = ["ml*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.ico", "*.png", "*.svg"]
-
-[tool.uv.sources]
-bayes-drt2 = { git = "https://github.com/jaroslav-herman/bayes-drt2.git" }
-hybrid-drt = { git = "https://github.com/jdhuang-csm/hybrid-drt.git" }
-wepy = { git = "https://github.com/jaroslav-herman/wepy.git" }

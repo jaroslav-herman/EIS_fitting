@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for package in bayes-drt2 hybrid-drt; do
+          for package in eisyfit-bayes-drt2 eisyfit-hybrid-drt eisyfit-galvani eisyfit-wepy; do
             if ! curl --fail --silent --show-error "https://pypi.org/pypi/${package}/json" >/dev/null; then
               echo "${package} is not published on PyPI. Publish a compatible distribution before releasing eisyfit."
               exit 1
