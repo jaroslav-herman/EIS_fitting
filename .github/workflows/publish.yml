@@ -73,4 +73,12 @@ jobs:
           assert not missing, f"Missing from wheel: {sorted(missing)}"
           assert any(name.endswith("entry_points.txt") for name in names)
           PY
+      - name: Clean-install wheel check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/eisyfit-clean
+          /tmp/eisyfit-clean/bin/python -m pip install --upgrade pip
+          /tmp/eisyfit-clean/bin/python -m pip install dist/eisyfit-*.whl
+          /tmp/eisyfit-clean/bin/python -c "import importlib.metadata, main; assert importlib.metadata.version('eisyfit') == '0.1.0'; print('eisyfit clean install succeeded')"
       - run: uv publish
