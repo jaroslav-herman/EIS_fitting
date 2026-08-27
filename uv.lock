@@ -129,7 +129,7 @@ wheels = [
 
 [[package]]
 name = "eisyfit"
-version = "0.1.1"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "eisyfit-bayes-drt2" },
@@ -195,10 +195,11 @@ wheels = [
 
 [[package]]
 name = "eisyfit-hybrid-drt"
-version = "0.1"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cvxopt" },
+    { name = "eisyfit-mittag-leffler" },
     { name = "matplotlib" },
     { name = "numpy" },
     { name = "pandas" },
@@ -206,9 +207,22 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "scipy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/42/d2/05ab4eaa44861c7c63129a128cc512982fb23d5ea66e0cdae90431be0d52/eisyfit_hybrid_drt-0.1.tar.gz", hash = "sha256:43a20105ad8bd69641948c50236bbc5e2adeb1503d6e0c3a0ce242cfb6676b8c", size = 271655, upload-time = "2026-08-27T09:27:57.305Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/15/e0/a8bb1cbf5af8df368a5d733149cdd9d351e9709be2f02fccb3dabb895900/eisyfit_hybrid_drt-0.1.1.tar.gz", hash = "sha256:5eceecf6c9bcf2764aba66188515dce0924a9b1e8efa02cd25efd89ced70003c", size = 271760, upload-time = "2026-08-27T11:04:38.482Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a7/39/a5f953b03bdfab6a623b519c0c2898842d585fc78919a0210db797f850be/eisyfit_hybrid_drt-0.1-py3-none-any.whl", hash = "sha256:3be48cb67def007ca094c35bea44bd0f9fe04b81669eb0f9680484a17904008f", size = 290399, upload-time = "2026-08-27T09:27:56.13Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/b2/b4e21b0356b98aa98901fc7a80ea5e34457878e4570e71e7387cfaf68701/eisyfit_hybrid_drt-0.1.1-py3-none-any.whl", hash = "sha256:9092f1eb2fc2167db20fe78167468c2ec65b79db6184030257952eacb2d031ac", size = 290436, upload-time = "2026-08-27T11:04:37.14Z" },
+]
+
+[[package]]
+name = "eisyfit-mittag-leffler"
+version = "0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5a/45/9c839a8a208c87a40b0edf111464ea88696006b6e1024467e7cc12dd2f09/eisyfit_mittag_leffler-0.1.tar.gz", hash = "sha256:2cac4930241841fecaf4e80a22682eaf472eedf679a30dc326453e26d5c0d188", size = 7094, upload-time = "2026-08-27T11:03:44.284Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a5/1a/b23b90ce78a06435cfbbb76725fef2617bfa435c8ce8a6f143f20f5fad2b/eisyfit_mittag_leffler-0.1-py3-none-any.whl", hash = "sha256:8f39d229996757e1e4efdf14928f5c2f633eff1e64ba620fdfba8b82f8422f3d", size = 8137, upload-time = "2026-08-27T11:03:43.495Z" },
 ]
 
 [[package]]
