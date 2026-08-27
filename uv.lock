@@ -33,19 +33,6 @@ wheels = [
 ]
 
 [[package]]
-name = "bayes-drt2"
-version = "0.2"
-source = { git = "https://github.com/jaroslav-herman/bayes-drt2#836f66fa4b791fa353ac6ea4540ce5e752f05774" }
-dependencies = [
-    { name = "cmdstanpy" },
-    { name = "cvxopt" },
-    { name = "matplotlib" },
-    { name = "numpy" },
-    { name = "pandas" },
-    { name = "scipy" },
-]
-
-[[package]]
 name = "cloudpickle"
 version = "3.1.2"
 source = { registry = "https://pypi.org/simple" }
@@ -145,8 +132,9 @@ name = "eisyfit"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "bayes-drt2" },
-    { name = "hybrid-drt" },
+    { name = "eisyfit-bayes-drt2" },
+    { name = "eisyfit-hybrid-drt" },
+    { name = "eisyfit-wepy" },
     { name = "impedance" },
     { name = "matplotlib" },
     { name = "natsort" },
@@ -157,13 +145,13 @@ dependencies = [
     { name = "pyswarms" },
     { name = "scikit-learn" },
     { name = "scipy" },
-    { name = "wepy" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "bayes-drt2", git = "https://github.com/jaroslav-herman/bayes-drt2.git" },
-    { name = "hybrid-drt", git = "https://github.com/jdhuang-csm/hybrid-drt.git" },
+    { name = "eisyfit-bayes-drt2", specifier = ">=0.2" },
+    { name = "eisyfit-hybrid-drt", specifier = ">=0.1" },
+    { name = "eisyfit-wepy", specifier = ">=0.1.1" },
     { name = "impedance", specifier = ">=1.7.1" },
     { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "natsort", specifier = ">=8.4.0" },
@@ -174,7 +162,72 @@ requires-dist = [
     { name = "pyswarms", specifier = ">=1.3" },
     { name = "scikit-learn", specifier = ">=1.5.0" },
     { name = "scipy", specifier = ">=1.18.0" },
-    { name = "wepy", git = "https://github.com/jaroslav-herman/wepy.git" },
+]
+
+[[package]]
+name = "eisyfit-bayes-drt2"
+version = "0.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cmdstanpy" },
+    { name = "cvxopt" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/31/51/2e824989440ab2d82de0483ee0727dd88a4006d463758f3845be44fd71a4/eisyfit_bayes_drt2-0.2.tar.gz", hash = "sha256:7bde02c79abc93ee525bdd4b812b19e960596670abb082c03a5647f1699a3d74", size = 87932, upload-time = "2026-08-27T09:27:28.224Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4c/ce/9d29b329bb83db9a6422be06758f58f69656c4506d41ae78db02b9bff6b0/eisyfit_bayes_drt2-0.2-py3-none-any.whl", hash = "sha256:667c873c19554b3cf23106f59a8dc316af9d14d34470f5d121e94c45990d2c76", size = 103313, upload-time = "2026-08-27T09:27:27.2Z" },
+]
+
+[[package]]
+name = "eisyfit-galvani"
+version = "0.5.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/fa/2e53e755d1dd85c308ec66b56620fd6b6e3afcab3b03d379d4ecd67b2a43/eisyfit_galvani-0.5.0.tar.gz", hash = "sha256:f4a2a5c05fd9f328eb68cf707520133d412414955d93f3909f0c1fe380247723", size = 41360, upload-time = "2026-08-27T10:18:57.926Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f0/12/d7b9b2ca5a0b2fa3a6d8b4ad46d046d18310256a2ead24c7d2127157d150/eisyfit_galvani-0.5.0-py3-none-any.whl", hash = "sha256:519e539e440245d4df0a47347caf10a4e63ca31a883a8b045fd0534ad56c887e", size = 30520, upload-time = "2026-08-27T10:18:57.016Z" },
+]
+
+[[package]]
+name = "eisyfit-hybrid-drt"
+version = "0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cvxopt" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "scikit-image" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/42/d2/05ab4eaa44861c7c63129a128cc512982fb23d5ea66e0cdae90431be0d52/eisyfit_hybrid_drt-0.1.tar.gz", hash = "sha256:43a20105ad8bd69641948c50236bbc5e2adeb1503d6e0c3a0ce242cfb6676b8c", size = 271655, upload-time = "2026-08-27T09:27:57.305Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a7/39/a5f953b03bdfab6a623b519c0c2898842d585fc78919a0210db797f850be/eisyfit_hybrid_drt-0.1-py3-none-any.whl", hash = "sha256:3be48cb67def007ca094c35bea44bd0f9fe04b81669eb0f9680484a17904008f", size = 290399, upload-time = "2026-08-27T09:27:56.13Z" },
+]
+
+[[package]]
+name = "eisyfit-wepy"
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "eisyfit-bayes-drt2" },
+    { name = "eisyfit-galvani" },
+    { name = "eisyfit-hybrid-drt" },
+    { name = "impedance" },
+    { name = "matplotlib" },
+    { name = "natsort" },
+    { name = "numpy" },
+    { name = "pandas" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/df/1d/1500745927e0814f909c8d57e834cef4c8b35ab739163af5eee1cd789281/eisyfit_wepy-0.1.1.tar.gz", hash = "sha256:00db3dccc30e71fe2ca86c1e6e32cc3fef3bd79863d5de9a1ea6f2472f9c179b", size = 45352, upload-time = "2026-08-27T10:21:14.371Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/34/96/32d90e98bd884b4b1c23c06c128a265b39c70b215f0c5f09d99abef1294e/eisyfit_wepy-0.1.1-py3-none-any.whl", hash = "sha256:7178f9dbafdb606dae93f8765728bcb73245a5001bbd98cdc19e763e0ed85119", size = 38361, upload-time = "2026-08-27T10:21:13.329Z" },
 ]
 
 [[package]]
@@ -209,28 +262,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a7/b2/4140c69c6a66432916b26158687e821ba631a4c9273c474343badf84d3ba/future-1.0.0.tar.gz", hash = "sha256:bd2968309307861edae1458a4f8a4f3598c03be43b97521076aebf5d94c07b05", size = 1228490, upload-time = "2024-02-21T11:52:38.461Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/da/71/ae30dadffc90b9006d77af76b393cb9dfbfc9629f339fc1574a1c52e6806/future-1.0.0-py3-none-any.whl", hash = "sha256:929292d34f5872e70396626ef385ec22355a1fae8ad29e1a734c3e43f9fbc216", size = 491326, upload-time = "2024-02-21T11:52:35.956Z" },
-]
-
-[[package]]
-name = "galvani"
-version = "0.5.0"
-source = { git = "https://github.com/jaroslav-herman/galvani#14a5bc29ca47e48c4423d6a93c41d9df7d0aced5" }
-dependencies = [
-    { name = "numpy" },
-]
-
-[[package]]
-name = "hybrid-drt"
-version = "0.1"
-source = { git = "https://github.com/jdhuang-csm/hybrid-drt#e01dba1bf5f02fa6b63c82169c0652a5a695344d" }
-dependencies = [
-    { name = "cvxopt" },
-    { name = "matplotlib" },
-    { name = "numpy" },
-    { name = "pandas" },
-    { name = "scikit-image" },
-    { name = "scikit-learn" },
-    { name = "scipy" },
 ]
 
 [[package]]
@@ -420,15 +451,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/0f/68/3c22e9320bdce2c4d2f1320643ef706db7a24cb7420eea28b97a2d67f5a8/matplotlib-3.11.1-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:b937b9dba5f5f6c1e31c47abe2186c865c0914fd18f2ce0dfc39c9adcef5951d", size = 10943061, upload-time = "2026-07-18T03:39:32.356Z" },
     { url = "https://files.pythonhosted.org/packages/f6/4a/907ed190ee81a9df581e0ed5456134fc0f7cb55ffcfda2f9e54ca900761c/matplotlib-3.11.1-cp314-cp314t-win_amd64.whl", hash = "sha256:f2912f647f3fbe1ccf085f91e213936f9101bead81a5e670565b1f1b3712f4fb", size = 9540074, upload-time = "2026-07-18T03:39:34.789Z" },
     { url = "https://files.pythonhosted.org/packages/23/d4/97c19b77e0a6e3b48581185bb65088f431cd20186076cc0f650a1757ea46/matplotlib-3.11.1-cp314-cp314t-win_arm64.whl", hash = "sha256:54d47b8ae8b579633a3902ca5b4ad6c1e132a5626d64447b2e22a66394e79987", size = 9213472, upload-time = "2026-07-18T03:39:37.141Z" },
-]
-
-[[package]]
-name = "mittag-leffler"
-version = "0.1"
-source = { git = "https://github.com/jdhuang-csm/mittag-leffler#6e875fa3e124d25420fd791e4e742d67599d94a7" }
-dependencies = [
-    { name = "numpy" },
-    { name = "scipy" },
 ]
 
 [[package]]
@@ -916,20 +938,4 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/92/ff/5a28bdfd8c3ebec42564ac7d0e54ca3db65044a9314a97f9564fa7a1e926/tzdata-2026.3.tar.gz", hash = "sha256:4a1518b8993086a7982523e071643f3c0e5f213e75b21318e78bcabfff9d1415", size = 198674, upload-time = "2026-07-10T08:50:37.887Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e5/6d/b53b99a9f2766d095985947a5782f1702cabb129a34f7a802d7197af832f/tzdata-2026.3-py2.py3-none-any.whl", hash = "sha256:dc096730c87af6cab1b171c9d532be840741ff5d459015e7f6947bd7d7e54931", size = 348168, upload-time = "2026-07-10T08:50:36.46Z" },
-]
-
-[[package]]
-name = "wepy"
-version = "0.1.0"
-source = { git = "https://github.com/jaroslav-herman/wepy.git#ede59f1f486aecd8d7daeda8214d0c794dc6a480" }
-dependencies = [
-    { name = "bayes-drt2" },
-    { name = "galvani" },
-    { name = "hybrid-drt" },
-    { name = "impedance" },
-    { name = "matplotlib" },
-    { name = "mittag-leffler" },
-    { name = "natsort" },
-    { name = "numpy" },
-    { name = "pandas" },
 ]
