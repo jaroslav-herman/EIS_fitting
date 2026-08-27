@@ -16,6 +16,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
 
+import matplotlib
 import numpy as np
 from natsort import natsort_keygen, ns
 from scipy.optimize import curve_fit
@@ -95,6 +96,14 @@ from explorer_filter import (
 from plot_export import extract_displayed_series, write_displayed_csv
 from circuit_structure import circuits_equivalent, map_parameter_name, parameter_name_mapping
 
+
+# Configure Matplotlib before any application figure or text artist is created.
+# This deliberately disables both external TeX and Matplotlib's `$...$`
+# math-text parsing so labels and legends always use the application's plain
+# text style, even when the user's matplotlibrc enables math rendering.
+matplotlib.rcParams["text.usetex"] = False
+matplotlib.rcParams["text.parse_math"] = False
+
 MODEL_PRESETS = (
     "R0-L0-p(R1,CPE1)",
     "R0-p(R1,CPE1)",
@@ -106,8 +115,6 @@ MODEL_PRESETS = (
 
 def _configure_matplotlib_without_tex() -> None:
     """Use the application's plain, non-LaTeX plot text style."""
-    import matplotlib
-
     # Do not inherit external TeX or Matplotlib math-text rendering from a
     # user's matplotlibrc. Plot labels in this application are plain text.
     matplotlib.rcParams["text.usetex"] = False
