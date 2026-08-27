@@ -151,7 +151,7 @@ dependencies = [
 requires-dist = [
     { name = "eisyfit-bayes-drt2", specifier = ">=0.2" },
     { name = "eisyfit-hybrid-drt", specifier = ">=0.1" },
-    { name = "eisyfit-wepy", specifier = ">=0.1.1" },
+    { name = "eisyfit-wepy", specifier = ">=0.1.2" },
     { name = "impedance", specifier = ">=1.7.1" },
     { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "natsort", specifier = ">=8.4.0" },
@@ -213,7 +213,7 @@ wheels = [
 
 [[package]]
 name = "eisyfit-wepy"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "eisyfit-bayes-drt2" },
@@ -225,9 +225,9 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/df/1d/1500745927e0814f909c8d57e834cef4c8b35ab739163af5eee1cd789281/eisyfit_wepy-0.1.1.tar.gz", hash = "sha256:00db3dccc30e71fe2ca86c1e6e32cc3fef3bd79863d5de9a1ea6f2472f9c179b", size = 45352, upload-time = "2026-08-27T10:21:14.371Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/84/29/1b2794f36529e5b3e209109e22b814ba0c14f84fc078fe55430fb2c770b6/eisyfit_wepy-0.1.2.tar.gz", hash = "sha256:33a4ba65d7e858168a10ba06446bc327b71f2620350731210b8b18284d2ff245", size = 45790, upload-time = "2026-08-27T10:53:43.167Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/34/96/32d90e98bd884b4b1c23c06c128a265b39c70b215f0c5f09d99abef1294e/eisyfit_wepy-0.1.1-py3-none-any.whl", hash = "sha256:7178f9dbafdb606dae93f8765728bcb73245a5001bbd98cdc19e763e0ed85119", size = 38361, upload-time = "2026-08-27T10:21:13.329Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/74/d47e58417414c193321ccb068c0351c3874d4e0bb15f52854d923f2a42b4/eisyfit_wepy-0.1.2-py3-none-any.whl", hash = "sha256:019dc7d51e9bf95b3eaa6f9d11fffd4d6c29082a22c1d1b3e5c9e1daa60859f1", size = 38845, upload-time = "2026-08-27T10:53:41.86Z" },
 ]
 
 [[package]]
