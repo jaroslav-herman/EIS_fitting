@@ -80,5 +80,5 @@ jobs:
           python -m venv /tmp/eisyfit-clean
           /tmp/eisyfit-clean/bin/python -m pip install --upgrade pip
           /tmp/eisyfit-clean/bin/python -m pip install dist/eisyfit-*.whl
-          /tmp/eisyfit-clean/bin/python -c "import importlib.metadata, main; assert importlib.metadata.version('eisyfit') == '0.1.0'; print('eisyfit clean install succeeded')"
+          /tmp/eisyfit-clean/bin/python -c "import importlib.metadata, main; assert importlib.metadata.version('eisyfit') == '0.1.1'; print('eisyfit clean install succeeded')"
       - run: uv publish
