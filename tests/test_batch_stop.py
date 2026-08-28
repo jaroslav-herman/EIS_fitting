@@ -122,6 +122,25 @@ class BatchStopTests(unittest.TestCase):
         self.assertEqual(2, len(report.fits))
         self.assertIsNone(report.failed_label)
 
+    @patch("eis_services.fit_cycle", side_effect=fake_fit)
+    def test_selected_fit_clamps_previous_initials_to_current_bounds(self, fit):
+        parameters = [ParameterValue("R0", "Ohm", 20.0, 0.0, 10.0, None)]
+        loaded = FakeLoaded([FakeCycle(1, parameters=parameters), FakeCycle(2, parameters=parameters)])
+        targets = [
+            SpectrumFitTarget(loaded, cycle, f"cycle {cycle}")
+            for cycle in (1, 2)
+        ]
+
+        report = batch_fit_spectra(
+            targets,
+            parameters,
+            use_target_initial_parameters=True,
+        )
+
+        self.assertEqual(2, len(report.fits))
+        self.assertEqual([10.0, 10.0], [call.args[2][0].initial for call in fit.call_args_list])
+        self.assertEqual(20.0, parameters[0].initial)
+
 
 if __name__ == "__main__":
     unittest.main()

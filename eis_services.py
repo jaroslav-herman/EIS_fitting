@@ -114,6 +114,7 @@ class FitOptions:
     iterations: int = 200
     weight_by_modulus: bool = False
     use_analytical_jacobian: bool = False
+    jacobian_mode: str = "numerical"
     runtime_checks: bool = True
 
     def stages(self) -> tuple[str, ...]:
@@ -131,7 +132,14 @@ class FitOptions:
             int(self.seed)
         if int(self.population_size) < 4 or int(self.iterations) < 1:
             raise ValueError("Optimizer population and iteration limits must be positive")
+        if self.jacobian_mode.casefold() not in {"automatic", "analytical", "numerical"}:
+            raise ValueError("Jacobian mode must be automatic, analytical, or numerical")
         return self
+
+    def resolved_jacobian_mode(self) -> str:
+        if self.use_analytical_jacobian and self.jacobian_mode == "numerical":
+            return "analytical"
+        return self.jacobian_mode.casefold()
 
 
 @dataclass
@@ -147,6 +155,8 @@ class FitResult:
     stages: list[dict[str, object]] = field(default_factory=list)
     options: FitOptions = field(default_factory=FitOptions)
     elapsed_seconds: float = 0.0
+    jacobian_mode: str = "numerical"
+    jacobian_fallback_reason: str | None = None
 
     def __iter__(self):
         """Backward-compatible unpacking for existing batch/refinement callers."""
@@ -168,6 +178,8 @@ def _fit_provenance(result: FitResult) -> dict[str, object]:
         "converged": result.converged,
         "elapsed_seconds": result.elapsed_seconds,
         "stages": result.stages,
+        "jacobian_mode": result.jacobian_mode,
+        "jacobian_fallback_reason": result.jacobian_fallback_reason,
     }
 
 
@@ -1115,6 +1127,213 @@ def fit_cycle(
     options: FitOptions | None = None,
     stop_event=None,
 ) -> FitResult:
+    return _fit_cycle_impl(state, circuit, parameters, options, stop_event)
+
+
+class JacobianUnsupported(ValueError):
+    """Raised when a circuit cannot use the analytical Jacobian path."""
+
+
+@dataclass
+class _JacobianNode:
+    kind: str
+    token: str = ""
+    children: tuple["_JacobianNode", ...] = ()
+
+
+def _split_circuit_top_level(text: str, separator: str) -> list[str]:
+    parts, start, depth = [], 0, 0
+    for index, char in enumerate(text):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == separator and depth == 0:
+            parts.append(text[start:index])
+            start = index + 1
+    parts.append(text[start:])
+    return [part for part in parts if part]
+
+
+def _parse_jacobian_circuit(circuit: str) -> _JacobianNode:
+    text = str(circuit).replace(" ", "")
+    if not text:
+        raise JacobianUnsupported("empty circuit")
+    for operator, kind, separator in (("p", "parallel", ","), ("s", "series", "-")):
+        if text.startswith(operator + "(") and text.endswith(")"):
+            inner = text[2:-1]
+            children = tuple(_parse_jacobian_circuit(part) for part in _split_circuit_top_level(inner, separator))
+            if len(children) < 2:
+                raise JacobianUnsupported(f"{operator}() needs at least two branches")
+            return _JacobianNode(kind, children=children)
+    series = _split_circuit_top_level(text, "-")
+    if len(series) > 1:
+        return _JacobianNode("series", children=tuple(_parse_jacobian_circuit(part) for part in series))
+    if not re.fullmatch(r"[A-Za-z]+_?\d+", text):
+        raise JacobianUnsupported(f"unsupported circuit syntax: {text}")
+    return _JacobianNode("element", token=text)
+
+
+def _element_impedance_derivatives(token: str, values: np.ndarray, frequency: np.ndarray):
+    """Return an element impedance and derivatives for its local parameters."""
+    from impedance.models.circuits.elements import get_element_from_name
+
+    element = get_element_from_name(token)
+    omega = 2.0 * np.pi * frequency
+    jw = 1j * omega
+    name = re.match(r"[A-Za-z]+", token).group(0)
+    supported = {"R", "C", "L", "W", "Wo", "Ws", "CPE", "La", "G", "Gs", "K", "Zarc"}
+    if element not in supported:
+        raise JacobianUnsupported(f"element {element} has no analytical derivative")
+    if np.any(~np.isfinite(values)):
+        raise JacobianUnsupported(f"non-finite parameters in {token}")
+    p = values
+    if element == "R":
+        z, derivatives = np.full(frequency.size, p[0], complex), [np.ones(frequency.size, complex)]
+    elif element == "C":
+        z = 1.0 / (p[0] * jw)
+        derivatives = [-z / p[0]]
+    elif element == "L":
+        z = p[0] * jw
+        derivatives = [np.full(frequency.size, 1j * omega, complex)]
+    elif element == "W":
+        base = (1.0 - 1.0j) / np.sqrt(omega)
+        z, derivatives = p[0] * base, [base]
+    elif element in {"Wo", "Ws"}:
+        if p[1] == 0:
+            raise JacobianUnsupported(f"zero time constant in {token}")
+        x = np.sqrt(jw * p[1])
+        tanh_x = np.tanh(x)
+        sech2_x = 1.0 - tanh_x * tanh_x
+        if element == "Wo":
+            z = p[0] / (x * tanh_x)
+            derivative_x = -z * (1.0 / x + sech2_x / tanh_x)
+        else:
+            z = p[0] * tanh_x / x
+            derivative_x = p[0] * (sech2_x / x - tanh_x / (x * x))
+        derivatives = [z / p[0], derivative_x * x / (2.0 * p[1])]
+    elif element == "CPE":
+        if p[0] == 0:
+            raise JacobianUnsupported(f"zero CPE Q in {token}")
+        z = 1.0 / (p[0] * jw ** p[1])
+        derivatives = [-z / p[0], -z * np.log(jw)]
+    elif element == "La":
+        if p[0] <= 0:
+            raise JacobianUnsupported(f"non-positive La inductance in {token}")
+        base = p[0] * jw
+        z = base ** p[1]
+        derivatives = [p[1] * z / p[0], z * np.log(base)]
+    elif element == "G":
+        if p[1] == 0:
+            raise JacobianUnsupported(f"zero Gerischer time constant in {token}")
+        denominator = np.sqrt(1.0 + jw * p[1])
+        z = p[0] / denominator
+        derivatives = [z / p[0], -0.5 * z * jw / (1.0 + jw * p[1])]
+    elif element == "Gs":
+        if p[1] == 0 or p[2] == 0:
+            raise JacobianUnsupported(f"singular Gs parameters in {token}")
+        u = 1.0 + jw * p[1]
+        a = np.sqrt(u)
+        tanh_v = np.tanh(p[2] * a)
+        sech2_v = 1.0 - tanh_v * tanh_v
+        z = p[0] / (a * tanh_v)
+        derivatives = [
+            z / p[0],
+            z * (-(0.5 / u + p[2] * sech2_v / (2.0 * a * tanh_v))) * jw,
+            -z * a * sech2_v / tanh_v,
+        ]
+    elif element == "K":
+        denominator = 1.0 + jw * p[1]
+        z = p[0] / denominator
+        derivatives = [z / p[0], -p[0] * jw / denominator ** 2]
+    else:  # Zarc
+        if p[1] == 0:
+            raise JacobianUnsupported(f"zero Zarc time constant in {token}")
+        u = jw * p[1]
+        denominator = 1.0 + u ** p[2]
+        z = p[0] / denominator
+        derivatives = [
+            z / p[0],
+            -p[0] * p[2] * u ** (p[2] - 1.0) * jw / denominator ** 2,
+            -p[0] * u ** p[2] * np.log(u) / denominator ** 2,
+        ]
+    if not np.all(np.isfinite(z)) or any(not np.all(np.isfinite(d)) for d in derivatives):
+        raise JacobianUnsupported(f"non-finite analytical derivative in {token}")
+    return z, derivatives, [token if len(derivatives) == 1 else f"{token}_{i}" for i in range(len(derivatives))]
+
+
+def circuit_jacobian(
+    frequency_hz: Iterable[float], circuit: str, parameter_values: Iterable[float], parameter_names: Iterable[str]
+) -> np.ndarray:
+    """Return dZ/d(parameter) in the circuit's full parameter-name order."""
+    frequency = as_1d_array(frequency_hz).astype(float)
+    values = as_1d_array(parameter_values).astype(float)
+    names = list(parameter_names)
+    if values.size != len(names):
+        raise JacobianUnsupported("parameter values and names have different lengths")
+    name_to_index = {name: index for index, name in enumerate(names)}
+    root = _parse_jacobian_circuit(circuit)
+
+    def evaluate(node: _JacobianNode):
+        if node.kind == "element":
+            from impedance.models.circuits.elements import get_element_from_name
+            element = get_element_from_name(node.token)
+            count = {"R": 1, "C": 1, "L": 1, "W": 1, "Wo": 2, "Ws": 2, "CPE": 2,
+                     "La": 2, "G": 2, "Gs": 3, "K": 2, "Zarc": 3}.get(element)
+            if count is None:
+                raise JacobianUnsupported(f"element {element} has no analytical derivative")
+            local_names = [node.token if count == 1 else f"{node.token}_{i}" for i in range(count)]
+            try:
+                local_values = np.array([values[name_to_index[name]] for name in local_names])
+            except KeyError as error:
+                raise JacobianUnsupported(f"missing parameter {error.args[0]}") from error
+            z, local_derivatives, _ = _element_impedance_derivatives(node.token, local_values, frequency)
+            derivatives = np.zeros((frequency.size, len(names)), complex)
+            for local_name, derivative in zip(local_names, local_derivatives):
+                if local_name not in name_to_index:
+                    raise JacobianUnsupported(f"unknown parameter {local_name}")
+                derivatives[:, name_to_index[local_name]] = derivative
+            return z, derivatives
+        children = [evaluate(child) for child in node.children]
+        if node.kind == "series":
+            return sum((item[0] for item in children), np.zeros(frequency.size, complex)), sum(
+                (item[1] for item in children), np.zeros((frequency.size, len(names)), complex)
+            )
+        admittance = sum((1.0 / item[0] for item in children), np.zeros(frequency.size, complex))
+        if np.any(np.abs(admittance) <= np.finfo(float).eps):
+            raise JacobianUnsupported("singular parallel admittance")
+        derivative_admittance = sum(
+            (-item[1] / item[0][:, None] ** 2 for item in children),
+            np.zeros((frequency.size, len(names)), complex),
+        )
+        return 1.0 / admittance, -derivative_admittance / admittance[:, None] ** 2
+
+    return evaluate(root)[1]
+
+
+def _validate_circuit_jacobian(frequency, circuit, values, names, free_indices, predict) -> None:
+    analytical = circuit_jacobian(frequency, circuit, values, names)[:, free_indices]
+    numerical = np.empty_like(analytical)
+    values = np.asarray(values, dtype=float)
+    for column, index in enumerate(free_indices):
+        step = np.sqrt(np.finfo(float).eps) * max(abs(values[index]), 1.0)
+        plus, minus = values.copy(), values.copy()
+        plus[index] += step
+        minus[index] -= step
+        numerical[:, column] = (predict(plus) - predict(minus)) / (2.0 * step)
+    scale = np.maximum(np.abs(numerical), 1.0)
+    if not np.allclose(analytical, numerical, rtol=3e-4, atol=3e-7 * scale):
+        difference = float(np.max(np.abs(analytical - numerical) / scale))
+        raise JacobianUnsupported(f"derivative validation failed (relative maximum {difference:.3g})")
+
+
+def _fit_cycle_impl(
+    state: CycleState,
+    circuit: str,
+    parameters: list[ParameterValue],
+    options: FitOptions | None = None,
+    stop_event=None,
+) -> FitResult:
     from impedance.models.circuits import CustomCircuit
     from scipy.optimize import least_squares
     from wepy.eis import show_fit
@@ -1126,10 +1345,7 @@ def fit_cycle(
     if frequency.size < 3:
         raise ValueError("At least three included points are required for fitting")
     frequency, impedance = sort_spectrum(frequency, impedance)
-    initial_parameters = np.array(
-        [parameter.initial for parameter in parameters],
-        dtype=float,
-    )
+    initial_parameters = np.array([parameter.initial for parameter in parameters], dtype=float)
     circuit_parameters_only = initial_parameters.copy()
     fixed_constants = {
         parameter.name: float(parameter.initial)
@@ -1142,7 +1358,7 @@ def fit_cycle(
 
     # Keep the default path identical to the pre-extension impedance.py path.
     # This preserves curve_fit's optimizer, weighting, and uncertainty semantics.
-    if options.stages() == ("least_squares",):
+    if options.stages() == ("least_squares",) and options.resolved_jacobian_mode() == "numerical":
         from impedance.models.circuits.fitting import circuit_fit
 
         fitted = initial_parameters.copy()
@@ -1193,6 +1409,7 @@ def fit_cycle(
             stages=[{"method": "least_squares", "objective": objective_value, "converged": True}],
             options=options,
             elapsed_seconds=time.perf_counter() - started,
+            jacobian_mode="numerical",
         )
 
     free_initial = initial_parameters[free_indices]
@@ -1214,6 +1431,33 @@ def fit_cycle(
             difference = difference / np.maximum(np.abs(impedance), np.finfo(float).eps)
         return np.concatenate((difference.real, difference.imag))
 
+    jacobian_mode = options.resolved_jacobian_mode()
+    actual_jacobian_mode = "numerical"
+    jacobian_fallback_reason = None
+    jacobian_callable = None
+    if free_parameters and jacobian_mode != "numerical":
+        try:
+            parameter_names, _units = CustomCircuit(
+                circuit, initial_guess=initial_parameters
+            ).get_param_names()
+            _validate_circuit_jacobian(
+                frequency, circuit, initial_parameters, parameter_names, free_indices, predict
+            )
+
+            def jacobian_callable(values: np.ndarray) -> np.ndarray:
+                if stop_event is not None and stop_event.is_set():
+                    raise FitTimeoutError("EEC fit cancelled")
+                full = initial_parameters.copy()
+                full[free_indices] = values
+                derivative = circuit_jacobian(frequency, circuit, full, parameter_names)[:, free_indices]
+                if options.weight_by_modulus:
+                    derivative = derivative / np.maximum(np.abs(impedance), np.finfo(float).eps)[:, None]
+                return np.vstack((derivative.real, derivative.imag))
+
+            actual_jacobian_mode = "analytical"
+        except Exception as error:
+            jacobian_fallback_reason = str(error)
+
     def objective(values: np.ndarray) -> float:
         values = np.clip(np.asarray(values, dtype=float), lower, upper)
         return float(np.sum(residual(values) ** 2))
@@ -1232,6 +1476,7 @@ def fit_cycle(
                 result = least_squares(
                     residual, current, bounds=(lower, upper),
                     max_nfev=max(int(options.iterations) * 10, 100),
+                    jac=jacobian_callable or "2-point",
                 )
                 current = result.x
                 converged = bool(result.success)
@@ -1287,13 +1532,20 @@ def fit_cycle(
                 detail = {"best_cost": float(-fitness_value)}
             stages.append({"method": stage, "objective": objective(current), "converged": converged,
                            "elapsed_seconds": time.perf_counter() - stage_started, **detail})
+            if stage == "least_squares":
+                stages[-1]["jacobian_mode"] = actual_jacobian_mode
+                if jacobian_fallback_reason:
+                    stages[-1]["jacobian_fallback_reason"] = jacobian_fallback_reason
     absolute_errors = np.zeros(len(parameters), dtype=float)
     if free_parameters:
         circuit_parameters_only[free_indices] = current
         # Estimate covariance from the local Jacobian when available.
         try:
-            from scipy.optimize._numdiff import approx_derivative
-            jacobian = approx_derivative(residual, current, method="2-point", bounds=(lower, upper))
+            if jacobian_callable is not None:
+                jacobian = jacobian_callable(current)
+            else:
+                from scipy.optimize._numdiff import approx_derivative
+                jacobian = approx_derivative(residual, current, method="2-point", bounds=(lower, upper))
             covariance = np.linalg.pinv(jacobian.T @ jacobian)
             # Match scipy curve_fit's default absolute_sigma=False behavior:
             # covariance is scaled by the residual variance (reduced chi-square).
@@ -1341,6 +1593,8 @@ def fit_cycle(
         stages=stages,
         options=options,
         elapsed_seconds=time.perf_counter() - started,
+        jacobian_mode=actual_jacobian_mode,
+        jacobian_fallback_reason=jacobian_fallback_reason,
     )
 
 
@@ -1420,15 +1674,21 @@ def refine_fit_cycle(
 
     working_state = deepcopy(state)
     working_parameters = copy_parameter_values(parameters)
-    current_result = (
-        as_1d_array(state.fit_parameters).astype(float).copy(),
-        np.asarray(
+    current_result = FitResult(
+        fitted_parameters=as_1d_array(state.fit_parameters).astype(float).copy(),
+        errors_percent=np.asarray(
             [parameter.error_percent or 0.0 for parameter in parameters],
             dtype=float,
         ),
-        as_1d_array(state.fit_frequency_hz).astype(float).copy(),
-        as_1d_array(state.fit_impedance).astype(complex).copy(),
-        as_1d_array(state.fit_at_data_impedance).astype(complex).copy(),
+        fit_frequency_hz=as_1d_array(state.fit_frequency_hz).astype(float).copy(),
+        fit_impedance=as_1d_array(state.fit_impedance).astype(complex).copy(),
+        fit_at_data_impedance=as_1d_array(
+            state.fit_at_data_impedance
+        ).astype(complex).copy(),
+        objective=float("nan"),
+        rmse=float("nan"),
+        converged=True,
+        options=fit_options or FitOptions(),
     )
     removed_indices: list[int] = []
     iterations = 0
@@ -1447,7 +1707,7 @@ def refine_fit_cycle(
             break
         order = np.argsort(working_state.frequency_hz[active_indices])[::-1]
         measured = working_state.impedance[active_indices][order]
-        calculated = current_result[4][active_indices][order]
+        calculated = current_result.fit_at_data_impedance[active_indices][order]
         if calculated.size != measured.size:
             raise ValueError("The fit and active points have different lengths")
         residual = measured - calculated
@@ -1471,7 +1731,9 @@ def refine_fit_cycle(
         working_state.manually_included[original_indices] = False
         working_state.outliers[original_indices] = True
         removed_indices.extend(int(index) for index in original_indices)
-        for parameter, value in zip(working_parameters, current_result[0]):
+        for parameter, value in zip(
+            working_parameters, current_result.fitted_parameters
+        ):
             parameter.initial = float(value)
         fit_function = (
             fit_cycle_with_timeout
@@ -1521,6 +1783,13 @@ def _batch_parameters_with_initials(
             )
         )
     return copied
+
+
+def _parameters_with_clamped_initials(
+    parameters: list[ParameterValue],
+) -> list[ParameterValue]:
+    """Copy parameters and move every initial value into its current bounds."""
+    return _batch_parameters_with_initials(parameters, parameters)
 
 
 def batch_fit_from_cycle(
@@ -1679,7 +1948,10 @@ def batch_fit_spectra(
         target_parameters = project.parameters_for(target.cycle)
         if use_target_initial_parameters:
             fit_circuit = target_circuit
-            fit_parameters = target_parameters
+            # A previous fit may have been produced with wider bounds.  Use a
+            # bounded copy for the new fit, without mutating the stored fit
+            # until the refit succeeds.
+            fit_parameters = _parameters_with_clamped_initials(target_parameters)
         else:
             if not circuits_equivalent(next_circuit, target_circuit):
                 return SpectrumBatchReport(

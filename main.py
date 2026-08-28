@@ -5,7 +5,7 @@ from pathlib import Path
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="eis-fitting",
+        prog="eisyfit",
         description="Interactive Nyquist spectrum editor and fitting GUI.",
     )
     parser.add_argument(

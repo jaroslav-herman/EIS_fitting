@@ -25,7 +25,31 @@ The application:
 - Python 3.14 or newer
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/), the environment and dependency manager used by this project
 
-### Install from GitHub
+### Install from PyPI
+
+To install the released application into an isolated environment and launch it:
+
+```text
+uvx eisyfit
+```
+
+To add it to an existing uv project:
+
+```text
+uv add eisyfit
+eisyfit
+```
+
+The PyPI release depends on public distributions of the project’s DRT
+backends. Until the maintained forks of `bayes-drt2`, `hybrid-drt`, and the
+EIS-specific `wepy` package are published under installable PyPI names, use
+the GitHub installation below.
+
+The application requires Python 3.14 or newer and a desktop environment with
+Tk support. On some Linux distributions, Tk must be installed separately
+(for example, the `python3-tk` system package).
+
+### Run from GitHub
 
 In PowerShell, Terminal, or a shell:
 
@@ -58,6 +82,13 @@ available and starts the application from the repository directory.
 
 If `uv` is not available, install it using the official instructions linked
 above, then open a new terminal and repeat `uv sync`.
+
+## License
+
+EIS Fitting is licensed under the GNU General Public License v3.0 or later.
+Its dependencies remain under their respective licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for the dependency license
+summary.
 
 ## Run
 

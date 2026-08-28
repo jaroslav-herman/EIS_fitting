@@ -98,11 +98,14 @@ from circuit_structure import circuits_equivalent, map_parameter_name, parameter
 
 
 # Configure Matplotlib before any application figure or text artist is created.
-# This deliberately disables both external TeX and Matplotlib's `$...$`
-# math-text parsing so labels and legends always use the application's plain
-# text style, even when the user's matplotlibrc enables math rendering.
+# ``wepy`` installs its own publication style as an import side effect.  The
+# GUI should use Matplotlib's normal defaults instead of inheriting that style
+# (or a user's external TeX configuration).  Keep Matplotlib's built-in
+# math-text parser enabled because its default log tick formatter uses
+# ``\\mathdefault{...}`` internally; disabling it displays that implementation
+# detail literally on the graph.
+matplotlib.rcdefaults()
 matplotlib.rcParams["text.usetex"] = False
-matplotlib.rcParams["text.parse_math"] = False
 
 MODEL_PRESETS = (
     "R0-L0-p(R1,CPE1)",
@@ -114,11 +117,199 @@ MODEL_PRESETS = (
 
 
 def _configure_matplotlib_without_tex() -> None:
-    """Use the application's plain, non-LaTeX plot text style."""
-    # Do not inherit external TeX or Matplotlib math-text rendering from a
-    # user's matplotlibrc. Plot labels in this application are plain text.
+    """Restore Matplotlib defaults and use plain text for GUI plots."""
+    # Reapply this at application construction time because importing another
+    # plotting backend can change the process-wide Matplotlib rcParams.
+    matplotlib.rcdefaults()
     matplotlib.rcParams["text.usetex"] = False
-    matplotlib.rcParams["text.parse_math"] = False
+
+
+_configure_matplotlib_without_tex()
+
+
+class _ExplorerLineTool:
+    """Interactive reference line shared by the parameter explorers."""
+
+    def __init__(self, axes, canvas, parent, refresh_callback) -> None:
+        self.axes = axes
+        self.canvas = canvas
+        self.refresh_callback = refresh_callback
+        self.visible = tk.BooleanVar(value=False)
+        self.slope_var = tk.StringVar(value="")
+        self.intersection_var = tk.StringVar(value="")
+        self.slope_function_var = tk.StringVar(value="k")
+        self.intersection_function_var = tk.StringVar(value="q")
+        self._points: list[tuple[float, float]] | None = None
+        self._data_available = False
+        self._active_point: int | None = None
+        self._slope: float | None = None
+        self._intersection: float | None = None
+
+        frame = ttk.LabelFrame(parent, text="Reference line y = kx + q", padding=4)
+        frame.grid(row=5, column=0, columnspan=5, padx=3, pady=(6, 0), sticky="ew")
+        for column in range(8):
+            frame.columnconfigure(column, weight=1 if column in {1, 3, 5, 7} else 0)
+        ttk.Checkbutton(
+            frame,
+            text="Show line",
+            variable=self.visible,
+            command=self._on_visibility_changed,
+        ).grid(row=0, column=0, padx=(0, 8), sticky="w")
+        ttk.Label(frame, text="Slope k").grid(row=0, column=1, sticky="e")
+        ttk.Entry(
+            frame, textvariable=self.slope_var, state="readonly", width=12
+        ).grid(row=0, column=2, padx=(3, 8), sticky="ew")
+        ttk.Label(frame, text="Intersection q").grid(row=0, column=3, sticky="e")
+        ttk.Entry(
+            frame, textvariable=self.intersection_var, state="readonly", width=12
+        ).grid(row=0, column=4, padx=(3, 8), sticky="ew")
+        ttk.Button(
+            frame, text="Recalculate", command=self._recalculate
+        ).grid(row=0, column=5, padx=(0, 8), sticky="w")
+        ttk.Label(frame, text="k function").grid(row=1, column=0, sticky="e")
+        ttk.Entry(
+            frame, textvariable=self.slope_function_var, width=14
+        ).grid(row=1, column=1, columnspan=2, padx=(3, 8), sticky="ew")
+        ttk.Label(frame, text="q function").grid(row=1, column=3, sticky="e")
+        ttk.Entry(
+            frame, textvariable=self.intersection_function_var, width=14
+        ).grid(row=1, column=4, columnspan=2, padx=(3, 8), sticky="ew")
+        ttk.Label(
+            frame, text="Drag the two markers in the graph; functions use k, q, and np"
+        ).grid(row=1, column=6, columnspan=2, padx=(0, 3), sticky="w")
+
+        self.canvas.mpl_connect("button_press_event", self._on_press)
+        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self.canvas.mpl_connect("button_release_event", self._on_release)
+
+    @staticmethod
+    def _format_value(value: float | None) -> str:
+        return "" if value is None or not np.isfinite(value) else f"{value:.8g}"
+
+    def _update_line_parameters(self) -> None:
+        if self._points is None:
+            self._slope = None
+            self._intersection = None
+        else:
+            (x1, y1), (x2, y2) = self._points
+            if not np.isfinite([x1, y1, x2, y2]).all() or x1 == x2:
+                self._slope = None
+                self._intersection = None
+            else:
+                self._slope = (y2 - y1) / (x2 - x1)
+                self._intersection = y1 - self._slope * x1
+        self.slope_var.set(self._format_value(self._slope))
+        self.intersection_var.set(self._format_value(self._intersection))
+
+    def set_data(self, values: list[tuple[float, float]]) -> None:
+        finite_values = [
+            (float(x), float(y))
+            for x, y in values
+            if np.isfinite(x) and np.isfinite(y)
+        ]
+        self._data_available = len(finite_values) >= 2
+        if self._points is None and self._data_available:
+            ordered = sorted(finite_values)
+            self._points = [ordered[0], ordered[-1]]
+            self._update_line_parameters()
+
+    def _on_visibility_changed(self) -> None:
+        self.refresh_callback()
+
+    def _recalculate(self) -> None:
+        if self._points is None or self._slope is None or self._intersection is None:
+            return
+        try:
+            scope = {
+                "__builtins__": {},
+                "np": np,
+                "k": self._slope,
+                "q": self._intersection,
+            }
+            slope = float(eval(self.slope_function_var.get().strip() or "k", scope))
+            intersection = float(
+                eval(self.intersection_function_var.get().strip() or "q", scope)
+            )
+        except (TypeError, ValueError, SyntaxError, NameError, ZeroDivisionError):
+            return
+        if not np.isfinite([slope, intersection]).all():
+            return
+        x1, _y1 = self._points[0]
+        x2, _y2 = self._points[1]
+        self._slope = slope
+        self._intersection = intersection
+        self._points = [
+            (x1, slope * x1 + intersection),
+            (x2, slope * x2 + intersection),
+        ]
+        self._update_line_parameters()
+        self.redraw()
+        self.canvas.draw_idle()
+
+    def _nearest_point(self, event) -> int | None:
+        if not self.visible.get() or self._points is None:
+            return None
+        if event.x is None or event.y is None:
+            return None
+        try:
+            display_points = self.axes.transData.transform(self._points)
+        except (ValueError, OverflowError):
+            return None
+        distances = [
+            float(np.hypot(display_x - event.x, display_y - event.y))
+            for display_x, display_y in display_points
+        ]
+        nearest = int(np.argmin(distances))
+        return nearest if distances[nearest] <= 12.0 else None
+
+    def _on_press(self, event) -> None:
+        if event.inaxes is self.axes and event.button == 1:
+            self._active_point = self._nearest_point(event)
+
+    def _on_motion(self, event) -> None:
+        if self._active_point is None or event.inaxes is not self.axes:
+            return
+        if event.xdata is None or event.ydata is None or self._points is None:
+            return
+        if (
+            self.axes.get_xscale() == "log" and event.xdata <= 0
+        ) or (self.axes.get_yscale() == "log" and event.ydata <= 0):
+            return
+        self._points[self._active_point] = (float(event.xdata), float(event.ydata))
+        self._update_line_parameters()
+        self.redraw()
+        self.canvas.draw_idle()
+
+    def _on_release(self, event) -> None:
+        if event.button == 1:
+            self._active_point = None
+
+    def redraw(self) -> None:
+        if not self.visible.get() or not self._data_available or self._points is None:
+            return
+        (x1, y1), (x2, y2) = self._points
+        if self._slope is None or self._intersection is None:
+            x_values = np.full(200, x1)
+            y_values = np.linspace(y1, y2, 200)
+        else:
+            x_limits = self.axes.get_xlim()
+            x_values = np.linspace(x_limits[0], x_limits[1], 200)
+            y_values = self._slope * x_values + self._intersection
+        finite = np.isfinite(x_values) & np.isfinite(y_values)
+        if self.axes.get_xscale() == "log":
+            finite &= x_values > 0
+        if self.axes.get_yscale() == "log":
+            finite &= y_values > 0
+        if np.count_nonzero(finite) >= 2:
+            self.axes.plot(
+                x_values[finite], y_values[finite], "--", color="black",
+                linewidth=1.2, label="Reference line"
+            )
+        self.axes.plot(
+            [x1, x2], [y1, y2], "o", color="black", markersize=7,
+            markerfacecolor="white", markeredgewidth=1.4,
+            label="Line control points",
+        )
 
 
 class ParameterTable(ttk.Frame):
@@ -365,6 +556,7 @@ class MetadataEditDialog(tk.Toplevel):
         parent: tk.Tk,
         spectrum_count: int,
         columns: list[str],
+        initial_column: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.result: tuple[str, list[str | None], bool] | None = None
@@ -380,7 +572,8 @@ class MetadataEditDialog(tk.Toplevel):
         body.columnconfigure(0, weight=1)
         body.rowconfigure(4, weight=1)
         ttk.Label(body, text="Metadata column").grid(row=0, column=0, sticky="w")
-        self.column_var = tk.StringVar(value=columns[0])
+        default_column = initial_column if initial_column in columns else columns[0]
+        self.column_var = tk.StringVar(value=default_column)
         ttk.Combobox(
             body,
             textvariable=self.column_var,
@@ -592,6 +785,8 @@ class EISApplication:
         self.control = control
         self.circuit = circuit
         self._preferences_path = self._preferences_file_path()
+        self._procedure_library_blocks: dict[str, list[dict[str, str]]] = {}
+        self._procedure_library: dict[str, list[dict[str, object]]] = {}
         self._model_presets = self._load_preferences()
         self.analysis_mode_var = tk.StringVar(value="EEC")
         self.loaded: LoadedProject | None = None
@@ -599,6 +794,7 @@ class EISApplication:
         self.loaded_projects: dict[str, LoadedProject] = {}
         self._dataset_order: list[str] = []
         self._custom_metadata_columns: list[str] = []
+        self._last_metadata_edit_column: dict[str, str] = {}
         self._explorer_rows: dict[str, tuple[str, LoadedProject, SpectrumMetadata]] = (
             {}
         )
@@ -609,6 +805,7 @@ class EISApplication:
         self._explorer_anchor_item: str | None = None
         self._explorer_primary_item: str | None = None
         self._suspend_explorer_select = False
+        self._explorer_shift_double_click = False
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="eis-worker"
         )
@@ -629,6 +826,7 @@ class EISApplication:
         self._plot_imports = None
         self.plot_mode = "nyquist"
         self.procedure_blocks: dict[str, list[dict[str, str]]] = {}
+        self.procedures: dict[str, list[dict[str, object]]] = {}
         self.simulator_spectrum = None
         self.simulator_parameters: list[ParameterValue] = []
         self.simulator_drt_result = None
@@ -901,6 +1099,50 @@ class EISApplication:
         base = Path(app_data) if app_data else Path.home() / ".config"
         return base / "EIS_fitting" / "preferences.json"
 
+    @staticmethod
+    def _validate_procedure_data(
+        blocks_payload, procedures_payload
+    ) -> tuple[dict[str, list[dict[str, str]]], dict[str, list[dict[str, object]]]]:
+        blocks: dict[str, list[dict[str, str]]] = {}
+        if isinstance(blocks_payload, dict):
+            for name, raw_steps in blocks_payload.items():
+                if not isinstance(name, str) or not isinstance(raw_steps, list):
+                    continue
+                steps = [
+                    {"action": str(step["action"]), "parameter": str(step.get("parameter", ""))}
+                    for step in raw_steps
+                    if isinstance(step, dict) and isinstance(step.get("action"), str)
+                ]
+                if len(steps) == len(raw_steps):
+                    blocks[name] = steps
+        procedures: dict[str, list[dict[str, object]]] = {}
+        if isinstance(procedures_payload, dict):
+            for name, raw_entries in procedures_payload.items():
+                if not isinstance(name, str) or not isinstance(raw_entries, list):
+                    continue
+                entries = []
+                valid = True
+                for entry in raw_entries:
+                    if not isinstance(entry, dict) or not isinstance(entry.get("block"), str):
+                        valid = False
+                        break
+                    raw_steps = entry.get("steps", [])
+                    if not isinstance(raw_steps, list):
+                        valid = False
+                        break
+                    steps = [
+                        {"action": str(step["action"]), "parameter": str(step.get("parameter", ""))}
+                        for step in raw_steps
+                        if isinstance(step, dict) and isinstance(step.get("action"), str)
+                    ]
+                    if len(steps) != len(raw_steps):
+                        valid = False
+                        break
+                    entries.append({"block": entry["block"], "steps": steps})
+                if valid:
+                    procedures[name] = entries
+        return blocks, procedures
+
     def _load_preferences(self) -> tuple[str, ...]:
         self._fit_timeout_seconds = 10.0
         self._fit_pipeline_preference = "local only"
@@ -996,6 +1238,12 @@ class EISApplication:
                 self._auto_model_settings["max_num_peaks"] = max(
                     int(self._auto_model_settings["max_num_peaks"]), 1
                 )
+            (
+                self._procedure_library_blocks,
+                self._procedure_library,
+            ) = self._validate_procedure_data(
+                payload.get("procedure_blocks"), payload.get("procedures")
+            )
             circuits = payload.get("eec_circuits", [])
             if isinstance(circuits, list):
                 values = tuple(
@@ -1044,6 +1292,8 @@ class EISApplication:
         drt_explorer_y: str,
         explorer_column_order: list[str],
         explorer_new_columns_position: str,
+        procedure_blocks: dict[str, list[dict[str, str]]] | None = None,
+        procedures: dict[str, list[dict[str, object]]] | None = None,
     ) -> None:
         self._preferences_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self._preferences_path.with_suffix(".tmp")
@@ -1062,6 +1312,8 @@ class EISApplication:
                     "last_import_directory": str(self._last_import_directory),
                     "last_project_directory": str(self._last_project_directory),
                     "fit_timeout_seconds": self._fit_timeout_seconds,
+                    "procedure_blocks": procedure_blocks if procedure_blocks is not None else self._procedure_library_blocks,
+                    "procedures": procedures if procedures is not None else self._procedure_library,
                     "eec_optimizer": {
                         "pipeline": self.fit_pipeline_var.get(),
                         "seed": self.fit_seed_var.get(),
@@ -1076,6 +1328,30 @@ class EISApplication:
             encoding="utf-8",
         )
         temporary.replace(self._preferences_path)
+
+    def save_procedures_to_preferences(self) -> None:
+        """Store the current block/procedure library alongside other preferences."""
+        try:
+            self._save_preferences(
+                self._model_presets,
+                self._fit_explorer_x_preference,
+                self._drt_explorer_x_preference,
+                self._fit_explorer_y_preference,
+                self._drt_explorer_y_preference,
+                self._explorer_column_order_preference,
+                self._explorer_new_columns_position,
+                self.procedure_blocks,
+                self.procedures,
+            )
+            self._procedure_library_blocks = copy.deepcopy(self.procedure_blocks)
+            self._procedure_library = copy.deepcopy(self.procedures)
+            self._update_status("blocks and procedures saved to Preferences")
+        except (OSError, TypeError, ValueError) as error:
+            messagebox.showerror("Preferences save failed", str(error), parent=self.root)
+
+    def _autosave_procedures_to_project(self) -> None:
+        if self.project_path is not None and self.state is not None and not self.busy:
+            self.save_project(self.project_path)
 
     def open_preferences(self) -> None:
         existing = getattr(self, "preferences_popup", None)
@@ -1474,6 +1750,8 @@ class EISApplication:
                         for saved_order_item in order_list.get(0, tk.END)
                     ],
                     new_columns_position_var.get().casefold(),
+                    self.procedure_blocks,
+                    self.procedures,
                 )
             except (OSError, TypeError, ValueError) as error:
                 messagebox.showerror("Preferences save failed", str(error), parent=popup)
@@ -1488,6 +1766,8 @@ class EISApplication:
                 for saved_order_item in order_list.get(0, tk.END)
             ]
             self._explorer_new_columns_position = new_columns_position_var.get().casefold()
+            self._procedure_library_blocks = copy.deepcopy(self.procedure_blocks)
+            self._procedure_library = copy.deepcopy(self.procedures)
             if hasattr(self, "model_box"):
                 self.model_box.configure(values=self._model_presets)
             self._update_status("preferences saved")
@@ -2565,7 +2845,6 @@ class EISApplication:
             magnitude_handles + phase_handles,
             magnitude_labels + phase_labels,
             loc="best",
-            fontsize=8,
         )
 
     def _configure_plot_layout(self) -> None:
@@ -2693,7 +2972,7 @@ class EISApplication:
             (self.kk_imag_artist,) = self.kk_axes.plot(
                 [], [], "s-", color="#8e24aa", markersize=2.8, linewidth=1.0, label="Imag"
             )
-            self.kk_axes.legend(loc="best", fontsize=8)
+            self.kk_axes.legend(loc="best")
         else:
             self.kk_real_artist = None
             self.kk_imag_artist = None
@@ -2861,6 +3140,9 @@ class EISApplication:
             add="+",
         )
         self.explorer.bind("<Button-1>", self._on_explorer_click, add="+")
+        self.explorer.bind(
+            "<Shift-Double-Button-1>", self._on_explorer_shift_double_click, add="+"
+        )
         self.explorer.bind("<Double-Button-1>", self._on_explorer_double_click, add="+")
         self.explorer.bind("<Button-1>", self._on_explorer_heading_click, add="+")
         self.explorer.bind("<<TreeviewSelect>>", self._select_explorer_spectrum)
@@ -3027,7 +3309,12 @@ class EISApplication:
     def _refresh_explorer_schema(self) -> None:
         if not hasattr(self, "explorer"):
             return
-        columns = self._explorer_display_columns()
+        # Keep the Treeview's internal column order aligned with the order used
+        # when row values are constructed in _populate_explorer().  The visual
+        # order belongs in displaycolumns; using it for columns makes values
+        # appear under the wrong headings as soon as a custom column is added
+        # (especially when an explorer column-order preference is active).
+        columns = self._explorer_columns()
         self.explorer.configure(
             columns=columns,
             displaycolumns=self._explorer_display_columns(),
@@ -3453,10 +3740,10 @@ class EISApplication:
         popup = tk.Toplevel(self.root)
         self.procedure_builder_popup = popup
         popup.title("Procedure builder")
-        popup.geometry("760x560")
-        popup.minsize(640, 440)
+        popup.geometry("860x760")
+        popup.minsize(700, 600)
         popup.columnconfigure(0, weight=1)
-        popup.rowconfigure(3, weight=1)
+        popup.rowconfigure(5, weight=1)
 
         def close_popup() -> None:
             self.procedure_builder_popup = None
@@ -3474,6 +3761,8 @@ class EISApplication:
             "Initial values",
             "Fit current spectrum",
             "Fit selected",
+            "Refine fits",
+            "Find deterministic outliers",
             "Auto model (Hybrid DRT)",
             "Batch fit selected",
         ]
@@ -3484,18 +3773,28 @@ class EISApplication:
             "Find outliers in selected": "threshold (blank uses current value)",
             "Choose EEC model": "circuit, e.g. R0-L0-p(R1,CPE1)",
             "Go to spectrum…": "position in selected spectra: first, middle, last, or a number",
-            "Fit selected": "fits selected spectra using each spectrum's model and initial parameters",
-            "Auto model (Hybrid DRT)": "selects a Hybrid DRT discrete model for selected spectra",
+            "Initial values": "no parameters",
+            "Fit current spectrum": "no parameters",
+            "Fit selected": "fits selected spectra using each spectrum's model and initial parameters (no parameters)",
+            "Refine fits": "refines the existing fits for selected spectra using the current refinement settings",
+            "Find deterministic outliers": "detects and deactivates deterministic outliers in selected spectra using the current threshold",
+            "Auto model (Hybrid DRT)": "selects a Hybrid DRT discrete model for selected spectra (no parameters)",
             "Batch fit selected": "direction: up, down, or up and down",
         }
         top = ttk.Frame(popup, padding=10)
         top.grid(row=0, column=0, sticky="ew")
         top.columnconfigure(1, weight=1)
-        ttk.Label(top, text="Procedure name").grid(row=0, column=0, sticky="w")
-        name_var = tk.StringVar(value="Procedure 1")
+        ttk.Label(top, text="Block name").grid(row=0, column=0, sticky="w")
+        name_var = tk.StringVar(value="Block 1")
         ttk.Entry(top, textvariable=name_var).grid(row=0, column=1, padx=8, sticky="ew")
         block_var = tk.StringVar()
-        block_box = ttk.Combobox(top, textvariable=block_var, state="readonly", width=22)
+        block_box = ttk.Combobox(
+            top,
+            textvariable=block_var,
+            values=sorted(self.procedure_blocks),
+            state="readonly",
+            width=22,
+        )
         block_box.grid(row=0, column=2, sticky="e")
 
         add_frame = ttk.LabelFrame(popup, text="Add action", padding=8)
@@ -3512,14 +3811,22 @@ class EISApplication:
         parameter_controls.columnconfigure(0, weight=1)
         parameter_controls.columnconfigure(1, weight=1)
         parameter_controls.columnconfigure(2, weight=1)
+        parameter_controls.columnconfigure(3, weight=1)
         parameter_entry = ttk.Combobox(
             parameter_controls, textvariable=parameter_var, state="normal"
         )
-        parameter_entry.grid(row=0, column=0, columnspan=3, sticky="ew")
         select_column_var = tk.StringVar(value="All")
         select_operator_var = tk.StringVar(value="=")
         select_value_var = tk.StringVar()
         batch_direction_var = tk.StringVar(value="up")
+        refine_z_threshold_var = tk.StringVar(value=self.refine_z_threshold_var.get())
+        refine_max_iterations_var = tk.StringVar(value=self.refine_max_iterations_var.get())
+        parameterless_actions = {
+            "Initial values",
+            "Fit current spectrum",
+            "Fit selected",
+            "Auto model (Hybrid DRT)",
+        }
 
         def configure_parameter_input(action: str) -> None:
             for child in parameter_controls.winfo_children():
@@ -3554,6 +3861,21 @@ class EISApplication:
                     values=("up", "down", "up and down"),
                     state="readonly",
                 ).grid(row=0, column=0, columnspan=3, sticky="ew")
+            elif action == "Refine fits":
+                ttk.Label(parameter_controls, text="Z threshold").grid(
+                    row=0, column=0, padx=(0, 3), sticky="w"
+                )
+                ttk.Entry(
+                    parameter_controls, textvariable=refine_z_threshold_var, width=10
+                ).grid(row=0, column=1, padx=3, sticky="ew")
+                ttk.Label(parameter_controls, text="Max iterations").grid(
+                    row=0, column=2, padx=(8, 3), sticky="w"
+                )
+                ttk.Entry(
+                    parameter_controls, textvariable=refine_max_iterations_var, width=10
+                ).grid(row=0, column=3, padx=(3, 0), sticky="ew")
+            elif action in parameterless_actions:
+                return
             else:
                 parameter_entry.grid(row=0, column=0, columnspan=3, sticky="ew")
 
@@ -3564,6 +3886,10 @@ class EISApplication:
                 )
             if action_var.get() == "Batch fit selected":
                 return batch_direction_var.get()
+            if action_var.get() == "Refine fits":
+                return f"{refine_z_threshold_var.get().strip()},{refine_max_iterations_var.get().strip()}"
+            if action_var.get() in parameterless_actions:
+                return ""
             return parameter_var.get().strip()
 
         configure_parameter_input(action_var.get())
@@ -3575,8 +3901,129 @@ class EISApplication:
         arguments_frame = ttk.LabelFrame(popup, text="Procedure arguments (edit directly)", padding=8)
         arguments_frame.grid(row=2, column=0, padx=10, pady=(8, 0), sticky="ew")
 
+        procedure_entries: list[dict[str, object]] = []
+        procedure_name_var = tk.StringVar(value="Procedure 1")
+        procedure_block_var = tk.StringVar()
+        procedure_var = tk.StringVar()
+        procedure_frame = ttk.LabelFrame(
+            popup, text="Build procedure from blocks", padding=8
+        )
+        procedure_frame.grid(row=3, column=0, padx=10, pady=(8, 0), sticky="ew")
+        procedure_frame.columnconfigure(1, weight=1)
+        procedure_frame.columnconfigure(3, weight=1)
+        procedure_frame.columnconfigure(5, weight=1)
+        ttk.Label(procedure_frame, text="Procedure name").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Entry(procedure_frame, textvariable=procedure_name_var, width=18).grid(
+            row=0, column=1, padx=(6, 12), sticky="ew"
+        )
+        ttk.Label(procedure_frame, text="Block").grid(row=0, column=2, sticky="w")
+        procedure_block_box = ttk.Combobox(
+            procedure_frame, textvariable=procedure_block_var, state="readonly", width=20
+        )
+        procedure_block_box.grid(row=0, column=3, padx=6, sticky="ew")
+        ttk.Label(procedure_frame, text="Saved procedure").grid(
+            row=0, column=4, padx=(12, 4), sticky="w"
+        )
+        procedure_box = ttk.Combobox(
+            procedure_frame,
+            textvariable=procedure_var,
+            values=sorted(self.procedures),
+            state="readonly",
+            width=20,
+        )
+        procedure_box.grid(row=0, column=5, sticky="ew")
+        procedure_list = tk.Listbox(
+            procedure_frame, height=4, exportselection=False, activestyle="dotbox"
+        )
+        procedure_list.grid(row=1, column=0, columnspan=4, pady=(6, 0), sticky="ew")
+
+        def render_procedure_entries() -> None:
+            procedure_list.delete(0, tk.END)
+            for index, entry in enumerate(procedure_entries, 1):
+                block_name = str(entry.get("block", ""))
+                entry_steps = entry.get("steps", [])
+                procedure_list.insert(
+                    tk.END, f"{index}. {block_name} ({len(entry_steps)} actions)"
+                )
+
+        def add_procedure_block() -> None:
+            block_name = procedure_block_var.get().strip()
+            if block_name not in self.procedure_blocks:
+                messagebox.showwarning(
+                    "No block selected", "Save a block and select it first.", parent=popup
+                )
+                return
+            procedure_entries.append(
+                {
+                    "block": block_name,
+                    "steps": copy.deepcopy(self.procedure_blocks[block_name]),
+                }
+            )
+            render_procedure_entries()
+            procedure_list.selection_set(tk.END)
+
+        def remove_procedure_block() -> None:
+            selection = procedure_list.curselection()
+            if selection:
+                procedure_entries.pop(int(selection[0]))
+                render_procedure_entries()
+
+        def edit_procedure_block() -> None:
+            selection = procedure_list.curselection()
+            if not selection:
+                return
+            entry = procedure_entries[int(selection[0])]
+            name_var.set(str(entry.get("block", "")))
+            steps[:] = copy.deepcopy(entry.get("steps", []))
+            render_steps()
+
+        def update_procedure_block() -> None:
+            selection = procedure_list.curselection()
+            if not selection:
+                return
+            entry = procedure_entries[int(selection[0])]
+            entry["steps"] = copy.deepcopy(steps)
+            render_procedure_entries()
+            procedure_list.selection_set(int(selection[0]))
+            self._autosave_procedures_to_project()
+
+        procedure_buttons = ttk.Frame(procedure_frame)
+        procedure_buttons.grid(row=2, column=0, columnspan=4, pady=(6, 0), sticky="w")
+        ttk.Button(procedure_buttons, text="Add block", command=add_procedure_block).pack(
+            side=tk.LEFT
+        )
+        ttk.Button(
+            procedure_buttons, text="Edit selected", command=edit_procedure_block
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            procedure_buttons, text="Update selected", command=update_procedure_block
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            procedure_buttons, text="Remove block", command=remove_procedure_block
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            procedure_buttons, text="Save procedure", command=lambda: save_procedure()
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(
+            procedure_buttons, text="New procedure", command=lambda: new_procedure()
+        ).pack(side=tk.LEFT, padx=4)
+
+        repeat_frame = ttk.LabelFrame(
+            popup, text="Repeat block for input values (optional)", padding=8
+        )
+        repeat_frame.grid(row=4, column=0, padx=10, pady=(8, 0), sticky="ew")
+        repeat_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            repeat_frame,
+            text="Enter one value per line. Use {input} in an action parameter; the block runs once per value.",
+        ).grid(row=0, column=0, sticky="w")
+        repeat_values_text = tk.Text(repeat_frame, height=3, width=40, wrap=tk.NONE)
+        repeat_values_text.grid(row=1, column=0, sticky="ew", pady=(3, 0))
+
         list_frame = ttk.LabelFrame(popup, text="Actions in procedure", padding=8)
-        list_frame.grid(row=3, column=0, padx=10, pady=(8, 0), sticky="nsew")
+        list_frame.grid(row=5, column=0, padx=10, pady=(8, 0), sticky="nsew")
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
         action_list = tk.Listbox(list_frame, activestyle="dotbox", exportselection=False)
@@ -3684,6 +4131,44 @@ class EISApplication:
                         state="readonly",
                         width=18,
                     )
+                elif step["action"] == "Refine fits":
+                    values = [part.strip() for part in parameter.split(",", 1)]
+                    if len(values) == 1:
+                        values.append("")
+                    refinement_frame = ttk.Frame(arguments_frame)
+                    refinement_frame.columnconfigure(1, weight=1)
+                    refinement_frame.columnconfigure(3, weight=1)
+                    ttk.Label(refinement_frame, text="Z threshold").grid(
+                        row=0, column=0, padx=(0, 3), sticky="w"
+                    )
+                    refinement_z_var = tk.StringVar(value=values[0])
+                    ttk.Entry(
+                        refinement_frame, textvariable=refinement_z_var, width=8
+                    ).grid(row=0, column=1, padx=(0, 5), sticky="ew")
+                    ttk.Label(refinement_frame, text="Max iterations").grid(
+                        row=0, column=2, padx=(0, 3), sticky="w"
+                    )
+                    refinement_iterations_var = tk.StringVar(value=values[1])
+                    ttk.Entry(
+                        refinement_frame,
+                        textvariable=refinement_iterations_var,
+                        width=8,
+                    ).grid(row=0, column=3, sticky="ew")
+
+                    def update_refinement_argument(
+                        *_args, selected=index - 1
+                    ) -> None:
+                        if selected < len(steps):
+                            steps[selected]["parameter"] = (
+                                f"{refinement_z_var.get().strip()},"
+                                f"{refinement_iterations_var.get().strip()}"
+                            )
+
+                    refinement_z_var.trace_add("write", update_refinement_argument)
+                    refinement_iterations_var.trace_add("write", update_refinement_argument)
+                    argument_entry = refinement_frame
+                elif step["action"] in parameterless_actions:
+                    argument_entry = None
                 else:
                     argument_entry = ttk.Entry(arguments_frame, textvariable=argument_var, width=18)
                 if step["action"] == "Sort spectra by metadata":
@@ -3698,8 +4183,9 @@ class EISApplication:
                         state="normal",
                         width=18,
                     )
-                argument_entry.grid(row=1, column=index - 1, padx=4, pady=(3, 0), sticky="ew")
-                argument_entry.bind("<FocusOut>", lambda _event: render_steps())
+                if argument_entry is not None:
+                    argument_entry.grid(row=1, column=index - 1, padx=4, pady=(3, 0), sticky="ew")
+                    argument_entry.bind("<FocusOut>", lambda _event: render_steps())
 
         def selected_index() -> int | None:
             selection = action_list.curselection()
@@ -3728,7 +4214,7 @@ class EISApplication:
 
         def new_block() -> None:
             steps.clear()
-            name_var.set(f"Procedure {len(self.procedure_blocks) + 1}")
+            name_var.set(f"Block {len(self.procedure_blocks) + 1}")
             render_steps()
 
         def save_block() -> None:
@@ -3738,14 +4224,84 @@ class EISApplication:
                 return
             self.procedure_blocks[name] = copy.deepcopy(steps)
             block_box.configure(values=sorted(self.procedure_blocks))
+            procedure_block_box.configure(values=sorted(self.procedure_blocks))
             block_var.set(name)
+            self._autosave_procedures_to_project()
+            self._update_status(f"block '{name}' saved in this session")
+
+        def save_procedure() -> None:
+            name = procedure_name_var.get().strip()
+            if not name:
+                messagebox.showerror("Missing name", "Enter a procedure name.", parent=popup)
+                return
+            if not procedure_entries:
+                messagebox.showwarning(
+                    "Empty procedure", "Add at least one block first.", parent=popup
+                )
+                return
+            self.procedures[name] = copy.deepcopy(procedure_entries)
+            procedure_box.configure(values=sorted(self.procedures))
+            procedure_var.set(name)
+            self._autosave_procedures_to_project()
             self._update_status(f"procedure '{name}' saved in this session")
+
+        def load_procedure(_event=None) -> None:
+            name = procedure_var.get()
+            if name not in self.procedures:
+                return
+            procedure_entries[:] = copy.deepcopy(self.procedures[name])
+            procedure_name_var.set(name)
+            render_procedure_entries()
+
+        def new_procedure() -> None:
+            procedure_entries.clear()
+            procedure_name_var.set(f"Procedure {len(self.procedures) + 1}")
+            procedure_var.set("")
+            render_procedure_entries()
+
+        def load_procedures_from_preferences() -> None:
+            self.procedure_blocks = copy.deepcopy(self._procedure_library_blocks)
+            self.procedures = copy.deepcopy(self._procedure_library)
+            block_box.configure(values=sorted(self.procedure_blocks))
+            procedure_block_box.configure(values=sorted(self.procedure_blocks))
+            procedure_box.configure(values=sorted(self.procedures))
+            self._update_status("blocks and procedures loaded from Preferences")
+
+        def run_procedure() -> None:
+            if not procedure_entries:
+                messagebox.showwarning(
+                    "Empty procedure", "Add at least one block first.", parent=popup
+                )
+                return
+            procedure_steps = [
+                step
+                for entry in procedure_entries
+                for step in copy.deepcopy(entry.get("steps", []))
+            ]
+            if self.busy:
+                self._update_status("wait for the current operation to finish")
+                return
+            input_values = [
+                line.strip()
+                for line in repeat_values_text.get("1.0", tk.END).splitlines()
+                if line.strip()
+            ]
+            try:
+                run_steps = self._expand_procedure_inputs(procedure_steps, input_values)
+            except ValueError as error:
+                messagebox.showerror("Invalid repeat inputs", str(error), parent=popup)
+                return
+            self._procedure_running = True
+            self._run_procedure_steps(run_steps, 0)
 
         def save_to_file() -> None:
             name = name_var.get().strip()
             if name:
                 self.procedure_blocks[name] = copy.deepcopy(steps)
-            if not self.procedure_blocks:
+            procedure_name = procedure_name_var.get().strip()
+            if procedure_name and procedure_entries:
+                self.procedures[procedure_name] = copy.deepcopy(procedure_entries)
+            if not self.procedure_blocks and not self.procedures:
                 messagebox.showwarning("No procedures", "Add and save a procedure first.", parent=popup)
                 return
             path = filedialog.asksaveasfilename(
@@ -3758,8 +4314,10 @@ class EISApplication:
                 return
             payload = {
                 "format": "eisfit-procedures-v1",
-                "procedures": self.procedure_blocks,
-                "active": name,
+                "procedure_blocks": self.procedure_blocks,
+                "procedures": self.procedures,
+                "active_block": name,
+                "active_procedure": procedure_name,
             }
             try:
                 Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -3779,32 +4337,37 @@ class EISApplication:
                 return
             try:
                 payload = json.loads(Path(path).read_text(encoding="utf-8"))
-                loaded_blocks = payload.get("procedures")
-                if not isinstance(loaded_blocks, dict):
-                    raise ValueError("the file does not contain procedure blocks")
-                validated: dict[str, list[dict[str, str]]] = {}
-                for block_name, block_steps in loaded_blocks.items():
-                    if not isinstance(block_name, str) or not isinstance(block_steps, list):
-                        raise ValueError("invalid procedure block")
-                    validated_steps = []
-                    for step in block_steps:
-                        if not isinstance(step, dict) or not isinstance(step.get("action"), str):
-                            raise ValueError("invalid procedure action")
-                        validated_steps.append(
-                            {"action": step["action"], "parameter": str(step.get("parameter", ""))}
-                        )
-                    validated[block_name] = validated_steps
+                loaded_blocks = payload.get("procedure_blocks")
+                loaded_procedures = payload.get(
+                    "procedures", payload.get("procedure_definitions")
+                )
+                # Earlier block-only files stored blocks under ``procedures``.
+                if loaded_blocks is None and isinstance(loaded_procedures, dict):
+                    loaded_blocks = loaded_procedures
+                    loaded_procedures = {}
+                validated, validated_procedures = self._validate_procedure_data(
+                    loaded_blocks, loaded_procedures
+                )
+                if not validated and not validated_procedures:
+                    raise ValueError("the file does not contain valid blocks or procedures")
             except (OSError, json.JSONDecodeError, ValueError) as error:
                 messagebox.showerror("Load procedures failed", str(error), parent=popup)
                 return
             self.procedure_blocks = validated
             block_box.configure(values=sorted(self.procedure_blocks))
-            active_name = payload.get("active")
-            if active_name not in self.procedure_blocks:
-                active_name = next(iter(self.procedure_blocks), None)
-            if active_name is not None:
-                block_var.set(active_name)
+            procedure_block_box.configure(values=sorted(self.procedure_blocks))
+            self.procedures = validated_procedures
+            procedure_box.configure(values=sorted(self.procedures))
+            active_block = payload.get("active_block")
+            if active_block not in self.procedure_blocks:
+                active_block = next(iter(self.procedure_blocks), None)
+            if active_block is not None:
+                block_var.set(active_block)
                 load_block()
+            active_procedure = payload.get("active_procedure")
+            if active_procedure in self.procedures:
+                procedure_var.set(active_procedure)
+                load_procedure()
             self._update_status(f"procedures loaded from {Path(path).name}")
 
         def load_block(_event=None) -> None:
@@ -3822,8 +4385,20 @@ class EISApplication:
             if self.busy:
                 self._update_status("wait for the current operation to finish")
                 return
+            input_values = [
+                line.strip()
+                for line in repeat_values_text.get("1.0", tk.END).splitlines()
+                if line.strip()
+            ]
+            try:
+                run_steps = self._expand_procedure_inputs(
+                    copy.deepcopy(steps), input_values
+                )
+            except ValueError as error:
+                messagebox.showerror("Invalid repeat inputs", str(error), parent=popup)
+                return
             self._procedure_running = True
-            self._run_procedure_steps(copy.deepcopy(steps), 0)
+            self._run_procedure_steps(run_steps, 0)
 
         def update_parameter_choices(_event=None) -> None:
             configure_parameter_input(action_var.get())
@@ -3852,11 +4427,12 @@ class EISApplication:
             ),
         )
         block_box.bind("<<ComboboxSelected>>", load_block)
+        procedure_box.bind("<<ComboboxSelected>>", load_procedure)
         ttk.Button(add_frame, text="Add", command=add_step).grid(
             row=0, column=3, padx=(8, 0), sticky="e"
         )
         buttons = ttk.Frame(popup, padding=10)
-        buttons.grid(row=4, column=0, sticky="ew")
+        buttons.grid(row=5, column=0, sticky="ew")
         ttk.Button(buttons, text="Remove", command=remove_step).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Move up", command=lambda: move_step(-1)).pack(side=tk.LEFT, padx=4)
         ttk.Button(buttons, text="Move down", command=lambda: move_step(1)).pack(side=tk.LEFT)
@@ -3864,8 +4440,39 @@ class EISApplication:
         ttk.Button(buttons, text="Save block", command=save_block).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Save to file", command=save_to_file).pack(side=tk.LEFT, padx=4)
         ttk.Button(buttons, text="Load from file", command=load_from_file).pack(side=tk.LEFT)
+        ttk.Button(
+            buttons, text="Save to Preferences", command=self.save_procedures_to_preferences
+        ).pack(side=tk.LEFT, padx=4)
+        ttk.Button(
+            buttons,
+            text="Load from Preferences",
+            command=load_procedures_from_preferences,
+        ).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Run block", command=run_block).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Run procedure", command=run_procedure).pack(
+            side=tk.RIGHT, padx=4
+        )
         ttk.Button(buttons, text="Close", command=close_popup).pack(side=tk.RIGHT, padx=4)
+
+    @staticmethod
+    def _expand_procedure_inputs(
+        steps: list[dict[str, str]], input_values: list[str]
+    ) -> list[dict[str, str]]:
+        """Expand a procedure block once for each optional ``{input}`` value."""
+        if not input_values:
+            return steps
+        if not any("{input}" in step.get("parameter", "") for step in steps):
+            raise ValueError(
+                "repeat values require {input} in at least one action parameter"
+            )
+        return [
+            {
+                **step,
+                "parameter": step.get("parameter", "").replace("{input}", value),
+            }
+            for value in input_values
+            for step in steps
+        ]
 
     def _procedure_column(self, value: str) -> str:
         candidate = value.strip()
@@ -4001,6 +4608,18 @@ class EISApplication:
             return
         if action == "Fit selected":
             self.fit_selected()
+            return
+        if action == "Refine fits":
+            if parameter:
+                values = [part.strip() for part in parameter.split(",", 1)]
+                if len(values) != 2 or not all(values):
+                    raise ValueError("refine fits requires z threshold,max iterations")
+                self.refine_z_threshold_var.set(values[0])
+                self.refine_max_iterations_var.set(values[1])
+            self.refine_fit_selected()
+            return
+        if action == "Find deterministic outliers":
+            self.remove_deterministic_outliers()
             return
         if action == "Batch fit selected":
             direction = parameter.casefold().strip()
@@ -4376,16 +4995,48 @@ class EISApplication:
         clicked_value = self._format_explorer_value(
             self._explorer_value(row[1], row[2], column), column
         )
-        matching_items = []
-        for candidate, (_dataset_id, loaded, spectrum) in self._explorer_rows.items():
-            value = self._format_explorer_value(
-                self._explorer_value(loaded, spectrum, column), column
-            )
-            if value == clicked_value:
-                matching_items.append(candidate)
+        if bool(event.state & 0x0001) or self._explorer_shift_double_click:
+            visible_items = list(self.explorer.get_children(""))
+            clicked_index = visible_items.index(item)
+            matching_items = [item]
+            for direction in (-1, 1):
+                index = clicked_index + direction
+                while 0 <= index < len(visible_items):
+                    candidate = visible_items[index]
+                    candidate_row = self._explorer_rows.get(candidate)
+                    if candidate_row is None:
+                        break
+                    candidate_value = self._format_explorer_value(
+                        self._explorer_value(
+                            candidate_row[1], candidate_row[2], column
+                        ),
+                        column,
+                    )
+                    if candidate_value != clicked_value:
+                        break
+                    if direction < 0:
+                        matching_items.insert(0, candidate)
+                    else:
+                        matching_items.append(candidate)
+                    index += direction
+        else:
+            matching_items = []
+            for candidate, (_dataset_id, loaded, spectrum) in self._explorer_rows.items():
+                value = self._format_explorer_value(
+                    self._explorer_value(loaded, spectrum, column), column
+                )
+                if value == clicked_value:
+                    matching_items.append(candidate)
         self._set_explorer_selection(matching_items, primary=item)
         self._activate_explorer_item(item)
         return "break"
+
+    def _on_explorer_shift_double_click(self, event):
+        self._explorer_shift_double_click = True
+        self.root.after_idle(
+            lambda: setattr(self, "_explorer_shift_double_click", False)
+        )
+        return self._on_explorer_double_click(event)
 
     def _set_explorer_selection(
         self,
@@ -7846,7 +8497,7 @@ class EISApplication:
             label="Peak sum",
         )
         self._update_drt_peak_table()
-        self.drt_axes.legend(loc="best", fontsize=8)
+        self.drt_axes.legend(loc="best")
 
     def add_drt_peak(self, shape: str = "gaussian") -> None:
         tau, gamma = self._current_drt_arrays()
@@ -11546,6 +12197,8 @@ class EISApplication:
         toolbar.update()
         toolbar.grid(row=1, column=0, sticky="ew")
 
+        line_tool = _ExplorerLineTool(axes, canvas, controls, lambda: refresh_plot())
+
         range_state: dict[str, tuple[tk.DoubleVar, tk.DoubleVar, float, float]] = {}
         range_labels: dict[str, tk.StringVar] = {}
         range_widgets: dict[str, list[tk.Widget]] = {}
@@ -11730,8 +12383,10 @@ class EISApplication:
             axes.set_ylabel(" / ".join(y_labels))
             axes.set_xscale("log" if x_log.get() else "linear")
             axes.set_yscale("log" if y_log.get() else "linear")
+            line_tool.set_data(plotted_values)
+            line_tool.redraw()
             if plotted_groups and not hide_legend.get():
-                axes.legend(loc="best", fontsize=8)
+                axes.legend(loc="best")
             canvas.draw_idle()
 
         def toggle_legend(_event=None):
@@ -11759,6 +12414,7 @@ class EISApplication:
                     y_box.configure(values=[])
                     split_box.configure(values=["None"])
                 axes.clear()
+                line_tool.set_data([])
                 canvas.draw_idle()
                 self._update_status(f"no {current_mode} parameters are available")
                 return
@@ -12071,6 +12727,8 @@ class EISApplication:
         toolbar.update()
         toolbar.grid(row=1, column=0, sticky="ew")
 
+        line_tool = _ExplorerLineTool(axes, canvas, controls, lambda: refresh_plot())
+
         range_state: dict[str, tuple[tk.DoubleVar, tk.DoubleVar, float, float]] = {}
         range_labels: dict[str, tk.StringVar] = {}
         range_widgets: dict[str, list[tk.Widget]] = {}
@@ -12254,8 +12912,10 @@ class EISApplication:
             axes.set_ylabel(" / ".join(y_labels))
             axes.set_xscale("log" if x_log.get() else "linear")
             axes.set_yscale("log" if y_log.get() else "linear")
+            line_tool.set_data(plotted_values)
+            line_tool.redraw()
             if plotted_groups and not hide_legend.get():
-                axes.legend(loc="best", fontsize=8)
+                axes.legend(loc="best")
             canvas.draw_idle()
 
         def toggle_legend(_event=None):
@@ -12325,6 +12985,13 @@ class EISApplication:
                 continue
             callback()
 
+    def _metadata_edit_project_key(self) -> str:
+        if self.project_path is not None:
+            return str(self.project_path.resolve())
+        if self.loaded is not None:
+            return f"source::{self.loaded.state.source_path.resolve()}"
+        return "session"
+
     def edit_metadata_column_from_clipboard(self) -> None:
         if self.busy or self.state is None:
             return
@@ -12341,6 +13008,7 @@ class EISApplication:
             self.root,
             len(selected_rows),
             editable_columns,
+            self._last_metadata_edit_column.get(self._metadata_edit_project_key()),
         )
         self.root.wait_window(dialog)
         if dialog.result is None:
@@ -12353,6 +13021,7 @@ class EISApplication:
                 parent=self.root,
             )
             return
+        project_key = self._metadata_edit_project_key()
         if create_new:
             reserved_names = {
                 "source_file",
@@ -12478,6 +13147,7 @@ class EISApplication:
                 else:
                     loaded.dataframe[column_name] = value
         self._populate_explorer()
+        self._last_metadata_edit_column[project_key] = column_name
         self._update_status(f"metadata column '{column_name}' updated")
 
     def paste_metadata_column_from_clipboard(self) -> None:
@@ -13024,7 +13694,6 @@ class EISApplication:
                     magnitude_handles + phase_handles,
                     magnitude_labels + phase_labels,
                     loc="best",
-                    fontsize=8,
                 )
             else:
                 axes = figure.add_subplot(111)
@@ -13064,7 +13733,7 @@ class EISApplication:
                     x_min, x_max, y_min, y_max = limits
                     axes.set_xlim(x_min, x_max)
                     axes.set_ylim(y_min, y_max)
-                axes.legend(loc="best", fontsize=8)
+                axes.legend(loc="best")
             popup_axes["main"] = axes
             popup_axes["phase"] = phase_axes
             toggle_button.configure(
@@ -13212,7 +13881,7 @@ class EISApplication:
                 axes.set_xlim(x_min, x_max)
                 axes.set_ylim(y_min, y_max)
             axes.set_title("Ridge DRT" if mode_state["value"] == "ridge" else "Hybrid DRT")
-            axes.legend(loc="best", fontsize=8)
+            axes.legend(loc="best")
             canvas.draw_idle()
 
         def _reset_popup_view() -> None:
@@ -13586,7 +14255,13 @@ class EISApplication:
                 for dataset_id in ordered_dataset_ids
                 if dataset_id is not None and dataset_id in self.loaded_projects
             ]
-            save_project_file(self.state, project_path, datasets=datasets)
+            save_project_file(
+                self.state,
+                project_path,
+                datasets=datasets,
+                procedure_blocks=self.procedure_blocks,
+                procedures=self.procedures,
+            )
         except Exception as error:
             messagebox.showerror(
                 "Project save failed",
@@ -14039,6 +14714,10 @@ class EISApplication:
         self.current_dataset_id = dataset_id
         self.loaded = loaded
         self.state = restored
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.procedure_blocks, self.procedures = self._validate_procedure_data(
+            payload.get("procedure_blocks"), payload.get("procedures")
+        )
         self._saved_project_signature = self._project_signature()
         self.control = restored.control
         self.circuit = restored.circuit

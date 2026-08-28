@@ -306,8 +306,14 @@ def save_project_file(
     state: ProjectState,
     path: Path,
     datasets: list[tuple[str, ProjectState, object]] | None = None,
+    procedure_blocks: dict[str, list[dict[str, str]]] | None = None,
+    procedures: dict[str, list[dict[str, object]]] | None = None,
 ) -> None:
     payload = _state_to_payload(state)
+    if procedure_blocks is not None:
+        payload["procedure_blocks"] = procedure_blocks
+    if procedures is not None:
+        payload["procedures"] = procedures
     if datasets:
         payload["datasets"] = [
             {

@@ -1,9 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from eis_model import CycleState, ParameterValue
-from eis_services import FitOptions, FitResult, fit_cycle
+from eis_services import FitOptions, FitResult, fit_cycle, refine_fit_cycle
 from spectrum_simulator import simulate_spectrum
 
 
@@ -43,6 +44,41 @@ class FitOptimizerTests(unittest.TestCase):
         parameters[0].initial = 1.25
         result = fit_cycle(cycle, "R0-p(R1,CPE1)", parameters)
         self.assertEqual(result.fitted_parameters[0], 1.25)
+
+    def test_refine_can_run_more_than_one_iteration(self):
+        frequency = np.arange(1.0, 9.0)
+        impedance = np.array([0, 0, 0, 0, 0, 0, 10, 100], dtype=complex)
+        parameters = [ParameterValue("R0", "ohm", 1.0, 0.0, 10.0)]
+        cycle = CycleState(
+            1,
+            frequency,
+            impedance,
+            parameters=parameters,
+            fit_parameters=np.array([1.0]),
+            fit_frequency_hz=frequency.copy(),
+            fit_impedance=np.zeros(frequency.size, dtype=complex),
+            fit_at_data_impedance=np.zeros(frequency.size, dtype=complex),
+        )
+        updated_fit = FitResult(
+            fitted_parameters=np.array([1.0]),
+            errors_percent=np.array([0.0]),
+            fit_frequency_hz=frequency.copy(),
+            fit_impedance=np.zeros(frequency.size, dtype=complex),
+            fit_at_data_impedance=np.zeros(frequency.size, dtype=complex),
+            objective=0.0,
+            rmse=0.0,
+            converged=True,
+        )
+
+        with patch("eis_services.fit_cycle", return_value=updated_fit) as fit:
+            result, removed_indices, iterations = refine_fit_cycle(
+                cycle, "R0", parameters, z_threshold=0.5, max_iterations=2
+            )
+
+        self.assertIsInstance(result, FitResult)
+        self.assertEqual(fit.call_count, 2)
+        self.assertEqual(iterations, 2)
+        self.assertGreater(removed_indices.size, 0)
 
 
 if __name__ == "__main__":
