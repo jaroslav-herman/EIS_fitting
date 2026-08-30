@@ -11,6 +11,7 @@ class SpectrumPreprocessor:
     grid_size: int = 64
     use_metadata: bool = False
     spectrum_mode: str = "raw"
+    include_impedance_scale: bool = False
     frequency_grid_: np.ndarray | None = None
     fill_values_: np.ndarray | None = None
     metadata_mean_: np.ndarray | None = None
@@ -28,7 +29,13 @@ class SpectrumPreprocessor:
         raw = np.vstack([self._spectrum_features(record) for record in records])
         self.fill_values_ = np.nanmean(raw, axis=0)
         self.fill_values_[~np.isfinite(self.fill_values_)] = 0.0
+        # The impedance traces below are normalized by their per-spectrum
+        # magnitude so that shape models are not dominated by units.  Keep
+        # the scale separately: without it R0 and L0 cannot be inferred in
+        # physical units from otherwise identical normalized spectra.
         self.feature_names_ = [f"logf_{i:03d}" for i in range(self.grid_size)] + [f"zreal_{i:03d}" for i in range(self.grid_size)] + [f"zimag_{i:03d}" for i in range(self.grid_size)]
+        if self.include_impedance_scale:
+            self.feature_names_.append("log_impedance_scale")
         if self.use_metadata:
             metadata = np.asarray([[r.voltage, r.current, r.time] for r in records], dtype=float)
             self.metadata_mean_ = np.nanmean(metadata, axis=0)
@@ -51,7 +58,10 @@ class SpectrumPreprocessor:
         imag = np.interp(grid, logf, z.imag, left=np.nan, right=np.nan) / scale
         # log-frequency is represented by the common grid; NaNs mark missing
         # regions and are filled only with training-fold statistics in transform.
-        return np.concatenate([grid, real, imag])
+        features = np.concatenate([grid, real, imag])
+        if self.include_impedance_scale:
+            features = np.concatenate([features, [np.log10(scale)]])
+        return features
 
     def transform(self, records: list[SpectrumRecord]) -> np.ndarray:
         if self.frequency_grid_ is None or self.fill_values_ is None:

@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import copy
 from io import BytesIO
 import json
+import joblib
 import os
 from pathlib import Path
 import re
@@ -75,8 +76,8 @@ from eis_services import (
     load_projects,
     select_eec_model_from_hybrid_drt,
 )
-from ml.gui_results import MLResult, load_ml_results, suggested_eec
-from ml.results_schema import spectrum_identifier
+from ml.gui_results import MLResult, load_ml_results, load_ml_results_payload, suggested_eec
+from ml.results_schema import spectrum_identifier, write_ml_results
 from ml.point_validity import detect_outliers_in_active_points
 from ml.runtime_inference import (
     discover_pretrained_artifacts,
@@ -84,6 +85,7 @@ from ml.runtime_inference import (
     make_runtime_spectrum,
     save_runtime_results,
 )
+from ml.number_aware_pipeline import infer_bundle_records, load_pipeline_bundle
 from spectrum_simulator import logarithmic_frequencies, simulate_spectrum
 from extract_relaxis import export_to_eisfit_json
 from explorer_filter import (
@@ -114,6 +116,10 @@ MODEL_PRESETS = (
     "R0-p(R1,C1)",
     "R0-p(R1,CPE1)-W1",
 )
+
+ML_TRAINED_MODELS = {
+    "Sputtered cathode": Path(__file__).resolve().parent / "ml" / "analysis" / "number_aware_pipeline_455" / "pipeline.joblib",
+}
 
 
 def _configure_matplotlib_without_tex() -> None:
@@ -1908,11 +1914,6 @@ class EISApplication:
         self.ml_controls.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
         ttk.Button(
             self.ml_controls,
-            text="Load ML results…",
-            command=self.load_ml_results,
-        ).pack(side=tk.LEFT)
-        ttk.Button(
-            self.ml_controls,
             text="ML processing…",
             command=self.open_ml_processing,
         ).pack(side=tk.LEFT, padx=(8, 0))
@@ -1933,12 +1934,7 @@ class EISApplication:
         ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(
             self.ml_controls,
-            text="Apply ML Active Points",
-            command=self.apply_ml_active_points_to_selected,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            self.ml_controls,
-            text="Load ML Initial Parameters",
+            text="Apply ML Initial Parameters",
             command=self.load_and_apply_ml_initial_parameters,
         ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(
@@ -6816,7 +6812,7 @@ class EISApplication:
             self.ml_results_status_var.set("No ML results found")
 
     def open_ml_processing(self) -> None:
-        """Open the staged ML application dialog for explorer-selected spectra."""
+        """Configure and run an ordered ML/EEC pipeline on selected spectra."""
         if self.busy or self.state is None:
             return
         selected_rows = self._selected_spectrum_rows()
@@ -6837,33 +6833,61 @@ class EISApplication:
         popup.resizable(False, False)
         frame = ttk.Frame(popup, padding=12)
         frame.grid(sticky="nsew")
-        ttk.Label(
-            frame,
-            text=f"Selected spectra: {len(selected_rows)}\nChoose the operations to apply in order.",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        options = {
-            "frequency": tk.BooleanVar(value=True),
-            "active_points": tk.BooleanVar(value=True),
-            "model": tk.BooleanVar(value=True),
-            "initial_parameters": tk.BooleanVar(value=True),
-            "fit": tk.BooleanVar(value=True),
+        ttk.Label(frame, text=f"Selected spectra: {len(selected_rows)}").grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text="Trained model").grid(row=1, column=0, sticky="w", pady=(8, 2))
+        model_var = tk.StringVar(value="Sputtered cathode")
+        ttk.Combobox(frame, textvariable=model_var, values=tuple(ML_TRAINED_MODELS), state="readonly", width=28).grid(row=1, column=1, sticky="ew", pady=(8, 2))
+        ttk.Label(frame, text="Pipeline actions (top to bottom)").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        action_labels = {
+            "frequency": "ML frequency range",
+            "outliers": "Deterministic outliers removal",
+            "model": "ML EEC model selection",
+            "initial_parameters": "ML initial parameters",
+            "fit": "Fit selected spectra",
+            "refine": "Refine fit",
         }
-        labels = (
-            ("frequency", "ML frequency selection"),
-            ("active_points", "ML active points / outliers"),
-            ("model", "ML EEC model selection"),
-            ("initial_parameters", "ML initial parameters"),
-            ("fit", "Run conventional EEC fit automatically"),
-        )
-        for row, (key, label) in enumerate(labels, start=1):
-            ttk.Checkbutton(frame, text=label, variable=options[key]).grid(
-                row=row, column=0, columnspan=2, sticky="w", pady=2
-            )
-        ttk.Label(
-            frame,
-            text="ML predictions are applied to the selected spectra; the final fit is the normal numerical EEC fit.",
-            wraplength=420,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 10))
+        action_values = tuple(action_labels)
+        actions = ["frequency", "outliers", "model", "initial_parameters", "fit", "refine"]
+        action_var = tk.StringVar(value="frequency")
+        action_box = ttk.Combobox(frame, textvariable=action_var, values=action_values, state="readonly", width=22)
+        action_box.grid(row=3, column=0, sticky="ew")
+        action_list = tk.Listbox(frame, height=6, width=38, exportselection=False)
+        action_list.grid(row=3, column=1, rowspan=3, sticky="ew", padx=(8, 0))
+        def render_actions():
+            action_list.delete(0, tk.END)
+            for action in actions:
+                action_list.insert(tk.END, action_labels[action])
+        def add_action():
+            actions.append(action_var.get()); render_actions()
+        def remove_action():
+            selection = action_list.curselection()
+            if selection: actions.pop(selection[0]); render_actions()
+        def move_action(direction):
+            selection = action_list.curselection()
+            if not selection: return
+            index = selection[0]; target = index + direction
+            if 0 <= target < len(actions):
+                actions[index], actions[target] = actions[target], actions[index]
+                render_actions(); action_list.selection_set(target)
+        ttk.Button(frame, text="Add", command=add_action).grid(row=4, column=0, sticky="w", pady=3)
+        control_row = ttk.Frame(frame); control_row.grid(row=5, column=0, sticky="w")
+        ttk.Button(control_row, text="Remove", command=remove_action).pack(side=tk.LEFT)
+        ttk.Button(control_row, text="Up", command=lambda: move_action(-1)).pack(side=tk.LEFT, padx=3)
+        ttk.Button(control_row, text="Down", command=lambda: move_action(1)).pack(side=tk.LEFT)
+        settings = ttk.LabelFrame(frame, text="Deterministic/refinement settings", padding=6)
+        settings.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        ttk.Label(settings, text="Outlier threshold").grid(row=0, column=0, sticky="w")
+        threshold_var = tk.StringVar(value=self.deterministic_threshold_var.get())
+        ttk.Entry(settings, textvariable=threshold_var, width=10).grid(row=0, column=1, padx=5)
+        ttk.Label(settings, text="Refine Z threshold").grid(row=0, column=2, sticky="w")
+        refine_z_var = tk.StringVar(value=self.refine_z_threshold_var.get())
+        ttk.Entry(settings, textvariable=refine_z_var, width=10).grid(row=0, column=3, padx=5)
+        ttk.Label(settings, text="Refine iterations").grid(row=0, column=4, sticky="w")
+        refine_iterations_var = tk.StringVar(value=self.refine_max_iterations_var.get())
+        ttk.Entry(settings, textvariable=refine_iterations_var, width=8).grid(row=0, column=5, padx=5)
+        render_actions()
+        save_results_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="Save ML results sidecar", variable=save_results_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 2))
 
         def close() -> None:
             try:
@@ -6874,28 +6898,119 @@ class EISApplication:
             popup.destroy()
 
         def run() -> None:
-            selected = {key for key, _label in labels if options[key].get()}
-            if not selected:
+            if not actions:
                 messagebox.showerror("ML processing", "Select at least one operation.", parent=popup)
                 return
-            destination = filedialog.asksaveasfilename(
-                parent=popup,
-                title="Save calculated ML results",
-                initialdir=str(self._current_directory()),
-                initialfile=f"{self._current_stem()}_ml_results.json",
-                defaultextension=".json",
-                filetypes=(("ML results JSON", "*_ml_results.json"), ("JSON", "*.json")),
-            )
-            if not destination:
-                return
+            destination = None
+            if save_results_var.get():
+                destination = filedialog.asksaveasfilename(
+                    parent=popup, title="Save calculated ML results",
+                    initialdir=str(self._current_directory()),
+                    initialfile=f"{self._current_stem()}_ml_results.json",
+                    defaultextension=".json",
+                    filetypes=(("ML results JSON", "*_ml_results.json"), ("JSON", "*.json")),
+                )
+                if not destination:
+                    return
             close()
-            self._start_runtime_ml_processing(selected, selected_rows, Path(destination))
+            self._start_named_ml_pipeline(model_var.get(), actions, threshold_var.get(), refine_z_var.get(), refine_iterations_var.get(), selected_rows, Path(destination) if destination else None)
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=7, column=0, columnspan=2, sticky="e")
+        buttons.grid(row=8, column=0, columnspan=2, sticky="e")
         ttk.Button(buttons, text="Cancel", command=close).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Run", command=run).pack(side=tk.RIGHT, padx=(0, 8))
         popup.protocol("WM_DELETE_WINDOW", close)
+
+    def _start_named_ml_pipeline(self, model_name: str, actions: list[str], outlier_threshold: str, refine_z: str, refine_iterations: str, selected_rows, destination: Path | None) -> None:
+        model_path = ML_TRAINED_MODELS.get(model_name)
+        if model_path is None or not model_path.exists():
+            messagebox.showerror("ML model unavailable", f"Trained model '{model_name}' is not available:\n{model_path}", parent=self.root)
+            return
+        try:
+            threshold = float(outlier_threshold)
+            if not np.isfinite(threshold) or threshold <= 0:
+                raise ValueError("outlier threshold must be positive")
+            float(refine_z); iterations = int(refine_iterations)
+            if iterations < 1:
+                raise ValueError("refinement iterations must be at least 1")
+        except ValueError as error:
+            messagebox.showerror("Invalid ML pipeline settings", str(error), parent=self.root)
+            return
+        selected_keys = {(dataset_id, int(spectrum.cycle)) for dataset_id, _loaded, spectrum in selected_rows}
+        needs_ml = bool(set(actions) & {"frequency", "model", "initial_parameters"})
+        targets = []
+        try:
+            for dataset_id in self._dataset_order:
+                loaded = self.loaded_projects[dataset_id]
+                for spectrum in loaded.spectra:
+                    if (dataset_id, int(spectrum.cycle)) not in selected_keys:
+                        continue
+                    cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+                    targets.append(make_runtime_spectrum(f"{dataset_id}::{loaded.state.control}::{spectrum.cycle}", cycle, cycle.model(loaded.state.circuit)))
+        except (TypeError, ValueError) as error:
+            messagebox.showerror("ML processing", str(error), parent=self.root)
+            return
+        if not targets:
+            self._update_status("no valid selected spectra available for ML processing")
+            return
+        self.status_var.set(f"Preparing {model_name} pipeline for {len(targets)} spectra…")
+        def work():
+            bundle = load_pipeline_bundle(model_path) if needs_ml else None
+            predictions = infer_bundle_records(bundle, [target.record for target in targets], threshold=threshold) if bundle is not None else []
+            if destination is not None:
+                write_ml_results(destination, predictions, source_project=str(self._current_stem()), pipeline={"name": model_name, "actions": list(actions), "outlier_threshold": threshold, "refine_z_threshold": float(refine_z), "refine_max_iterations": iterations})
+            return destination, predictions
+        self._submit(work, lambda result: self._finish_named_ml_pipeline(result, actions, threshold, float(refine_z), iterations, selected_rows), "ML pipeline failed", operation_labels=[f"{loaded.dataset_label}, cycle {spectrum.cycle}" for _id, loaded, spectrum in selected_rows], operation_name="ML pipeline")
+
+    def _finish_named_ml_pipeline(self, result, actions: list[str], threshold: float, refine_z: float, refine_iterations: int, selected_rows) -> None:
+        destination, predictions = result
+        if destination is not None:
+            self.ml_results = load_ml_results(destination)
+            self.ml_results_directory = destination.resolve()
+        else:
+            payload = {"format": "eis-fitting-ml-results", "version": 1, "source_project": str(self._current_stem()), "spectra": predictions}
+            self.ml_results = load_ml_results_payload(payload)
+            self.ml_results_directory = None
+        self._attach_ml_initial_results_to_projects()
+        self._refresh_ml_visuals()
+        self._run_named_ml_pipeline_steps(actions, 0, threshold, refine_z, refine_iterations, selected_rows)
+
+    def _run_named_ml_pipeline_steps(self, actions: list[str], index: int, threshold: float, refine_z: float, refine_iterations: int, selected_rows) -> None:
+        if index >= len(actions):
+            self._update_status("ML pipeline completed")
+            return
+        action = actions[index]
+        if action == "frequency":
+            self.apply_ml_frequency_to_selected()
+        elif action == "outliers":
+            for _dataset_id, loaded, spectrum in selected_rows:
+                cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
+                indices, _diagnostics = detect_outliers_in_active_points(cycle.frequency_hz, cycle.impedance, cycle.included, threshold=threshold)
+                cycle.apply_outliers(indices)
+            self._refresh_explorer_values(); self._refresh_plot(rescale=True)
+        elif action == "model":
+            self._run_ml_processing({"model"}, selected_rows)
+        elif action == "initial_parameters":
+            self._apply_ml_initial_parameters_to_selected()
+        elif action == "fit":
+            self._ml_pipeline_pending = (actions, index + 1, threshold, refine_z, refine_iterations, selected_rows)
+            self.fit_selected()
+            return
+        elif action == "refine":
+            self.refine_z_threshold_var.set(str(refine_z)); self.refine_max_iterations_var.set(str(refine_iterations))
+            self._ml_pipeline_pending = (actions, index + 1, threshold, refine_z, refine_iterations, selected_rows)
+            self.refine_fit_selected()
+            return
+        self.root.after(0, lambda: self._run_named_ml_pipeline_steps(actions, index + 1, threshold, refine_z, refine_iterations, selected_rows))
+
+    def _continue_named_ml_pipeline(self) -> bool:
+        pending = getattr(self, "_ml_pipeline_pending", None)
+        if pending is None:
+            return False
+        self._ml_pipeline_pending = None
+        actions, index, threshold, refine_z, refine_iterations, selected_rows = pending
+        self.root.after(0, lambda: self._run_named_ml_pipeline_steps(actions, index, threshold, refine_z, refine_iterations, selected_rows))
+        return True
 
     def _start_runtime_ml_processing(self, operations: set[str], selected_rows, destination: Path) -> None:
         """Load the pretrained bundle and infer the selected open spectra."""
@@ -7112,9 +7227,11 @@ class EISApplication:
         self._refresh_ml_visuals()
 
     def load_and_apply_ml_initial_parameters(self) -> None:
-        self.load_ml_initial_parameters()
-        if self.ml_results:
-            self._apply_ml_initial_parameters_to_selected()
+        """Apply parameters from the already loaded ML sidecar."""
+        if not self.ml_results:
+            self._update_status("load an ML results file first")
+            return
+        self._apply_ml_initial_parameters_to_selected()
 
     def _ml_result_for_spectrum(
         self, dataset_id: str, loaded: LoadedProject, spectrum: SpectrumMetadata
@@ -11151,6 +11268,8 @@ class EISApplication:
             self.state.parameters_for(self.state.active_cycle)
         )
         self._refresh_plot(rescale=True)
+        if self._continue_named_ml_pipeline():
+            return
         if self._stop_event.is_set():
             self._update_status(
                 f"Refine fit stopped: processed {len(results)}, "
@@ -11212,6 +11331,8 @@ class EISApplication:
         self._restore_controls()
         self._refresh_plot(rescale=True)
         self._refresh_open_parameter_explorers()
+        if self._continue_named_ml_pipeline():
+            return
         if report.stopped:
             self._update_status(
                 f"batch fit stopped: processed {len(report.fits)}, "

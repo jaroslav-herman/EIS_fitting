@@ -14,6 +14,8 @@ ML_EEC_MODELS = {
     "R0-L0-p(R1,CPE1)",
     "R0-p(R1,CPE1)-p(R2,CPE2)",
     "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+    "R0-L0-p(R1,CPE1)-p(R3,CPE3)",
+    "R0-p(R1,CPE1)-p(R3,CPE3)",
 }
 
 
@@ -253,6 +255,9 @@ def _add_json_spectrum(
             source = _text(prediction.get("source"))
             if name and source:
                 result.initial_sources[name] = source
+            initial = _number(prediction.get("initial_value", prediction.get("initial")))
+            if name and initial is not None:
+                result.model_parameters[name] = initial
             reliability = _text(prediction.get("reliability"))
             if name and reliability:
                 result.parameter_reliability[name] = reliability
@@ -262,6 +267,17 @@ def _add_json_spectrum(
     )
     if model:
         result.model_circuit = model
+
+
+def load_ml_results_payload(payload: dict) -> dict[str, MLResult]:
+    """Decode an ML sidecar payload without requiring a file on disk."""
+    results: dict[str, MLResult] = {}
+    root = payload.get("ml_results", payload)
+    source_project = _text(root.get("source_file")) or _text(root.get("source_project"))
+    for spectrum in root.get("spectra", []):
+        if isinstance(spectrum, dict):
+            _add_json_spectrum(results, spectrum, source_project)
+    return results
 
 
 def load_ml_results(directory: Path) -> dict[str, MLResult]:
@@ -281,13 +297,7 @@ def load_ml_results(directory: Path) -> dict[str, MLResult]:
                             _add_json_spectrum(results, spectrum, source_project)
                     return results
                 return _load_project_initial_results(payload)
-            root = payload.get("ml_results", payload)
-            source_project = _text(root.get("source_file")) or _text(
-                root.get("source_project")
-            )
-            for spectrum in root.get("spectra", []):
-                if isinstance(spectrum, dict):
-                    _add_json_spectrum(results, spectrum, source_project)
+            results = load_ml_results_payload(payload)
         except (OSError, ValueError, TypeError, AttributeError):
             return {}
         return results

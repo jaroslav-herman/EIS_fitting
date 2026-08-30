@@ -24,9 +24,29 @@ def _models(seed: int) -> dict[str, object]:
     }
 
 
+def active_frequency_bounds(record: SpectrumRecord) -> tuple[float, float]:
+    """Return the range of points that are actually active in a project.
+
+    ``frequency_window`` is only a boundary constraint.  The saved cleaned
+    arrays already include that window, manual exclusions, and validity
+    filtering, so their extrema are the training labels for frequency ML.
+    """
+    if record.cleaned_frequency is not None:
+        active = np.asarray(record.cleaned_frequency, dtype=float)
+    else:
+        active = np.asarray(record.frequency, dtype=float)
+        if record.manual_f_min is not None and record.manual_f_max is not None:
+            active = active[(active >= record.manual_f_min) & (active <= record.manual_f_max)]
+    active = active[np.isfinite(active) & (active > 0)]
+    if active.size < 2:
+        raise ValueError(f"fewer than two active frequency points for {record.spectrum_id}")
+    return float(np.min(active)), float(np.max(active))
+
+
 def _targets(records: list[SpectrumRecord]) -> np.ndarray:
-    lower = np.log10([r.manual_f_min for r in records])
-    upper = np.log10([r.manual_f_max for r in records])
+    bounds = np.asarray([active_frequency_bounds(r) for r in records], dtype=float)
+    lower = np.log10(bounds[:, 0])
+    upper = np.log10(bounds[:, 1])
     center = (lower + upper) / 2.0
     log_width = np.log(np.maximum(upper - lower, np.finfo(float).eps))
     return np.column_stack([center, log_width])
@@ -111,8 +131,9 @@ def run_frequency_range_experiment(
                 raise ValueError(f"unknown model: {model_name}")
             predicted_min, predicted_max = _fit_predict(models[model_name], x_train, y_train, x_test)
             for record, minimum, maximum in zip(test, predicted_min, predicted_max):
-                manual_min = float(np.log10(record.manual_f_min))
-                manual_max = float(np.log10(record.manual_f_max))
+                active_min, active_max = active_frequency_bounds(record)
+                manual_min = float(np.log10(active_min))
+                manual_max = float(np.log10(active_max))
                 row = {
                     "spectrum_id": record.spectrum_id,
                     "source_project": record.source_project,
@@ -121,8 +142,8 @@ def run_frequency_range_experiment(
                     "current": record.current,
                     "time": record.time,
                     "device_setup": record.device_setup,
-                    "manual_f_min": record.manual_f_min,
-                    "manual_f_max": record.manual_f_max,
+                    "manual_f_min": active_min,
+                    "manual_f_max": active_max,
                     "manual_log_f_min": manual_min,
                     "manual_log_f_max": manual_max,
                     "predicted_log_f_min": float(minimum),

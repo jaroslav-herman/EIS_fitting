@@ -19,4 +19,14 @@ __all__ = [
     "SpectrumPreprocessor",
     "TopologyExperiment",
     "run_topology_experiment",
+    "PipelineBundle",
+    "train_bundle",
+    "run_pipeline",
 ]
+
+
+def __getattr__(name):
+    if name in {"PipelineBundle", "train_bundle", "run_pipeline"}:
+        from .number_aware_pipeline import PipelineBundle, run_pipeline, train_bundle
+        return {"PipelineBundle": PipelineBundle, "train_bundle": train_bundle, "run_pipeline": run_pipeline}[name]
+    raise AttributeError(name)

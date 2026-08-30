@@ -16,8 +16,10 @@ from eis_services import load_cycle
 KNOWN_EEC_TOPOLOGIES = {
     "R0-L0-p(R1,CPE1)",
     "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+    "R0-L0-p(R1,CPE1)-p(R3,CPE3)",
     "R0-p(R1,CPE1)",
     "R0-p(R1,CPE1)-p(R2,CPE2)",
+    "R0-p(R1,CPE1)-p(R3,CPE3)",
 }
 
 
@@ -28,6 +30,8 @@ def canonical_electrochemical_topology(original: str) -> str | None:
         "R0-p(R1,CPE1)": "R0-p(R1,CPE1)",
         "R0-L0-p(R1,CPE1)-p(R2,CPE2)": "R0-p(R1,CPE1)-p(R2,CPE2)",
         "R0-p(R1,CPE1)-p(R2,CPE2)": "R0-p(R1,CPE1)-p(R2,CPE2)",
+        "R0-L0-p(R1,CPE1)-p(R3,CPE3)": "R0-p(R1,CPE1)-p(R3,CPE3)",
+        "R0-p(R1,CPE1)-p(R3,CPE3)": "R0-p(R1,CPE1)-p(R3,CPE3)",
     }
     return mapping.get(original.strip())
 
@@ -54,6 +58,7 @@ class SpectrumRecord:
     device_setup: str | None = None
     manual_f_min: float | None = None
     manual_f_max: float | None = None
+    control: str = "cell"
 
     def __post_init__(self) -> None:
         original = self.original_eec_topology or self.topology_label
@@ -124,6 +129,7 @@ def load_eisfit_projects(
     sample_ids: Mapping[str | Path, str],
     *,
     require_fit: bool = True,
+    require_frequency_window: bool = True,
 ) -> ExtractionReport:
     """Extract labelled spectra from saved projects.
 
@@ -172,17 +178,20 @@ def load_eisfit_projects(
                     report.exclusions.append({"spectrum_id": spectrum_id, "reason": "missing_fit"})
                     continue
                 window = saved.get("frequency_window")
-                if window is None:
+                if window is None and require_frequency_window:
                     report.exclusions.append({"spectrum_id": spectrum_id, "reason": "missing_frequency_window"})
                     continue
-                try:
-                    manual_f_min, manual_f_max = sorted((float(window[0]), float(window[1])))
-                except (TypeError, ValueError, IndexError):
-                    report.exclusions.append({"spectrum_id": spectrum_id, "reason": "invalid_frequency_window"})
-                    continue
-                if not np.isfinite(manual_f_min) or not np.isfinite(manual_f_max) or manual_f_min <= 0 or manual_f_max <= manual_f_min:
-                    report.exclusions.append({"spectrum_id": spectrum_id, "reason": "invalid_frequency_window"})
-                    continue
+                if window is None:
+                    manual_f_min = manual_f_max = None
+                else:
+                    try:
+                        manual_f_min, manual_f_max = sorted((float(window[0]), float(window[1])))
+                    except (TypeError, ValueError, IndexError):
+                        report.exclusions.append({"spectrum_id": spectrum_id, "reason": "invalid_frequency_window"})
+                        continue
+                    if not np.isfinite(manual_f_min) or not np.isfinite(manual_f_max) or manual_f_min <= 0 or manual_f_max <= manual_f_min:
+                        report.exclusions.append({"spectrum_id": spectrum_id, "reason": "invalid_frequency_window"})
+                        continue
                 try:
                     cycle: CycleState = load_cycle(dataframe, cycle_number, control)
                     frequency = np.asarray(cycle.frequency_hz, dtype=float)
@@ -226,6 +235,7 @@ def load_eisfit_projects(
                         device_setup=_setup_value(metadata, f"{dataset_key}:{control}"),
                         manual_f_min=manual_f_min,
                         manual_f_max=manual_f_max,
+                        control=control,
                     )
                     report.records.append(record)
                 except Exception as error:

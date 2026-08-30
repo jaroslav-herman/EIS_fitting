@@ -215,6 +215,7 @@ def make_runtime_spectrum(key: str, cycle, circuit: str) -> RuntimeSpectrum:
     topology = canonical_electrochemical_topology(circuit)
     if topology is None:
         raise ValueError(f"unsupported EEC topology: {circuit}")
+    control = str(key).split("::")[1] if len(str(key).split("::")) > 1 else "working"
     fitted_values = {}
     if cycle.fit_parameters is not None:
         fitted_values = {
@@ -240,6 +241,7 @@ def make_runtime_spectrum(key: str, cycle, circuit: str) -> RuntimeSpectrum:
         device_setup=str(key.split("::")[0]),
         manual_f_min=f_min,
         manual_f_max=f_max,
+        control=control,
     )
     return RuntimeSpectrum(key, record, circuit, fitted_values)
 
