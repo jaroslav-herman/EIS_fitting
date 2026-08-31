@@ -1165,6 +1165,7 @@ class EISApplication:
         self._fit_explorer_y_preference = "R0"
         self._drt_explorer_y_preference = "R0"
         self._explorer_column_order_preference: list[str] = []
+        self._explorer_hidden_columns_preference: list[str] = []
         self._explorer_new_columns_position = "end"
         self._eec_parameter_bounds = {
             "r": (0.0, 1e6),
@@ -1224,6 +1225,13 @@ class EISApplication:
             if isinstance(saved_column_order, list):
                 self._explorer_column_order_preference = [
                     str(value).strip() for value in saved_column_order if str(value).strip()
+                ]
+            saved_hidden_columns = payload.get("explorer_hidden_columns", [])
+            if isinstance(saved_hidden_columns, list):
+                self._explorer_hidden_columns_preference = [
+                    str(value).strip()
+                    for value in saved_hidden_columns
+                    if str(value).strip()
                 ]
             position = str(payload.get("explorer_new_columns_position", "end")).casefold()
             if position in {"beginning", "end"}:
@@ -1298,6 +1306,7 @@ class EISApplication:
         fit_explorer_y: str,
         drt_explorer_y: str,
         explorer_column_order: list[str],
+        explorer_hidden_columns: list[str],
         explorer_new_columns_position: str,
         procedure_blocks: dict[str, list[dict[str, str]]] | None = None,
         procedures: dict[str, list[dict[str, object]]] | None = None,
@@ -1313,6 +1322,7 @@ class EISApplication:
                     "fit_explorer_y": fit_explorer_y,
                     "drt_explorer_y": drt_explorer_y,
                     "explorer_column_order": explorer_column_order,
+                    "explorer_hidden_columns": explorer_hidden_columns,
                     "explorer_new_columns_position": explorer_new_columns_position,
                     "eec_parameter_bounds": self._eec_parameter_bounds,
                     "auto_model": self._auto_model_settings,
@@ -1346,6 +1356,7 @@ class EISApplication:
                 self._fit_explorer_y_preference,
                 self._drt_explorer_y_preference,
                 self._explorer_column_order_preference,
+                self._explorer_hidden_columns_preference,
                 self._explorer_new_columns_position,
                 self.procedure_blocks,
                 self.procedures,
@@ -1493,22 +1504,66 @@ class EISApplication:
             if column in preference_columns
         ]
         saved_order.extend(column for column in preference_columns if column not in saved_order)
+        hidden_columns = {
+            column
+            for column in self._explorer_hidden_columns_preference
+            if column in preference_columns
+        }
+        visible_order = [column for column in saved_order if column not in hidden_columns]
+        hidden_order = [
+            column
+            for column in self._explorer_hidden_columns_preference
+            if column in preference_columns
+        ]
         ttk.Label(explorer_tab, text="Spectra Explorer column order").grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(12, 4)
         )
         order_frame = ttk.Frame(explorer_tab)
         order_frame.grid(row=5, column=0, columnspan=2, sticky="nsew")
         order_frame.columnconfigure(0, weight=1)
-        order_frame.rowconfigure(0, weight=1)
-        order_list = tk.Listbox(order_frame, exportselection=False, height=6)
-        order_list.grid(row=0, column=0, sticky="nsew")
-        order_scrollbar = ttk.Scrollbar(
-            order_frame, orient=tk.VERTICAL, command=order_list.yview
+        order_frame.columnconfigure(1, weight=0)
+        order_frame.columnconfigure(2, weight=1)
+        order_frame.rowconfigure(1, weight=1)
+        ttk.Label(order_frame, text="Visible columns").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
         )
-        order_scrollbar.grid(row=0, column=1, sticky="ns")
-        order_list.configure(yscrollcommand=order_scrollbar.set)
-        for column in saved_order:
-            order_list.insert(tk.END, f"{column} — {self._explorer_headings.get(column, column)}")
+        ttk.Label(order_frame, text="Hidden columns").grid(
+            row=0, column=2, sticky="w", padx=(8, 0)
+        )
+        visible_list = tk.Listbox(order_frame, exportselection=False, height=6)
+        visible_list.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        hidden_list = tk.Listbox(order_frame, exportselection=False, height=6)
+        hidden_list.grid(row=1, column=2, sticky="nsew", padx=(8, 0))
+        for column in visible_order:
+            visible_list.insert(tk.END, f"{column} — {self._explorer_headings.get(column, column)}")
+        for column in hidden_order:
+            hidden_list.insert(tk.END, f"{column} — {self._explorer_headings.get(column, column)}")
+        transfer_buttons = ttk.Frame(order_frame)
+        transfer_buttons.grid(row=1, column=1, padx=2)
+
+        def move_columns(source: tk.Listbox, target: tk.Listbox) -> None:
+            selected = source.curselection()
+            if not selected:
+                return
+            values = [source.get(index) for index in selected]
+            for index in reversed(selected):
+                source.delete(index)
+            for value in values:
+                target.insert(tk.END, value)
+            target.selection_clear(0, tk.END)
+            target.selection_set(target.size() - len(values), tk.END)
+            target.see(target.size() - 1)
+
+        ttk.Button(
+            transfer_buttons,
+            text="Hide →",
+            command=lambda: move_columns(visible_list, hidden_list),
+        ).pack(pady=2)
+        ttk.Button(
+            transfer_buttons,
+            text="← Show",
+            command=lambda: move_columns(hidden_list, visible_list),
+        ).pack(pady=2)
         ttk.Label(explorer_tab, text="Unlisted columns:").grid(
             row=6, column=0, sticky="w", pady=(6, 0)
         )
@@ -1523,21 +1578,21 @@ class EISApplication:
         ).grid(row=6, column=1, sticky="ew", pady=(6, 0))
 
         def move_order_item(direction: int) -> None:
-            selection = order_list.curselection()
+            selection = visible_list.curselection()
             if not selection:
                 return
             index = selection[0]
             target = index + direction
-            if not 0 <= target < order_list.size():
+            if not 0 <= target < visible_list.size():
                 return
-            value = order_list.get(index)
-            order_list.delete(index)
-            order_list.insert(target, value)
-            order_list.selection_set(target)
-            order_list.see(target)
+            value = visible_list.get(index)
+            visible_list.delete(index)
+            visible_list.insert(target, value)
+            visible_list.selection_set(target)
+            visible_list.see(target)
 
         order_buttons = ttk.Frame(explorer_tab)
-        order_buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(4, 0))
+        order_buttons.grid(row=6, column=0, columnspan=2, sticky="e", pady=(4, 0))
         ttk.Button(order_buttons, text="Move up", command=lambda: move_order_item(-1)).pack(
             side=tk.LEFT, padx=3
         )
@@ -1754,7 +1809,11 @@ class EISApplication:
                     drt_y_var.get().strip() or "R0",
                     [
                         saved_order_item.split(" — ", 1)[0]
-                        for saved_order_item in order_list.get(0, tk.END)
+                        for saved_order_item in visible_list.get(0, tk.END)
+                    ],
+                    [
+                        hidden_order_item.split(" — ", 1)[0]
+                        for hidden_order_item in hidden_list.get(0, tk.END)
                     ],
                     new_columns_position_var.get().casefold(),
                     self.procedure_blocks,
@@ -1770,9 +1829,15 @@ class EISApplication:
             self._drt_explorer_y_preference = drt_y_var.get().strip() or "R0"
             self._explorer_column_order_preference = [
                 saved_order_item.split(" — ", 1)[0]
-                for saved_order_item in order_list.get(0, tk.END)
+                for saved_order_item in visible_list.get(0, tk.END)
+            ]
+            self._explorer_hidden_columns_preference = [
+                hidden_order_item.split(" — ", 1)[0]
+                for hidden_order_item in hidden_list.get(0, tk.END)
             ]
             self._explorer_new_columns_position = new_columns_position_var.get().casefold()
+            self._explorer_current_column_order = None
+            self._apply_explorer_column_order()
             self._procedure_library_blocks = copy.deepcopy(self.procedure_blocks)
             self._procedure_library = copy.deepcopy(self.procedures)
             if hasattr(self, "model_box"):
@@ -3247,7 +3312,10 @@ class EISApplication:
         return [*self._explorer_base_columns(), *self._custom_metadata_columns]
 
     def _explorer_display_columns(self) -> list[str]:
-        available = self._explorer_columns()
+        hidden = set(self._explorer_hidden_columns_preference)
+        available = [
+            column for column in self._explorer_columns() if column not in hidden
+        ]
         preferred = self._explorer_current_column_order
         if preferred is None:
             preferred = self._explorer_column_order_preference
@@ -3283,6 +3351,8 @@ class EISApplication:
             )
             for spectrum in loaded.spectra:
                 for name in spectrum.custom_metadata:
+                    if str(name).casefold().startswith("_ml_"):
+                        continue
                     if is_ewe_data and name in {
                         WORKING_POTENTIAL_COLUMN,
                         COUNTER_POTENTIAL_COLUMN,
