@@ -21,6 +21,41 @@ DEFAULT_PATTERN = r"^VIII_Day\d+_Procedure\d+_05_PEIS_C01\.mpr$"
 DEFAULT_CIRCUIT = "R0-L0-p(R1,CPE1)"
 
 
+def source_path_candidates(source: Path) -> list[Path]:
+    """Return the exact Windows path plus a compatibility-normalized UNC path.
+
+    Some paths are copied from Markdown or notes with escaped underscores,
+    e.g. ``PEM-WE\\_measurements\\2026\\467\\_III``.  Windows Explorer displays
+    the corresponding directory names as ``PEM-WE_measurements`` and
+    ``467_III``.  Try the literal path first, then merge underscore-prefixed
+    components without changing ordinary paths.
+    """
+    text = str(source)
+    candidates = [Path(text)]
+    if text.startswith("\\\\"):
+        parts = text.split("\\")
+        merged = []
+        for part in parts:
+            if part.startswith("_") and merged:
+                merged[-1] += part
+            else:
+                merged.append(part)
+        normalized = "\\".join(merged)
+        if normalized != text:
+            candidates.append(Path(normalized))
+    return candidates
+
+
+def resolve_source_path(source: Path) -> Path:
+    """Resolve an existing source directory/file, including escaped UNC paths."""
+    candidates = source_path_candidates(source)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    formatted = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(f"source path is unavailable; tried: {formatted}")
+
+
 def find_pattern_length(voltages: np.ndarray, tolerance: float = 0.01) -> int:
     """Return the shortest whole-number repeating pattern within tolerance."""
     count = int(voltages.size)
@@ -89,9 +124,16 @@ def import_and_label(
     circuit: str = DEFAULT_CIRCUIT,
 ) -> dict[str, int]:
     """Import matching files from *source* and atomically save labeled Cell data."""
+    source = resolve_source_path(Path(source))
     matcher = re.compile(filename_pattern, re.IGNORECASE)
     candidates = [source] if source.is_file() else sorted(
-        (path for path in source.rglob("*.mpr") if matcher.fullmatch(path.name)),
+        (
+            path
+            for path in source.rglob("*")
+            if path.is_file()
+            and path.suffix.casefold() == ".mpr"
+            and matcher.fullmatch(path.name)
+        ),
         key=lambda path: path.name.casefold(),
     )
     if source.is_file() and not matcher.fullmatch(source.name):
