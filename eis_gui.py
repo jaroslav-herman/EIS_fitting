@@ -1381,8 +1381,8 @@ class EISApplication:
         popup = tk.Toplevel(self.root)
         self.preferences_popup = popup
         popup.title("Preferences")
-        popup.geometry("620x560")
-        popup.minsize(500, 380)
+        popup.geometry("700x620")
+        popup.minsize(560, 420)
         popup.transient(self.root)
         popup.columnconfigure(0, weight=1)
         popup.rowconfigure(0, weight=1)
@@ -1393,10 +1393,12 @@ class EISApplication:
         optimizer_tab = ttk.Frame(notebook, padding=10)
         explorer_tab = ttk.Frame(notebook, padding=10)
         auto_tab = ttk.Frame(notebook, padding=10)
+        thresholds_tab = ttk.Frame(notebook, padding=10)
         notebook.add(eec_tab, text="EEC models")
         notebook.add(optimizer_tab, text="EEC optimizer")
         notebook.add(explorer_tab, text="Explorers")
         notebook.add(auto_tab, text="Auto model selection")
+        notebook.add(thresholds_tab, text="Thresholds & guidance")
 
         eec_tab.columnconfigure(0, weight=1)
         eec_tab.rowconfigure(1, weight=1)
@@ -1404,6 +1406,7 @@ class EISApplication:
         explorer_tab.columnconfigure(1, weight=1)
         explorer_tab.rowconfigure(5, weight=1)
         auto_tab.columnconfigure(1, weight=1)
+        thresholds_tab.columnconfigure(0, weight=1)
 
         ttk.Label(
             optimizer_tab,
@@ -1727,6 +1730,88 @@ class EISApplication:
         ttk.Entry(auto_tab, textvariable=fit_timeout_var).grid(
             row=9, column=1, sticky="ew", pady=(6, 0)
         )
+
+        ttk.Label(
+            thresholds_tab,
+            text=(
+                "These are the defaults used by the main analysis controls on a fresh "
+                "application start. Adjust the corresponding fields on the main tab "
+                "when a particular spectrum needs a different sensitivity."
+            ),
+            wraplength=600,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 12))
+        default_thresholds = ttk.LabelFrame(
+            thresholds_tab, text="Outlier detection and refinement defaults", padding=8
+        )
+        default_thresholds.grid(row=1, column=0, sticky="ew")
+        default_thresholds.columnconfigure(1, weight=1)
+        threshold_rows = (
+            (
+                "Bayes-DRT2 outlier threshold",
+                "1.0",
+                "Lower values flag more points; increase to make detection more conservative.",
+            ),
+            (
+                "Deterministic outlier threshold",
+                "4",
+                "Robust-score cutoff; 3–4 is more sensitive, 5 is more conservative.",
+            ),
+            (
+                "Robust z threshold (Refine fit)",
+                "3.5",
+                "Residual cutoff used when iteratively deactivating bad points.",
+            ),
+            (
+                "Maximum iterations (Refine fit)",
+                "5",
+                "Maximum points-removal/refit passes; increase only for difficult spectra.",
+            ),
+        )
+        for row, (label, value, help_text) in enumerate(threshold_rows):
+            ttk.Label(default_thresholds, text=label).grid(
+                row=row, column=0, sticky="w", pady=3
+            )
+            ttk.Label(default_thresholds, text=value).grid(
+                row=row, column=1, sticky="w", padx=(16, 8), pady=3
+            )
+            ttk.Label(
+                default_thresholds, text=help_text, wraplength=390, justify=tk.LEFT
+            ).grid(row=row, column=2, sticky="w", pady=3)
+
+        other_thresholds = ttk.LabelFrame(
+            thresholds_tab, text="Other useful starting values", padding=8
+        )
+        other_thresholds.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        other_thresholds.columnconfigure(1, weight=1)
+        other_rows = (
+            ("Maximum DRT peaks / EEC blocks", "10", "Auto model selection"),
+            ("EEC fit time limit", "10 s", "Auto model selection"),
+            ("Optimizer population", "30", "EEC optimizer"),
+            ("Optimizer iterations", "200", "EEC optimizer"),
+            ("CPE alpha bounds", "0.5–1.0", "EEC parameter limits"),
+        )
+        for row, (label, value, location) in enumerate(other_rows):
+            ttk.Label(other_thresholds, text=label).grid(
+                row=row, column=0, sticky="w", pady=3
+            )
+            ttk.Label(other_thresholds, text=value).grid(
+                row=row, column=1, sticky="w", padx=(16, 8), pady=3
+            )
+            ttk.Label(other_thresholds, text=location).grid(
+                row=row, column=2, sticky="w", pady=3
+            )
+        ttk.Label(
+            thresholds_tab,
+            text=(
+                "Practical tuning: start with the defaults, inspect the excluded points, "
+                "and change one threshold at a time. A lower cutoff increases sensitivity "
+                "but can remove valid measurements; a higher cutoff may leave artifacts "
+                "in the fit."
+            ),
+            wraplength=600,
+            justify=tk.LEFT,
+        ).grid(row=3, column=0, sticky="w", pady=(12, 0))
 
         def add_circuit(_event=None) -> None:
             value = entry.get().strip()
@@ -14421,9 +14506,13 @@ class EISApplication:
                 parent=self.root,
                 title="Save EIS fitting project",
                 initialdir=str(self._current_directory()),
-                initialfile=f"{self._current_stem()}.eisfit.json",
-                defaultextension=".eisfit.json",
-                filetypes=[("EIS fitting project", "*.eisfit.json"), ("JSON", "*.json")],
+                initialfile=f"{self._current_stem()}.eisfit.json.gz",
+                defaultextension=".eisfit.json.gz",
+                filetypes=[
+                    ("Compressed EIS fitting project", "*.eisfit.json.gz"),
+                    ("EIS fitting project", "*.eisfit.json"),
+                    ("JSON", "*.json"),
+                ],
             )
             if not selected:
                 return
@@ -14691,7 +14780,13 @@ class EISApplication:
             parent=self.root,
             title="Load EIS fitting project",
             initialdir=str(self._dialog_directory("last_project_directory")),
-            filetypes=[("EIS fitting project", "*.eisfit.json"), ("JSON", "*.json")],
+            filetypes=[
+                ("Compressed EIS fitting project", "*.eisfit.json.gz"),
+                ("Compressed EIS fitting project", "*.eisfit.gz"),
+                ("EIS fitting project", "*.eisfit.json"),
+                ("JSON", "*.json"),
+                ("All files", "*.*"),
+            ],
         )
         if not selected:
             return
