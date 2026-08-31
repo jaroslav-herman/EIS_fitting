@@ -839,10 +839,21 @@ class EISApplication:
         self.simulator_drt_result = None
         self.simulator_drt_mode_var = tk.StringVar(value="Ridge DRT")
 
-        self.threshold_var = tk.StringVar(value=f"{threshold:g}")
-        self.deterministic_threshold_var = tk.StringVar(value="4")
-        self.refine_z_threshold_var = tk.StringVar(value="3.5")
-        self.refine_max_iterations_var = tk.StringVar(value="5")
+        initial_threshold = (
+            self._bayes_drt2_threshold_preference
+            if np.isclose(threshold, 1.0)
+            else f"{threshold:g}"
+        )
+        self.threshold_var = tk.StringVar(value=initial_threshold)
+        self.deterministic_threshold_var = tk.StringVar(
+            value=self._deterministic_threshold_preference
+        )
+        self.refine_z_threshold_var = tk.StringVar(
+            value=self._refine_z_threshold_preference
+        )
+        self.refine_max_iterations_var = tk.StringVar(
+            value=self._refine_max_iterations_preference
+        )
         self.fit_pipeline_var = tk.StringVar(value=self._fit_pipeline_preference)
         self.fit_seed_var = tk.StringVar(value=self._fit_seed_preference)
         self.fit_population_var = tk.StringVar(value=self._fit_population_preference)
@@ -1151,6 +1162,10 @@ class EISApplication:
         return blocks, procedures
 
     def _load_preferences(self) -> tuple[str, ...]:
+        self._bayes_drt2_threshold_preference = "1.0"
+        self._deterministic_threshold_preference = "4"
+        self._refine_z_threshold_preference = "3.5"
+        self._refine_max_iterations_preference = "5"
         self._fit_timeout_seconds = 10.0
         self._fit_pipeline_preference = "local only"
         self._fit_seed_preference = ""
@@ -1200,6 +1215,19 @@ class EISApplication:
                 jacobian_mode = str(optimizer.get("jacobian_mode", "Numerical only"))
                 if jacobian_mode in {"Automatic", "Analytical when supported", "Numerical only"}:
                     self._fit_jacobian_mode_preference = jacobian_mode
+            thresholds = payload.get("outlier_thresholds", {})
+            if isinstance(thresholds, dict):
+                for key, attribute_name, default in (
+                    ("bayes_drt2", "_bayes_drt2_threshold_preference", "1.0"),
+                    ("deterministic", "_deterministic_threshold_preference", "4"),
+                    ("refine_z", "_refine_z_threshold_preference", "3.5"),
+                ):
+                    value = float(thresholds.get(key, default))
+                    if np.isfinite(value) and value > 0:
+                        setattr(self, attribute_name, f"{value:g}")
+                value = int(thresholds.get("refine_max_iterations", 5))
+                if value >= 1:
+                    self._refine_max_iterations_preference = str(value)
             for preference_name, attribute_name in (
                 ("last_import_directory", "_last_import_directory"),
                 ("last_project_directory", "_last_project_directory"),
@@ -1325,6 +1353,12 @@ class EISApplication:
                     "explorer_hidden_columns": explorer_hidden_columns,
                     "explorer_new_columns_position": explorer_new_columns_position,
                     "eec_parameter_bounds": self._eec_parameter_bounds,
+                    "outlier_thresholds": {
+                        "bayes_drt2": self.threshold_var.get(),
+                        "deterministic": self.deterministic_threshold_var.get(),
+                        "refine_z": self.refine_z_threshold_var.get(),
+                        "refine_max_iterations": self.refine_max_iterations_var.get(),
+                    },
                     "auto_model": self._auto_model_settings,
                     "last_import_directory": str(self._last_import_directory),
                     "last_project_directory": str(self._last_project_directory),
@@ -1746,33 +1780,39 @@ class EISApplication:
         )
         default_thresholds.grid(row=1, column=0, sticky="ew")
         default_thresholds.columnconfigure(1, weight=1)
+        threshold_vars = {
+            "bayes_drt2": tk.StringVar(value=self.threshold_var.get()),
+            "deterministic": tk.StringVar(value=self.deterministic_threshold_var.get()),
+            "refine_z": tk.StringVar(value=self.refine_z_threshold_var.get()),
+            "refine_max_iterations": tk.StringVar(value=self.refine_max_iterations_var.get()),
+        }
         threshold_rows = (
             (
+                "bayes_drt2",
                 "Bayes-DRT2 outlier threshold",
-                "1.0",
                 "Lower values flag more points; increase to make detection more conservative.",
             ),
             (
+                "deterministic",
                 "Deterministic outlier threshold",
-                "4",
                 "Robust-score cutoff; 3–4 is more sensitive, 5 is more conservative.",
             ),
             (
+                "refine_z",
                 "Robust z threshold (Refine fit)",
-                "3.5",
                 "Residual cutoff used when iteratively deactivating bad points.",
             ),
             (
+                "refine_max_iterations",
                 "Maximum iterations (Refine fit)",
-                "5",
                 "Maximum points-removal/refit passes; increase only for difficult spectra.",
             ),
         )
-        for row, (label, value, help_text) in enumerate(threshold_rows):
+        for row, (key, label, help_text) in enumerate(threshold_rows):
             ttk.Label(default_thresholds, text=label).grid(
                 row=row, column=0, sticky="w", pady=3
             )
-            ttk.Label(default_thresholds, text=value).grid(
+            ttk.Entry(default_thresholds, textvariable=threshold_vars[key], width=12).grid(
                 row=row, column=1, sticky="w", padx=(16, 8), pady=3
             )
             ttk.Label(
@@ -1876,6 +1916,20 @@ class EISApplication:
                     "min_r0": optional_float(min_r0_var, "R0 threshold"),
                     "min_l0": optional_float(min_l0_var, "L0 threshold"),
                 }
+                bayes_drt2_threshold = float(threshold_vars["bayes_drt2"].get())
+                deterministic_threshold = float(threshold_vars["deterministic"].get())
+                refine_z_threshold = float(threshold_vars["refine_z"].get())
+                refine_max_iterations = int(
+                    threshold_vars["refine_max_iterations"].get()
+                )
+                if not np.isfinite(bayes_drt2_threshold) or bayes_drt2_threshold <= 0:
+                    raise ValueError("Bayes-DRT2 threshold must be positive")
+                if not np.isfinite(deterministic_threshold) or deterministic_threshold <= 0:
+                    raise ValueError("deterministic-outlier threshold must be positive")
+                if not np.isfinite(refine_z_threshold) or refine_z_threshold <= 0:
+                    raise ValueError("robust z threshold must be positive")
+                if refine_max_iterations < 1:
+                    raise ValueError("maximum refine iterations must be at least 1")
                 fit_timeout_seconds = float(fit_timeout_var.get())
                 if (
                     not np.isfinite(fit_timeout_seconds)
@@ -1886,6 +1940,14 @@ class EISApplication:
                 self._auto_model_settings = auto_settings
                 self._eec_parameter_bounds = parameter_bounds
                 self._fit_timeout_seconds = fit_timeout_seconds
+                self.threshold_var.set(f"{bayes_drt2_threshold:g}")
+                self.deterministic_threshold_var.set(f"{deterministic_threshold:g}")
+                self.refine_z_threshold_var.set(f"{refine_z_threshold:g}")
+                self.refine_max_iterations_var.set(str(refine_max_iterations))
+                self._bayes_drt2_threshold_preference = self.threshold_var.get()
+                self._deterministic_threshold_preference = self.deterministic_threshold_var.get()
+                self._refine_z_threshold_preference = self.refine_z_threshold_var.get()
+                self._refine_max_iterations_preference = self.refine_max_iterations_var.get()
                 self._save_preferences(
                     circuits,
                     fit_x_var.get().strip() or "I_mA",
