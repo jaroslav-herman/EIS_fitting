@@ -7157,31 +7157,43 @@ class EISApplication:
         selected_keys = {(dataset_id, int(spectrum.cycle)) for dataset_id, _loaded, spectrum in selected_rows}
         needs_ml = bool(set(actions) & {"frequency", "model", "initial_parameters"})
         targets = []
-        try:
-            for dataset_id in self._dataset_order:
-                loaded = self.loaded_projects[dataset_id]
-                for spectrum in loaded.spectra:
-                    if (dataset_id, int(spectrum.cycle)) not in selected_keys:
-                        continue
+        target_labels = []
+        failures = []
+        for dataset_id in self._dataset_order:
+            loaded = self.loaded_projects[dataset_id]
+            for spectrum in loaded.spectra:
+                if (dataset_id, int(spectrum.cycle)) not in selected_keys:
+                    continue
+                label = f"{loaded.dataset_label}, cycle {spectrum.cycle}"
+                try:
                     cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
                     targets.append(make_runtime_spectrum(f"{dataset_id}::{loaded.state.control}::{spectrum.cycle}", cycle, cycle.model(loaded.state.circuit)))
-        except (TypeError, ValueError) as error:
-            messagebox.showerror("ML processing", str(error), parent=self.root)
-            return
+                    target_labels.append(label)
+                except Exception as error:
+                    failures.append((label, f"{type(error).__name__}: {error}"))
         if not targets:
+            self._show_ml_spectrum_failures(failures, 0, len(selected_rows))
             self._update_status("no valid selected spectra available for ML processing")
             return
         self.status_var.set(f"Preparing {model_name} pipeline for {len(targets)} spectra…")
         def work():
             bundle = load_pipeline_bundle(model_path) if needs_ml else None
-            predictions = infer_bundle_records(bundle, [target.record for target in targets], threshold=threshold) if bundle is not None else []
+            predictions = []
+            inference_failures = list(failures)
+            if bundle is not None:
+                for target, label in zip(targets, target_labels):
+                    try:
+                        predictions.extend(infer_bundle_records(bundle, [target.record], threshold=threshold))
+                    except Exception as error:
+                        inference_failures.append((label, f"{type(error).__name__}: {error}"))
             if destination is not None:
                 write_ml_results(destination, predictions, source_project=str(self._current_stem()), pipeline={"name": model_name, "actions": list(actions), "outlier_threshold": threshold, "refine_z_threshold": float(refine_z), "refine_max_iterations": iterations})
-            return destination, predictions
+            return destination, predictions, inference_failures, len(targets)
         self._submit(work, lambda result: self._finish_named_ml_pipeline(result, actions, threshold, float(refine_z), iterations, selected_rows), "ML pipeline failed", operation_labels=[f"{loaded.dataset_label}, cycle {spectrum.cycle}" for _id, loaded, spectrum in selected_rows], operation_name="ML pipeline")
 
     def _finish_named_ml_pipeline(self, result, actions: list[str], threshold: float, refine_z: float, refine_iterations: int, selected_rows) -> None:
-        destination, predictions = result
+        destination, predictions, failures, processed = result
+        self._show_ml_spectrum_failures(failures, processed, len(selected_rows))
         if destination is not None:
             self.ml_results = load_ml_results(destination)
             self.ml_results_directory = destination.resolve()
@@ -7192,6 +7204,16 @@ class EISApplication:
         self._attach_ml_initial_results_to_projects()
         self._refresh_ml_visuals()
         self._run_named_ml_pipeline_steps(actions, 0, threshold, refine_z, refine_iterations, selected_rows)
+
+    def _show_ml_spectrum_failures(self, failures, processed: int, total: int) -> None:
+        if not failures:
+            return
+        details = "\n".join(f"• {label}: {error}" for label, error in failures)
+        messagebox.showwarning(
+            "ML pipeline: spectra skipped",
+            f"Processed {processed} of {total} selected spectra.\n\n{details}",
+            parent=self.root,
+        )
 
     def _run_named_ml_pipeline_steps(self, actions: list[str], index: int, threshold: float, refine_z: float, refine_iterations: int, selected_rows) -> None:
         if index >= len(actions):
@@ -7250,32 +7272,43 @@ class EISApplication:
             )
             return
         targets = []
-        try:
-            for dataset_id in self._dataset_order:
-                loaded = self.loaded_projects[dataset_id]
-                for spectrum in loaded.spectra:
-                    cycle_number = int(spectrum.cycle)
+        target_labels = []
+        failures = []
+        for dataset_id in self._dataset_order:
+            loaded = self.loaded_projects[dataset_id]
+            for spectrum in loaded.spectra:
+                cycle_number = int(spectrum.cycle)
+                key = (dataset_id, cycle_number)
+                if key not in selected_keys:
+                    continue
+                label = f"{loaded.dataset_label}, cycle {cycle_number}"
+                try:
                     cycle = self._loaded_cycle_for_popup(loaded, cycle_number)
-                    key = (dataset_id, cycle_number)
                     runtime = make_runtime_spectrum(
                         f"{dataset_id}::{loaded.state.control}::{cycle_number}",
                         cycle,
                         cycle.model(loaded.state.circuit),
                     )
-                    if key in selected_keys:
-                        targets.append(runtime)
-        except (TypeError, ValueError) as error:
-            messagebox.showerror("ML processing", str(error), parent=self.root)
-            return
+                    targets.append(runtime)
+                    target_labels.append(label)
+                except Exception as error:
+                    failures.append((label, f"{type(error).__name__}: {error}"))
         if not targets:
+            self._show_ml_spectrum_failures(failures, 0, len(selected_rows))
             self._update_status("no valid selected spectra available for ML processing")
             return
         self.status_var.set(f"Calculating ML predictions for {len(targets)} selected spectra…")
 
         def work():
-            predictions = infer_pretrained(artifacts, targets, operations=operations)
+            predictions = []
+            inference_failures = list(failures)
+            for target, label in zip(targets, target_labels):
+                try:
+                    predictions.extend(infer_pretrained(artifacts, [target], operations=operations))
+                except Exception as error:
+                    inference_failures.append((label, f"{type(error).__name__}: {error}"))
             save_runtime_results(destination, predictions, training_count=6, operations=operations)
-            return destination, predictions
+            return destination, predictions, inference_failures, len(targets)
 
         self._submit(
             work,
@@ -7286,7 +7319,8 @@ class EISApplication:
         )
 
     def _finish_runtime_ml_processing(self, result, operations: set[str], selected_rows) -> None:
-        destination, _predictions = result
+        destination, predictions, failures, processed = result
+        self._show_ml_spectrum_failures(failures, processed, len(selected_rows))
         self.ml_results = load_ml_results(destination)
         self.ml_results_directory = Path(destination).resolve()
         self.ml_results_status_var.set(f"Calculated and saved {len(self.ml_results)} ML results")
