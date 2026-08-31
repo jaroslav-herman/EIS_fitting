@@ -17,7 +17,9 @@ from eis_project import save_project_file
 from eis_services import load_cycle, load_projects
 
 
-DEFAULT_PATTERN = r"^VIII_Day\d+_Procedure\d+_05_PEIS_C01\.mpr$"
+# The station identifier is intentionally unrestricted; only Day and
+# Procedure numbers identify the requested measurement structure.
+DEFAULT_PATTERN = r"^(?:.*_)?Day\d+_Procedure\d+_05_PEIS_C01\.mpr$"
 DEFAULT_CIRCUIT = "R0-L0-p(R1,CPE1)"
 
 

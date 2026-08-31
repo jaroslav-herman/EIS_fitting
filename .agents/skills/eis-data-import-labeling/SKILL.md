@@ -17,10 +17,10 @@ From the repository root, use the project interpreter:
   ".\sample_Cell.eisfit.json.gz"
 ```
 
-The source may be one matching `.mpr` file or a directory. Directories are scanned recursively. The default filename expression is:
+The source may be one matching `.mpr` file or a directory. Directories are scanned recursively. The default filename expression is case-insensitive and leaves the station prefix unrestricted; only `Day` and `Procedure` carry the numeric structure:
 
 ```text
-^VIII_Day\d+_Procedure\d+_05_PEIS_C01\.mpr$
+^(?:.*_)?Day\d+_Procedure\d+_05_PEIS_C01\.mpr$
 ```
 
 Override it with `--pattern` only when the requested sample uses a different naming convention. Use `--tolerance` to adjust the voltage similarity threshold used to detect the shortest repeated cycle pattern.
