@@ -12,10 +12,10 @@ from pathlib import Path
 import re
 
 import numpy as np
+import wepy.basics as we
 
 from eis_project import save_project_file
 from eis_services import load_cycle, load_projects
-
 
 # The station identifier is intentionally unrestricted; only Day and
 # Procedure numbers identify the requested measurement structure.
@@ -56,6 +56,55 @@ def resolve_source_path(source: Path) -> Path:
             return candidate
     formatted = ", ".join(str(candidate) for candidate in candidates)
     raise FileNotFoundError(f"source path is unavailable; tried: {formatted}")
+
+
+def discover_source_files(source: Path, matcher: re.Pattern[str]) -> list[Path]:
+    """Inspect a source directory with wepy and return matching MPR files."""
+    source = Path(source)
+    for candidate in source_path_candidates(source):
+        if candidate.is_file():
+            return [candidate] if matcher.fullmatch(candidate.name) else []
+        if not candidate.is_dir():
+            continue
+        files = we.load_files(
+            str(candidate),
+            contains_string=["ay", "rocedure", "PEIS"],
+            extension=".mpr",
+            natural_sort=True,
+        )
+        return [Path(path) for path in files if matcher.fullmatch(Path(path).name)]
+
+    # If escaped path components prevent direct access, use wepy's folder
+    # inspection on the year directory and select the matching sample folder.
+    text = str(source)
+    year_match = re.match(r"^(.*\\2026)(?:\\.*)?$", text, re.IGNORECASE)
+    sample_match = re.search(r"\\2026\\_?(\d+)(?:\\|_)", text, re.IGNORECASE)
+    if year_match and sample_match:
+        for year_path in source_path_candidates(Path(year_match.group(1))):
+            folders = we.load_folders(
+                str(year_path),
+                contains_string=sample_match.group(1),
+                mode="any",
+                natural_sort=True,
+            )
+            if not isinstance(folders, list):
+                continue
+            discovered = []
+            for folder in folders:
+                files = we.load_files(
+                    folder,
+                    contains_string=["ay", "rocedure", "PEIS"],
+                    extension=".mpr",
+                    natural_sort=True,
+                )
+                discovered.extend(
+                    Path(path)
+                    for path in files
+                    if matcher.fullmatch(Path(path).name)
+                )
+            if discovered:
+                return sorted(set(discovered), key=lambda path: path.name.casefold())
+    return []
 
 
 def find_pattern_length(voltages: np.ndarray, tolerance: float = 0.01) -> int:
@@ -126,22 +175,12 @@ def import_and_label(
     circuit: str = DEFAULT_CIRCUIT,
 ) -> dict[str, int]:
     """Import matching files from *source* and atomically save labeled Cell data."""
-    source = resolve_source_path(Path(source))
+    source = Path(source)
     matcher = re.compile(filename_pattern, re.IGNORECASE)
-    candidates = [source] if source.is_file() else sorted(
-        (
-            path
-            for path in source.rglob("*")
-            if path.is_file()
-            and path.suffix.casefold() == ".mpr"
-            and matcher.fullmatch(path.name)
-        ),
-        key=lambda path: path.name.casefold(),
-    )
-    if source.is_file() and not matcher.fullmatch(source.name):
-        raise ValueError(f"file does not match --pattern: {source.name}")
+    candidates = discover_source_files(source, matcher)
     if not candidates:
-        raise FileNotFoundError(f"no .mpr files matched in {source}")
+        tried = ", ".join(str(path) for path in source_path_candidates(source))
+        raise FileNotFoundError(f"no .mpr files matched; inspected: {tried}")
 
     selection = {path.resolve(): ["cell"] for path in candidates}
     report = load_projects(

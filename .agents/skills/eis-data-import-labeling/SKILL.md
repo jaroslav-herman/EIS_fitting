@@ -5,7 +5,7 @@ description: Import BioLogic EIS files into an .eisfit project and persist repea
 
 # EIS data import and labeling
 
-Use the repository helper [load_and_label_eis.py](../../../load_and_label_eis.py) when a user asks to create an EIS project from raw files and label repeated measurement loops.
+Use the repository helper [load_and_label_eis.py](../../../load_and_label_eis.py) when a user asks to create an EIS project from raw files and label repeated measurement loops. It uses `wepy.load_folders` and `wepy.load_files` for Windows and network-folder inspection.
 
 ## Run
 
