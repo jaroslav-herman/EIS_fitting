@@ -40,6 +40,9 @@ def evaluate_circuit(circuit: str, frequency_hz, parameters) -> np.ndarray:
     frequency_hz = np.asarray(frequency_hz, dtype=float)
     values = [float(value) for value in parameters]
     model = CustomCircuit(circuit, initial_guess=values)
+    # These are explicit simulation parameters, not merely an initial guess.
+    # Mark them as active so impedance.py does not emit its misleading warning.
+    model.parameters_ = np.asarray(values, dtype=float)
     return np.asarray(model.predict(frequency_hz), dtype=complex)
 
 

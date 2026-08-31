@@ -7573,6 +7573,7 @@ class EISApplication:
             circuit = circuit_parameters(result.model_circuit)
             values = [result.model_parameters[p.name] for p in circuit]
             model = CustomCircuit(result.model_circuit, initial_guess=values)
+            model.parameters_ = np.asarray(values, dtype=float)
             return np.asarray(model.predict(frequency), dtype=complex)
         except (KeyError, TypeError, ValueError, ImportError):
             return None

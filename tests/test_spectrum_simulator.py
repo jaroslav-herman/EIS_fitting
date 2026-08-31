@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import warnings
 
 import numpy as np
 
@@ -34,6 +35,19 @@ class SpectrumSimulatorTests(unittest.TestCase):
         second = simulate_spectrum(**arguments)
         np.testing.assert_array_equal(first.impedance, second.impedance)
         self.assertFalse(np.array_equal(first.impedance, first.ideal_impedance))
+
+    def test_explicit_simulation_parameters_do_not_warn_as_initial_guess(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            simulate_spectrum(
+                "R0-p(R1,CPE1)", [10.0, 1.0], [1.0, 2.0, 1e-3, 0.9]
+            )
+        self.assertFalse(
+            any(
+                "Simulating circuit based on initial parameters" in str(item.message)
+                for item in caught
+            )
+        )
 
     def test_invalid_frequency_range_is_rejected(self):
         with self.assertRaises(ValueError):
