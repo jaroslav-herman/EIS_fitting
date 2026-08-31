@@ -57,6 +57,7 @@ def annotate_payload(payload: dict[str, object], tolerance: float = 0.01) -> dic
         datasets,
         key=lambda item: Path(str(item["state"]["source_path"])).name.casefold(),
     )
+    loop_offset = 0
     for dataset in ordered:
         frame = dataframe_from_payload(str(dataset["dataframe"]))
         cycles, voltages = _cycle_voltage_sequence(frame)
@@ -68,7 +69,7 @@ def annotate_payload(payload: dict[str, object], tolerance: float = 0.01) -> dic
             for index, cycle in enumerate(cycles)
         }
         cycle_to_loop = {
-            cycle: index // pattern_length + 1
+            cycle: loop_offset + index // pattern_length + 1
             for index, cycle in enumerate(cycles)
         }
         frame["Time"] = frame["cycle_number"].map(cycle_to_loop).astype("Int64")
@@ -95,6 +96,7 @@ def annotate_payload(payload: dict[str, object], tolerance: float = 0.01) -> dic
         state["cycles"] = annotated_cycles
         if dataset is ordered[0]:
             payload["cycles"] = annotated_cycles
+        loop_offset += len(cycles) // pattern_length
     payload["datasets"] = ordered
     return payload
 
