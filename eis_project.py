@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 from io import StringIO
 import json
 import re
@@ -14,6 +15,30 @@ from wepy.eis import tau as cpe_tau
 
 PROJECT_FORMAT = "eis-fitting-project"
 PROJECT_VERSION = 4
+
+
+def load_json_payload(path: Path) -> dict[str, object]:
+    """Load a project-like JSON payload, transparently handling gzip."""
+    raw = path.read_bytes()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("The JSON project payload must be an object")
+    return payload
+
+
+def _is_gzip_path(path: Path) -> bool:
+    return path.suffix.lower() == ".gz"
+
+
+def _json_bytes(payload: dict[str, object], *, compressed: bool) -> bytes:
+    if compressed:
+        raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
+        return gzip.compress(raw, compresslevel=9, mtime=0)
+    return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
 
 
 def _external_parameter_name(name: str) -> str:
@@ -324,7 +349,7 @@ def save_project_file(
             for dataset_id, dataset_state, dataframe in datasets
         ]
     temporary = path.with_suffix(f"{path.suffix}.tmp")
-    temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    temporary.write_bytes(_json_bytes(payload, compressed=_is_gzip_path(path)))
     temporary.replace(path)
 
 
@@ -337,7 +362,7 @@ def load_project_file(
     from eis_services import load_cycle
 
     if payload is None:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = load_json_payload(path)
     if payload.get("format") != PROJECT_FORMAT:
         raise ValueError("This is not an EIS fitting project file")
     version = int(payload.get("version", 0))

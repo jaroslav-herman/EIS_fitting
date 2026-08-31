@@ -40,6 +40,7 @@ from eis_project import (
     export_fit_parameters_for_states,
     export_python_workspace as write_python_workspace,
     load_project_file,
+    load_json_payload,
     save_project_file,
 )
 from eis_services import (
@@ -14734,7 +14735,7 @@ class EISApplication:
     def _load_saved_project(
         path: Path,
     ) -> list[tuple[str, LoadedProject, ProjectState]]:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = load_json_payload(path)
         if payload.get("format") == "eis-fitting-ml-results":
             raise ValueError(
                 "This is an ML-results sidecar, not an EIS-fit project. "
@@ -14835,7 +14836,7 @@ class EISApplication:
         self.current_dataset_id = dataset_id
         self.loaded = loaded
         self.state = restored
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = load_json_payload(path)
         self.procedure_blocks, self.procedures = self._validate_procedure_data(
             payload.get("procedure_blocks"), payload.get("procedures")
         )
@@ -14845,11 +14846,19 @@ class EISApplication:
         self.model_var.set(restored.circuit)
         self.cycle_var.set(str(restored.active_cycle))
         associated_results = path
-        if path.name.endswith(".eisfit.json"):
+        if path.name.endswith(".eisfit.json.gz"):
+            associated_results = path.with_name(
+                path.name.removesuffix(".eisfit.json.gz") + "_ml_results.json"
+            )
+        elif path.name.endswith(".eisfit.gz"):
+            associated_results = path.with_name(
+                path.name.removesuffix(".eisfit.gz") + "_ml_results.json"
+            )
+        elif path.name.endswith(".eisfit.json"):
             associated_results = path.with_name(
                 path.name.removesuffix(".eisfit.json") + "_ml_results.json"
             )
-        if "ml_results" in json.loads(path.read_text(encoding="utf-8")):
+        if "ml_results" in payload:
             associated_results = path
         if associated_results.is_file():
             self.ml_results = load_ml_results(associated_results)
