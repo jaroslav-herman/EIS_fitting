@@ -81,7 +81,15 @@ def _voltage_time_distance(target, candidate) -> float:
     return voltage + time
 
 
-def run(project: Path, results_path: Path, report_path: Path) -> dict:
+def run(
+    project: Path,
+    results_path: Path,
+    report_path: Path,
+    *,
+    preserve_existing_selection: bool = False,
+    refine_z_threshold: float = 3.5,
+    refine_iterations: int = 5,
+) -> dict:
     original_payload = load_json_payload(project)
     restored = EISApplication._load_saved_project(project)
     results = load_ml_results(results_path)
@@ -109,9 +117,9 @@ def run(project: Path, results_path: Path, report_path: Path) -> dict:
             if result is None:
                 raise ValueError(f"missing ML result for cycle {cycle.cycle} in {loaded.state.source_path.name}")
             operations.append((dataset_id, loaded, state, cycle, result))
-    if len(operations) != 288 or len(result_by_key) != 288 or len(set(expected)) != 288:
+    if len(operations) != len(result_by_key) or len(set(expected)) != len(expected):
         raise ValueError(
-            f"expected 288 unique matched spectra, got operations={len(operations)}, "
+            f"expected one result per unique spectrum, got operations={len(operations)}, "
             f"results={len(result_by_key)}, unique_keys={len(set(expected))}"
         )
 
@@ -128,6 +136,8 @@ def run(project: Path, results_path: Path, report_path: Path) -> dict:
     for dataset_id, loaded, state, cycle, result in operations:
         label = f"{loaded.state.source_path.name}, cycle {cycle.cycle}"
         try:
+            previous_manual = cycle.manually_included.copy()
+            previous_outliers = cycle.outliers.copy()
             if not result.frequency_ranges:
                 raise ValueError("ML frequency range is unavailable")
             if result.active_mask is None or result.active_mask.size != cycle.frequency_hz.size:
@@ -139,6 +149,9 @@ def run(project: Path, results_path: Path, report_path: Path) -> dict:
                 if result.outlier_mask is not None and result.outlier_mask.size == cycle.frequency_hz.size
                 else ~cycle.manually_included
             )
+            if preserve_existing_selection:
+                cycle.manually_included &= previous_manual
+                cycle.outliers |= previous_outliers
             cycle.clear_fit()
             cycle.invalidate_drt_cache()
             _set_initial_parameters(cycle, result)
@@ -155,8 +168,8 @@ def run(project: Path, results_path: Path, report_path: Path) -> dict:
                 cycle,
                 cycle.model(state.circuit),
                 copy.deepcopy(cycle.parameters),
-                3.5,
-                5,
+                refine_z_threshold,
+                refine_iterations,
                 10.0,
                 fit_options,
             )
@@ -167,7 +180,7 @@ def run(project: Path, results_path: Path, report_path: Path) -> dict:
             _apply_fit(
                 cycle,
                 refined,
-                refinement={"z_threshold": 3.5, "max_iterations": 5, "iterations": int(iterations), "removed_points": int(valid.size)},
+                refinement={"z_threshold": refine_z_threshold, "max_iterations": refine_iterations, "iterations": int(iterations), "removed_points": int(valid.size)},
             )
             report["refinement"].append({"spectrum": label, "converged": bool(refined.converged), "removed_points": int(valid.size), "iterations": int(iterations)})
             successful_cycles.append(cycle)
@@ -184,12 +197,12 @@ def run(project: Path, results_path: Path, report_path: Path) -> dict:
             fit = fit_cycle_with_timeout(cycle, cycle.model(state.circuit), cycle.parameters, 10.0, fit_options)
             _apply_fit(cycle, fit)
             report["fit"].append({"spectrum": label, "converged": bool(fit.converged), "rmse": float(fit.rmse), "retry": True, "initial_source_cycle": int(source.cycle), "initial_source_voltage": float(source.potential_v), "initial_source_time": float(source.time_s)})
-            refined, removed, iterations = refine_fit_cycle(cycle, cycle.model(state.circuit), copy.deepcopy(cycle.parameters), 3.5, 5, 10.0, fit_options)
+            refined, removed, iterations = refine_fit_cycle(cycle, cycle.model(state.circuit), copy.deepcopy(cycle.parameters), refine_z_threshold, refine_iterations, 10.0, fit_options)
             valid = removed[(removed >= 0) & (removed < cycle.frequency_hz.size)]
             cycle.manually_included[valid] = False
             cycle.outliers[valid] = True
             cycle.invalidate_drt_cache()
-            _apply_fit(cycle, refined, refinement={"z_threshold": 3.5, "max_iterations": 5, "iterations": int(iterations), "removed_points": int(valid.size), "retry": True, "initial_source_cycle": int(source.cycle)})
+            _apply_fit(cycle, refined, refinement={"z_threshold": refine_z_threshold, "max_iterations": refine_iterations, "iterations": int(iterations), "removed_points": int(valid.size), "retry": True, "initial_source_cycle": int(source.cycle)})
             report["refinement"].append({"spectrum": label, "converged": bool(refined.converged), "removed_points": int(valid.size), "iterations": int(iterations), "retry": True})
         except Exception as error:
             report["failures"].append({"spectrum": label, "stage": "retry_fit_or_refine", "error": f"{type(error).__name__}: {error}", "initial_source_cycle": int(source.cycle)})
