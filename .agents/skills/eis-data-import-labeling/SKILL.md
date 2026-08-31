@@ -17,7 +17,7 @@ From the repository root, use the project interpreter:
   ".\sample_Cell.eisfit.json.gz"
 ```
 
-The source may be one `.mpr` file or a directory. Directory contents are enumerated only through `wepy.load_files` after the sample folder is identified with `wepy.load_folders`. The import list is selected solely by `DEFAULT_FILE_CONTAINS = ("ay", "rocedure", "PEIS.mpr")` together with the `.mpr` extension. Use `--tolerance` to adjust the voltage similarity threshold used to detect the shortest repeated cycle pattern.
+The source may be one `.mpr` file or a directory. Directory contents are enumerated only through `wepy.load_files` after the sample folder is identified with `wepy.load_folders`. The import list is selected solely by `DEFAULT_FILE_CONTAINS = ("ay", "rocedure", "PEIS.mpr")` together with the `.mpr` extension. Empty files reported as having no cycles are skipped with a warning; other import errors stop the import. Use `--tolerance` to adjust the voltage similarity threshold used to detect the shortest repeated cycle pattern.
 
 ## Behavior to preserve
 

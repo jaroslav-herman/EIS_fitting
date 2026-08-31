@@ -10,6 +10,7 @@ import argparse
 from copy import deepcopy
 from pathlib import Path
 import re
+import sys
 
 import numpy as np
 import wepy.basics as we
@@ -19,6 +20,10 @@ from eis_services import load_cycle, load_projects
 
 DEFAULT_CIRCUIT = "R0-L0-p(R1,CPE1)"
 DEFAULT_FILE_CONTAINS = ("ay", "rocedure", "PEIS.mpr")
+
+
+def _is_empty_file_error(error: str) -> bool:
+    return "no cycles were found in the file" in str(error).casefold()
 
 
 def source_path_candidates(source: Path) -> list[Path]:
@@ -60,6 +65,7 @@ def discover_source_files(source: Path) -> list[Path]:
     """Inspect a source directory with wepy and return matching MPR files."""
 
     def files_from_folder(folder: str | Path) -> list[Path]:
+        print(folder)
         # load_files is deliberately the only directory enumerator used here.
         files = we.load_files(
             str(folder),
@@ -67,6 +73,7 @@ def discover_source_files(source: Path) -> list[Path]:
             extension=".mpr",
             natural_sort=True,
         )
+        print(files)
         return [Path(path) for path in files]
 
     source = Path(source)
@@ -181,13 +188,21 @@ def import_and_label(
         cycle=1,
         spectrum_kinds_by_path=selection,
     )
-    if report.errors:
-        details = "; ".join(f"{path.name}: {error}" for path, error in report.errors)
+    empty_errors = [
+        (path, error) for path, error in report.errors if _is_empty_file_error(error)
+    ]
+    for path, error in empty_errors:
+        print(f"Warning: skipping empty file {path.name}: {error}", file=sys.stderr)
+    fatal_errors = [
+        (path, error) for path, error in report.errors if not _is_empty_file_error(error)
+    ]
+    if fatal_errors:
+        details = "; ".join(f"{path.name}: {error}" for path, error in fatal_errors)
         raise RuntimeError(f"import failed: {details}")
     projects = [project for _dataset_id, project in report.loaded]
-    if len(projects) != len(candidates):
+    if not projects:
         raise RuntimeError(
-            f"expected one Cell dataset per file ({len(candidates)}), got {len(projects)}"
+            f"no non-empty Cell datasets could be imported from {len(candidates)} files"
         )
 
     offset = 0
