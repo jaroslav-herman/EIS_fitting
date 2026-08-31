@@ -10,6 +10,8 @@
 - For impedance signs, units, frequency/tau handling, CPEs, Nyquist/Bode, or DRT semantics, use `.agents/skills/eis-drt-conventions/SKILL.md`.
 - Preserve unrelated user changes. This repository may contain experimental data and generated ML artifacts that are intentionally untracked or large.
 
+After completing each task in this repository, commit the intended tracked changes and push the commit to the configured GitHub remote. Do not stage unrelated generated or untracked artifacts; preserve unrelated user changes and call out any ambiguity before committing.
+
 List the local skills without loading their bodies:
 
 ```powershell
