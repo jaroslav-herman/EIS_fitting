@@ -17,7 +17,7 @@ From the repository root, use the project interpreter:
   ".\sample_Cell.eisfit.json.gz"
 ```
 
-The source may be one matching `.mpr` file or a directory. Directories are scanned recursively. The default filename expression is case-insensitive and leaves the station prefix unrestricted; only `Day` and `Procedure` carry the numeric structure:
+The source may be one matching `.mpr` file or a directory. Directory contents are enumerated only through `wepy.load_files` after the sample folder is identified with `wepy.load_folders`. The default filename expression is case-insensitive and leaves the station prefix unrestricted; only `Day` and `Procedure` carry the numeric structure:
 
 ```text
 ^(?:.*_)?Day\d+_Procedure\d+_05_PEIS_C01\.mpr$

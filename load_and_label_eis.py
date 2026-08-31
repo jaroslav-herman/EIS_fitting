@@ -21,6 +21,7 @@ from eis_services import load_cycle, load_projects
 # Procedure numbers identify the requested measurement structure.
 DEFAULT_PATTERN = r"^(?:.*_)?Day\d+_Procedure\d+_05_PEIS_C01\.mpr$"
 DEFAULT_CIRCUIT = "R0-L0-p(R1,CPE1)"
+DEFAULT_FILE_CONTAINS = ("ay", "rocedure", "PEIS.mpr")
 
 
 def source_path_candidates(source: Path) -> list[Path]:
@@ -60,19 +61,24 @@ def resolve_source_path(source: Path) -> Path:
 
 def discover_source_files(source: Path, matcher: re.Pattern[str]) -> list[Path]:
     """Inspect a source directory with wepy and return matching MPR files."""
+
+    def files_from_folder(folder: str | Path) -> list[Path]:
+        # load_files is deliberately the only directory enumerator used here.
+        files = we.load_files(
+            str(folder),
+            contains_string=DEFAULT_FILE_CONTAINS,
+            extension=".mpr",
+            natural_sort=True,
+        )
+        return [Path(path) for path in files if matcher.fullmatch(Path(path).name)]
+
     source = Path(source)
     for candidate in source_path_candidates(source):
         if candidate.is_file():
             return [candidate] if matcher.fullmatch(candidate.name) else []
         if not candidate.is_dir():
             continue
-        files = we.load_files(
-            str(candidate),
-            contains_string=["ay", "rocedure", "PEIS"],
-            extension=".mpr",
-            natural_sort=True,
-        )
-        return [Path(path) for path in files if matcher.fullmatch(Path(path).name)]
+        return files_from_folder(candidate)
 
     # If escaped path components prevent direct access, use wepy's folder
     # inspection on the year directory and select the matching sample folder.
@@ -91,17 +97,7 @@ def discover_source_files(source: Path, matcher: re.Pattern[str]) -> list[Path]:
                 continue
             discovered = []
             for folder in folders:
-                files = we.load_files(
-                    folder,
-                    contains_string=["ay", "rocedure", "PEIS"],
-                    extension=".mpr",
-                    natural_sort=True,
-                )
-                discovered.extend(
-                    Path(path)
-                    for path in files
-                    if matcher.fullmatch(Path(path).name)
-                )
+                discovered.extend(files_from_folder(folder))
             if discovered:
                 return sorted(set(discovered), key=lambda path: path.name.casefold())
     return []
