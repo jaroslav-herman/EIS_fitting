@@ -1,0 +1,110 @@
+{
+  "training_samples": [
+    "453",
+    "457"
+  ],
+  "training_records": 1789,
+  "validation_sample": "455",
+  "validation_records": 960,
+  "training_exclusions": {
+    "missing_fit": 3
+  },
+  "circuit_classes": [
+    "R0-L0-p(R1,CPE1)",
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+    "R0-L0-p(R1,CPE1)-p(R3,CPE3)"
+  ],
+  "parameter_training": {
+    "R0": {
+      "training_spectra": 1789,
+      "target_transform": "log10",
+      "target_median": 0.024527544918526944
+    },
+    "L0": {
+      "training_spectra": 1789,
+      "target_transform": "log10",
+      "target_median": 9.723823836542942e-08
+    },
+    "R1": {
+      "training_spectra": 1789,
+      "target_transform": "log10",
+      "target_median": 0.03521452870806481
+    },
+    "CPE1_0": {
+      "training_spectra": 1789,
+      "target_transform": "log10",
+      "target_median": 0.12937814714487514
+    },
+    "CPE1_1": {
+      "training_spectra": 1789,
+      "target_transform": "identity",
+      "target_median": 0.8803783987310949
+    },
+    "R2": {
+      "training_spectra": 1425,
+      "target_transform": "log10",
+      "target_median": 0.011346236358561928
+    },
+    "CPE2_0": {
+      "training_spectra": 1425,
+      "target_transform": "log10",
+      "target_median": 0.013233325217799777
+    },
+    "CPE2_1": {
+      "training_spectra": 1425,
+      "target_transform": "identity",
+      "target_median": 0.9256575176688415
+    },
+    "R3": {
+      "training_spectra": 363,
+      "target_transform": "log10",
+      "target_median": 0.0019999999999999996
+    },
+    "CPE3_0": {
+      "training_spectra": 363,
+      "target_transform": "log10",
+      "target_median": 38.33114803372093
+    },
+    "CPE3_1": {
+      "training_spectra": 363,
+      "target_transform": "identity",
+      "target_median": 0.8899521012304872
+    }
+  },
+  "output": "ml\\analysis\\number_aware_pipeline_455\\455.eisfit_ml_results.json",
+  "deterministic_fit_requested": false,
+  "warnings": [
+    "raw-only validation has no ground-truth frequency, topology, or parameter accuracy metrics",
+    "one-process class has only one training spectrum",
+    "deterministic EEC fitting was disabled; ML initial guesses are available"
+  ],
+  "loso_validation": [
+    {
+      "held_out_sample": "453",
+      "training_samples": [
+        "457"
+      ],
+      "test_spectra": 927,
+      "frequency_mean_log_endpoint_error": 0.19641239134570143,
+      "topology_accuracy": 0.9762675296655879,
+      "topology_classes_seen_in_training": [
+        "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+        "R0-L0-p(R1,CPE1)-p(R3,CPE3)"
+      ]
+    },
+    {
+      "held_out_sample": "457",
+      "training_samples": [
+        "453"
+      ],
+      "test_spectra": 862,
+      "frequency_mean_log_endpoint_error": 0.14410548604849946,
+      "topology_accuracy": 0.9721577726218097,
+      "topology_classes_seen_in_training": [
+        "R0-L0-p(R1,CPE1)",
+        "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+        "R0-L0-p(R1,CPE1)-p(R3,CPE3)"
+      ]
+    }
+  ]
+}
