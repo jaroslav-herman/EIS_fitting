@@ -17,9 +17,6 @@ import wepy.basics as we
 from eis_project import save_project_file
 from eis_services import load_cycle, load_projects
 
-# The station identifier is intentionally unrestricted; only Day and
-# Procedure numbers identify the requested measurement structure.
-DEFAULT_PATTERN = r"^(?:.*_)?Day\d+_Procedure\d+_05_PEIS_C01\.mpr$"
 DEFAULT_CIRCUIT = "R0-L0-p(R1,CPE1)"
 DEFAULT_FILE_CONTAINS = ("ay", "rocedure", "PEIS.mpr")
 
@@ -59,7 +56,7 @@ def resolve_source_path(source: Path) -> Path:
     raise FileNotFoundError(f"source path is unavailable; tried: {formatted}")
 
 
-def discover_source_files(source: Path, matcher: re.Pattern[str]) -> list[Path]:
+def discover_source_files(source: Path) -> list[Path]:
     """Inspect a source directory with wepy and return matching MPR files."""
 
     def files_from_folder(folder: str | Path) -> list[Path]:
@@ -70,12 +67,12 @@ def discover_source_files(source: Path, matcher: re.Pattern[str]) -> list[Path]:
             extension=".mpr",
             natural_sort=True,
         )
-        return [Path(path) for path in files if matcher.fullmatch(Path(path).name)]
+        return [Path(path) for path in files]
 
     source = Path(source)
     for candidate in source_path_candidates(source):
         if candidate.is_file():
-            return [candidate] if matcher.fullmatch(candidate.name) else []
+            return [candidate] if candidate.suffix.casefold() == ".mpr" else []
         if not candidate.is_dir():
             continue
         return files_from_folder(candidate)
@@ -166,14 +163,12 @@ def import_and_label(
     source: Path,
     output: Path,
     *,
-    filename_pattern: str = DEFAULT_PATTERN,
     tolerance: float = 0.01,
     circuit: str = DEFAULT_CIRCUIT,
 ) -> dict[str, int]:
     """Import matching files from *source* and atomically save labeled Cell data."""
     source = Path(source)
-    matcher = re.compile(filename_pattern, re.IGNORECASE)
-    candidates = discover_source_files(source, matcher)
+    candidates = discover_source_files(Path(source))
     if not candidates:
         tried = ", ".join(str(path) for path in source_path_candidates(source))
         raise FileNotFoundError(f"no .mpr files matched; inspected: {tried}")
@@ -220,14 +215,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help=".mpr file or directory to scan")
     parser.add_argument("output", type=Path, help="output .eisfit.json or .json.gz")
-    parser.add_argument("--pattern", default=DEFAULT_PATTERN, help="regular expression for filenames")
     parser.add_argument("--tolerance", type=float, default=0.01, help="voltage tolerance in volts")
     parser.add_argument("--circuit", default=DEFAULT_CIRCUIT, help="initial EEC circuit")
     args = parser.parse_args()
     import_and_label(
         args.source,
         args.output,
-        filename_pattern=args.pattern,
         tolerance=args.tolerance,
         circuit=args.circuit,
     )
