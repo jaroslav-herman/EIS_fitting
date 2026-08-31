@@ -19,7 +19,8 @@ import tempfile
 import numpy as np
 import pandas as pd
 
-from eis_project import dataframe_from_payload, load_json_payload
+from eis_project import _cycle_to_dict, dataframe_from_payload, load_json_payload
+from eis_services import load_cycle
 
 
 def _cycle_voltage_sequence(frame: pd.DataFrame) -> tuple[list[int], np.ndarray]:
@@ -75,6 +76,25 @@ def annotate_payload(payload: dict[str, object], tolerance: float = 0.01) -> dic
         dataset["dataframe"] = frame.to_json(orient="split", date_format="iso")
         dataset["pattern_length"] = pattern_length
         dataset["pattern_loops"] = len(cycles) // pattern_length
+        state = dataset["state"]
+        control = str(state.get("control", "cell"))
+        saved_cycles = state.get("cycles", {})
+        annotated_cycles = {}
+        for cycle in cycles:
+            cycle_state = load_cycle(frame, cycle, control)
+            cycle_state.custom_metadata.update(
+                {"Time": cycle_to_loop[cycle], "Cycle mod": cycle_to_position[cycle]}
+            )
+            cycle_payload = _cycle_to_dict(cycle_state)
+            previous = saved_cycles.get(str(cycle)) if isinstance(saved_cycles, dict) else None
+            if isinstance(previous, dict):
+                previous = dict(previous)
+                previous["custom_metadata"] = cycle_payload["custom_metadata"]
+                cycle_payload = previous
+            annotated_cycles[str(cycle)] = cycle_payload
+        state["cycles"] = annotated_cycles
+        if dataset is ordered[0]:
+            payload["cycles"] = annotated_cycles
     payload["datasets"] = ordered
     return payload
 
