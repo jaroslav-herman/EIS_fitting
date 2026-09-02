@@ -37,6 +37,8 @@ class MlTests(unittest.TestCase):
             (1, True, "R0-L0-p(R1,CPE1)"),
             (2, False, "R0-p(R1,CPE1)-p(R2,CPE2)"),
             (2, True, "R0-L0-p(R1,CPE1)-p(R2,CPE2)"),
+            (3, False, "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)"),
+            (3, True, "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)"),
         )
         for process_count, l0_required, expected in cases:
             result = MLResult(
@@ -47,6 +49,11 @@ class MlTests(unittest.TestCase):
             self.assertEqual(suggested_eec(result), expected)
         self.assertIsNone(suggested_eec(MLResult("missing")))
         self.assertIsNone(suggested_eec(MLResult("invalid", suggested_eec="invalid")))
+        explicit_three_block = "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)"
+        self.assertEqual(
+            suggested_eec(MLResult("explicit", suggested_eec=explicit_three_block)),
+            explicit_three_block,
+        )
 
     def test_ml_json_keeps_source_cycle_identity_and_metadata(self):
         spectra = []

@@ -14,6 +14,8 @@ ML_EEC_MODELS = {
     "R0-L0-p(R1,CPE1)",
     "R0-p(R1,CPE1)-p(R2,CPE2)",
     "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+    "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
     "R0-L0-p(R1,CPE1)-p(R3,CPE3)",
     "R0-p(R1,CPE1)-p(R3,CPE3)",
 }
@@ -82,7 +84,7 @@ def suggested_eec(result: MLResult) -> str | None:
     explicit = (result.suggested_eec or "").strip()
     if explicit in ML_EEC_MODELS:
         return explicit
-    if result.predicted_process_count not in (1, 2):
+    if result.predicted_process_count not in (1, 2, 3):
         return None
     if result.predicted_l0_required is None:
         return None
@@ -90,6 +92,8 @@ def suggested_eec(result: MLResult) -> str | None:
     branches = "p(R1,CPE1)"
     if result.predicted_process_count == 2:
         branches += "-p(R2,CPE2)"
+    elif result.predicted_process_count == 3:
+        branches += "-p(R2,CPE2)-p(R3,CPE3)"
     return f"{prefix}-{branches}"
 
 
