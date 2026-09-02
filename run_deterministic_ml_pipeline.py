@@ -19,7 +19,7 @@ DEFAULT_MODEL = (
     Path(__file__).resolve().parent
     / "ml"
     / "analysis"
-    / "number_aware_pipeline_455"
+    / "number_aware_pipeline_453_455_457_voltage"
     / "pipeline.joblib"
 )
 

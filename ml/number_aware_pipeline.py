@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import gzip
 import json
 from pathlib import Path
 import sys
@@ -222,7 +223,15 @@ def _fit_topology(records: list[SpectrumRecord], seed: int) -> tuple[SpectrumPre
 def _fit_parameters(records: list[SpectrumRecord], projects: list[Path]) -> tuple[SpectrumPreprocessor, dict[str, object], dict[str, dict]]:
     preprocessor = SpectrumPreprocessor(grid_size=64, use_metadata=True, spectrum_mode="raw", include_impedance_scale=True)
     x = preprocessor.fit_transform(records)
-    payloads = {str(Path(path).resolve()): json.loads(Path(path).read_text(encoding="utf-8")) for path in projects}
+    payloads = {}
+    for path in projects:
+        path = Path(path)
+        if path.suffix.lower() == ".gz":
+            handle = gzip.open(path, "rt", encoding="utf-8")
+        else:
+            handle = path.open("r", encoding="utf-8")
+        with handle:
+            payloads[str(path.resolve())] = json.load(handle)
     targets: dict[str, list[float]] = {}
     target_rows: dict[str, list[int]] = {}
     for index, record in enumerate(records):

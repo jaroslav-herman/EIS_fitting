@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import gzip
 import json
 from pathlib import Path
 import re
@@ -16,6 +17,7 @@ from eis_services import load_cycle
 KNOWN_EEC_TOPOLOGIES = {
     "R0-L0-p(R1,CPE1)",
     "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
     "R0-L0-p(R1,CPE1)-p(R3,CPE3)",
     "R0-p(R1,CPE1)",
     "R0-p(R1,CPE1)-p(R2,CPE2)",
@@ -32,6 +34,8 @@ def canonical_electrochemical_topology(original: str) -> str | None:
         "R0-p(R1,CPE1)-p(R2,CPE2)": "R0-p(R1,CPE1)-p(R2,CPE2)",
         "R0-L0-p(R1,CPE1)-p(R3,CPE3)": "R0-p(R1,CPE1)-p(R3,CPE3)",
         "R0-p(R1,CPE1)-p(R3,CPE3)": "R0-p(R1,CPE1)-p(R3,CPE3)",
+        "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)": "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+        "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)": "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
     }
     return mapping.get(original.strip())
 
@@ -117,6 +121,16 @@ def _number(value) -> float | None:
     return value if np.isfinite(value) else None
 
 
+def _read_project_payload(path: Path) -> dict:
+    """Read a project payload from plain or gzip-compressed JSON."""
+    if path.suffix.lower() == ".gz":
+        handle = gzip.open(path, "rt", encoding="utf-8")
+    else:
+        handle = path.open("r", encoding="utf-8")
+    with handle:
+        return json.load(handle)
+
+
 def _payload_projects(payload: dict) -> list[tuple[dict, dict]]:
     datasets = payload.get("datasets")
     if datasets:
@@ -146,7 +160,7 @@ def load_eisfit_projects(
             report.exclusions.append({"spectrum_id": str(path), "reason": "missing_sample_id"})
             continue
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = _read_project_payload(path)
         except Exception as error:
             report.exclusions.append({"spectrum_id": str(path), "reason": f"invalid_project:{type(error).__name__}"})
             continue
