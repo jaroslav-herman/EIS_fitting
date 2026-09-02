@@ -2372,18 +2372,6 @@ class EISApplication:
             text="Restore Original Selection",
             command=self.restore_ml_original_selection,
         ).pack(side=tk.LEFT, padx=(8, 0))
-        for text, variable in (
-            ("Frequency ranges", self.show_ml_frequency_ranges_var),
-            ("Active points", self.show_ml_active_points_var),
-            ("EEC model", self.show_ml_model_var),
-            ("Residuals", self.show_ml_residuals_var),
-        ):
-            ttk.Checkbutton(
-                self.ml_controls,
-                text=text,
-                variable=variable,
-                command=self._refresh_ml_visuals,
-            ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(
             self.ml_controls, textvariable=self.ml_results_status_var
         ).pack(side=tk.LEFT, padx=(10, 0))
