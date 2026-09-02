@@ -2451,6 +2451,10 @@ class EISApplication:
                 x_root = widget.winfo_rootx() + event.x * widget.winfo_width() / max(figure_width, 1)
                 y_root = widget.winfo_rooty() + widget.winfo_height() - event.y * widget.winfo_height() / max(figure_height, 1)
             menu = tk.Menu(menu_owner, tearoff=False)
+            # Keep the Tcl/Tk menu alive after this callback returns.  A local
+            # Menu can otherwise be garbage-collected while the popup is open,
+            # especially after repeated right-clicks on recreated plot canvases.
+            canvas._eis_plot_context_menu = menu
             menu.add_command(
                 label="Save graph",
                 command=lambda: self._save_plot_graph(
@@ -6067,7 +6071,7 @@ class EISApplication:
     def _parameter_mousewheel(self, event):
         try:
             widget = self.root.winfo_containing(event.x_root, event.y_root)
-        except tk.TclError:
+        except (KeyError, tk.TclError):
             return None
         inside = False
         while widget is not None:
