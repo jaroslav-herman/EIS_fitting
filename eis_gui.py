@@ -2433,25 +2433,23 @@ class EISApplication:
         menu_owner = owner or self.root
         widget = canvas.get_tk_widget()
 
-        def axes_at_event(event):
-            figure_width, figure_height = canvas.figure.canvas.get_width_height()
-            widget_width = max(widget.winfo_width(), 1)
-            widget_height = max(widget.winfo_height(), 1)
-            display_x = event.x * figure_width / widget_width
-            display_y = (widget_height - event.y) * figure_height / widget_height
-            for axes in reversed(canvas.figure.axes):
-                if axes.get_visible() and axes.bbox.contains(display_x, display_y):
-                    return axes
-            return None
-
         def show_menu(event) -> str | None:
+            if event.button != 3:
+                return None
             if self.point_toggle_mode or self.point_auto_fit:
                 # Let Matplotlib deliver the right-click event to the point
                 # editor instead of opening the graph context menu.
                 return None
-            axes = axes_at_event(event)
+            axes = event.inaxes
             if axes is None:
-                return "break"
+                return None
+            gui_event = getattr(event, "guiEvent", None)
+            x_root = getattr(gui_event, "x_root", None)
+            y_root = getattr(gui_event, "y_root", None)
+            if x_root is None or y_root is None:
+                figure_width, figure_height = canvas.figure.canvas.get_width_height()
+                x_root = widget.winfo_rootx() + event.x * widget.winfo_width() / max(figure_width, 1)
+                y_root = widget.winfo_rooty() + widget.winfo_height() - event.y * widget.winfo_height() / max(figure_height, 1)
             menu = tk.Menu(menu_owner, tearoff=False)
             menu.add_command(
                 label="Save graph",
@@ -2471,12 +2469,12 @@ class EISApplication:
                 command=lambda: self._export_displayed_plot_data(axes, menu_owner),
             )
             try:
-                menu.tk_popup(event.x_root, event.y_root)
+                menu.tk_popup(int(x_root), int(y_root))
             finally:
                 menu.grab_release()
-            return "break"
+            return None
 
-        widget.bind("<Button-3>", show_menu, add="+")
+        canvas.mpl_connect("button_press_event", show_menu)
 
     def _save_plot_graph(self, figure, axes, owner: tk.Misc | None = None) -> None:
         title = axes.get_title().strip() or "plot"
