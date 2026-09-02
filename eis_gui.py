@@ -88,6 +88,48 @@ from ml.runtime_inference import (
 )
 from ml.number_aware_pipeline import infer_bundle_records, load_pipeline_bundle
 from spectrum_simulator import logarithmic_frequencies, simulate_spectrum
+
+
+def extract_metadata_value_from_filename(
+    filename: str, expression: str, capture_group: str | None = None
+) -> object:
+    """Extract and sensibly type one metadata value from a source filename."""
+    try:
+        pattern = re.compile(expression)
+    except re.error as error:
+        raise ValueError(f"invalid regular expression: {error}") from error
+    group_names = list(pattern.groupindex)
+    if not group_names:
+        raise ValueError("the regular expression must contain a named capture group")
+    group = (capture_group or "").strip()
+    if not group:
+        if len(group_names) != 1:
+            raise ValueError(
+                "specify the capture group when the expression has multiple named groups"
+            )
+        group = group_names[0]
+    if group not in pattern.groupindex:
+        raise ValueError(f"named capture group '{group}' was not found")
+
+    names = [Path(filename).stem, Path(filename).name]
+    match = next(
+        (match for candidate in names if candidate for match in [pattern.search(candidate)] if match),
+        None,
+    )
+    if match is None:
+        raise ValueError("filename did not match the expression")
+    value = match.group(group).strip()
+    if not value:
+        raise ValueError("the named capture group produced an empty value")
+    if re.fullmatch(r"[+-]?\d+", value):
+        return int(value)
+    try:
+        numeric_value = float(value)
+    except ValueError:
+        return value
+    if not np.isfinite(numeric_value):
+        raise ValueError("the named capture group produced a non-finite number")
+    return numeric_value
 from extract_relaxis import export_to_eisfit_json
 from explorer_filter import (
     FilterCondition,
@@ -564,20 +606,24 @@ class MetadataEditDialog(tk.Toplevel):
         spectrum_count: int,
         columns: list[str],
         initial_column: str | None = None,
+        source_filenames: list[str] | None = None,
     ) -> None:
         super().__init__(parent)
-        self.result: tuple[str, list[str | None], bool] | None = None
+        self.result: tuple[str, list[object], bool] | None = None
         self.spectrum_count = spectrum_count
+        self.source_filenames = source_filenames or []
+        self._filename_preview_key: tuple[str, str, str] | None = None
+        self._filename_preview_values: list[object] | None = None
         self.title("Edit metadata column")
-        self.geometry("520x430")
-        self.minsize(420, 320)
+        self.geometry("700x620")
+        self.minsize(560, 430)
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
 
         body = ttk.Frame(self, padding=12)
         body.pack(fill=tk.BOTH, expand=True)
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(4, weight=1)
+        body.rowconfigure(5, weight=1)
         ttk.Label(body, text="Metadata column").grid(row=0, column=0, sticky="w")
         default_column = initial_column if initial_column in columns else columns[0]
         self.column_var = tk.StringVar(value=default_column)
@@ -602,6 +648,35 @@ class MetadataEditDialog(tk.Toplevel):
         )
         self.new_column_entry = ttk.Entry(new_column_frame, state="disabled")
         self.new_column_entry.grid(row=0, column=2, sticky="ew")
+        self.filename_mode_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            new_column_frame,
+            text="Create column from source filename",
+            variable=self.filename_mode_var,
+            command=self._toggle_filename_mode,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        filename_frame = ttk.LabelFrame(body, text="Source filename rule", padding=8)
+        filename_frame.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        filename_frame.columnconfigure(1, weight=1)
+        ttk.Label(filename_frame, text="Regular expression").grid(
+            row=0, column=0, padx=(0, 8), sticky="w"
+        )
+        self.filename_expression_entry = ttk.Entry(filename_frame, state="disabled")
+        self.filename_expression_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Label(filename_frame, text="Value capture group").grid(
+            row=1, column=0, padx=(0, 8), pady=(6, 0), sticky="w"
+        )
+        self.filename_group_box = ttk.Combobox(filename_frame, state="disabled")
+        self.filename_group_box.grid(row=1, column=1, pady=(6, 0), sticky="ew")
+        ttk.Button(
+            filename_frame,
+            text="Preview filename values",
+            command=self._preview_filename_values,
+        ).grid(row=2, column=1, pady=(8, 0), sticky="e")
+        self.filename_preview = tk.Text(
+            filename_frame, height=7, state="disabled", wrap="none"
+        )
+        self.filename_preview.grid(row=3, column=0, columnspan=2, pady=(8, 0), sticky="ew")
         ttk.Label(
             body,
             text=(
@@ -610,9 +685,9 @@ class MetadataEditDialog(tk.Toplevel):
             ),
             wraplength=470,
             justify=tk.LEFT,
-        ).grid(row=3, column=0, sticky="w", pady=(0, 6))
+        ).grid(row=4, column=0, sticky="w", pady=(0, 6))
         text_frame = ttk.Frame(body)
-        text_frame.grid(row=4, column=0, sticky="nsew")
+        text_frame.grid(row=5, column=0, sticky="nsew")
         text_frame.columnconfigure(0, weight=1)
         text_frame.rowconfigure(0, weight=1)
         self.values_text = tk.Text(text_frame, wrap="none", undo=True)
@@ -623,7 +698,7 @@ class MetadataEditDialog(tk.Toplevel):
         self.values_text.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
         buttons = ttk.Frame(body)
-        buttons.grid(row=5, column=0, sticky="e", pady=(10, 0))
+        buttons.grid(row=6, column=0, sticky="e", pady=(10, 0))
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(
             side=tk.RIGHT, padx=(6, 0)
         )
@@ -644,6 +719,75 @@ class MetadataEditDialog(tk.Toplevel):
         if enabled:
             self.new_column_entry.focus_set()
 
+    def _toggle_filename_mode(self) -> None:
+        enabled = self.filename_mode_var.get()
+        self.new_column_var.set(enabled)
+        self.new_column_entry.configure(state="normal" if enabled else "disabled")
+        self.filename_expression_entry.configure(
+            state="normal" if enabled else "disabled"
+        )
+        self.filename_group_box.configure(state="normal" if enabled else "disabled")
+        if enabled:
+            self.new_column_entry.focus_set()
+
+    def _set_filename_preview(self, text: str) -> None:
+        self.filename_preview.configure(state="normal")
+        self.filename_preview.delete("1.0", tk.END)
+        self.filename_preview.insert("1.0", text)
+        self.filename_preview.configure(state="disabled")
+
+    def _preview_filename_values(self) -> bool:
+        column = self.new_column_entry.get().strip()
+        expression = self.filename_expression_entry.get().strip()
+        group = self.filename_group_box.get().strip()
+        if not column or not expression:
+            messagebox.showerror(
+                "Incomplete filename rule",
+                "Enter a new column name and regular expression.",
+                parent=self,
+            )
+            return False
+        try:
+            compiled = re.compile(expression)
+            self.filename_group_box.configure(values=list(compiled.groupindex))
+        except re.error as error:
+            self._filename_preview_key = None
+            self._filename_preview_values = None
+            self._set_filename_preview(f"ERROR: {error}")
+            messagebox.showerror("Invalid filename rule", str(error), parent=self)
+            return False
+        grouped: dict[str, tuple[object | None, int, str | None]] = {}
+        values: list[object] = []
+        for filename in self.source_filenames:
+            try:
+                value = extract_metadata_value_from_filename(
+                    filename, expression, group or None
+                )
+                values.append(value)
+                error_text = None
+            except ValueError as error:
+                value = None
+                error_text = str(error)
+            previous = grouped.get(filename)
+            grouped[filename] = (
+                value if previous is None or previous[2] is not None else previous[0],
+                previous[1] + 1 if previous else 1,
+                error_text or (previous[2] if previous else None),
+            )
+        lines = ["Source file\tValue\tSelected spectra"]
+        lines.extend(
+            f"{filename}\t{('ERROR: ' + error) if error else value}\t{count}"
+            for filename, (value, count, error) in grouped.items()
+        )
+        self._set_filename_preview("\n".join(lines))
+        if any(error for _value, _count, error in grouped.values()):
+            self._filename_preview_key = None
+            self._filename_preview_values = None
+            return False
+        self._filename_preview_key = (column, expression, group)
+        self._filename_preview_values = values
+        return True
+
     def _selected_column_name(self) -> tuple[str, bool] | None:
         if not self.new_column_var.get():
             return self.column_var.get(), False
@@ -658,6 +802,22 @@ class MetadataEditDialog(tk.Toplevel):
         return name, True
 
     def _accept(self, repeat_pattern: bool = False) -> None:
+        if self.filename_mode_var.get():
+            if not self._preview_filename_values():
+                return
+            if not messagebox.askyesno(
+                "Apply filename metadata",
+                "Apply the previewed values to the selected spectra?",
+                parent=self,
+            ):
+                return
+            self.result = (
+                self.new_column_entry.get().strip(),
+                list(self._filename_preview_values or []),
+                True,
+            )
+            self.destroy()
+            return
         selected_column = self._selected_column_name()
         if selected_column is None:
             return
@@ -13383,6 +13543,7 @@ class EISApplication:
             len(selected_rows),
             editable_columns,
             self._last_metadata_edit_column.get(self._metadata_edit_project_key()),
+            [loaded.state.source_path.name for _dataset_id, loaded, _spectrum in selected_rows],
         )
         self.root.wait_window(dialog)
         if dialog.result is None:
