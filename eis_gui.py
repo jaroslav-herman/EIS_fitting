@@ -130,6 +130,39 @@ def extract_metadata_value_from_filename(
     if not np.isfinite(numeric_value):
         raise ValueError("the named capture group produced a non-finite number")
     return numeric_value
+
+
+def suggest_metadata_filename_regex(filenames: list[str]) -> str | None:
+    """Suggest a regex for the single variable portion shared by filenames."""
+    stems = list(dict.fromkeys(Path(filename).stem for filename in filenames if filename))
+    if len(stems) < 2:
+        return None
+    prefix = os.path.commonprefix(stems)
+    suffix = os.path.commonprefix([stem[::-1] for stem in stems])[::-1]
+    # Prefer complete filename tokens over a coincidental shared suffix such
+    # as the ``2`` in ``N2``/``O2``.
+    while suffix and suffix[0].isalnum():
+        suffix = suffix[1:]
+    if len(prefix) + len(suffix) >= min(len(stem) for stem in stems):
+        return None
+    values = [stem[len(prefix) : len(stem) - len(suffix) or None] for stem in stems]
+    if len(set(values)) < 2 or any(not value for value in values):
+        return None
+    if all(re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", value) for value in values):
+        value_pattern = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+    else:
+        value_pattern = r".+?"
+    expression = f"^{re.escape(prefix)}(?P<value>{value_pattern}){re.escape(suffix)}$"
+    try:
+        if any(
+            extract_metadata_value_from_filename(filename, expression, "value")
+            is None
+            for filename in stems
+        ):
+            return None
+    except ValueError:
+        return None
+    return expression
 from extract_relaxis import export_to_eisfit_json
 from explorer_filter import (
     FilterCondition,
@@ -607,11 +640,13 @@ class MetadataEditDialog(tk.Toplevel):
         columns: list[str],
         initial_column: str | None = None,
         source_filenames: list[str] | None = None,
+        suggestion_filenames: list[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.result: tuple[str, list[object], bool] | None = None
         self.spectrum_count = spectrum_count
         self.source_filenames = source_filenames or []
+        self.suggestion_filenames = suggestion_filenames or self.source_filenames
         self._filename_preview_key: tuple[str, str, str] | None = None
         self._filename_preview_values: list[object] | None = None
         self.title("Edit metadata column")
@@ -663,6 +698,11 @@ class MetadataEditDialog(tk.Toplevel):
         )
         self.filename_expression_entry = ttk.Entry(filename_frame, state="disabled")
         self.filename_expression_entry.grid(row=0, column=1, sticky="ew")
+        ttk.Button(
+            filename_frame,
+            text="Suggest from loaded filenames",
+            command=self._suggest_filename_expression,
+        ).grid(row=0, column=2, padx=(8, 0), sticky="e")
         ttk.Label(filename_frame, text="Value capture group").grid(
             row=1, column=0, padx=(0, 8), pady=(6, 0), sticky="w"
         )
@@ -735,6 +775,23 @@ class MetadataEditDialog(tk.Toplevel):
         self.filename_preview.delete("1.0", tk.END)
         self.filename_preview.insert("1.0", text)
         self.filename_preview.configure(state="disabled")
+
+    def _suggest_filename_expression(self) -> None:
+        expression = suggest_metadata_filename_regex(self.suggestion_filenames)
+        if expression is None:
+            messagebox.showinfo(
+                "No filename pattern found",
+                "At least two loaded filenames with one shared variable portion are needed.",
+                parent=self,
+            )
+            return
+        self.filename_expression_entry.delete(0, tk.END)
+        self.filename_expression_entry.insert(0, expression)
+        self.filename_group_box.set("value")
+        self.filename_group_box.configure(values=("value",))
+        self._set_filename_preview(
+            "Suggested from the loaded filenames. Review the expression, then preview values."
+        )
 
     def _preview_filename_values(self) -> bool:
         column = self.new_column_entry.get().strip()
@@ -13544,6 +13601,10 @@ class EISApplication:
             editable_columns,
             self._last_metadata_edit_column.get(self._metadata_edit_project_key()),
             [loaded.state.source_path.name for _dataset_id, loaded, _spectrum in selected_rows],
+            [
+                loaded.state.source_path.name
+                for loaded in self.loaded_projects.values()
+            ],
         )
         self.root.wait_window(dialog)
         if dialog.result is None:

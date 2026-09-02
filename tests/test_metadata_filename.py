@@ -1,6 +1,9 @@
 import unittest
 
-from eis_gui import extract_metadata_value_from_filename
+from eis_gui import (
+    extract_metadata_value_from_filename,
+    suggest_metadata_filename_regex,
+)
 
 
 class MetadataFilenameTests(unittest.TestCase):
@@ -38,6 +41,38 @@ class MetadataFilenameTests(unittest.TestCase):
             ),
             2,
         )
+
+    def test_suggests_shared_numeric_filename_pattern(self):
+        expression = suggest_metadata_filename_regex(
+            [
+                "GEISs_at_N2_flow_2_sccm_automated_C02.mpt",
+                "GEISs_at_N2_flow_80_sccm_automated_C02.mpt",
+            ]
+        )
+        self.assertIsNotNone(expression)
+        self.assertEqual(
+            extract_metadata_value_from_filename(
+                "GEISs_at_N2_flow_2_sccm_automated_C02.mpt", expression, "value"
+            ),
+            2,
+        )
+        self.assertEqual(
+            extract_metadata_value_from_filename(
+                "GEISs_at_N2_flow_80_sccm_automated_C02.mpt", expression, "value"
+            ),
+            80,
+        )
+
+    def test_suggests_text_pattern_and_returns_none_without_variation(self):
+        expression = suggest_metadata_filename_regex(
+            ["sample_N2_run.mpt", "sample_O2_run.mpt"]
+        )
+        self.assertIsNotNone(expression)
+        self.assertEqual(
+            extract_metadata_value_from_filename("sample_N2_run.mpt", expression),
+            "N2",
+        )
+        self.assertIsNone(suggest_metadata_filename_regex(["same.mpt", "same.mpt"]))
 
     def test_invalid_rules_and_unmatched_files(self):
         cases = [
