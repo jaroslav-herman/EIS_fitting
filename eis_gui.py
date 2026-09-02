@@ -172,7 +172,12 @@ from explorer_filter import (
     field_operators,
 )
 from plot_export import extract_displayed_series, write_displayed_csv
-from circuit_structure import circuits_equivalent, map_parameter_name, parameter_name_mapping
+from circuit_structure import (
+    circuits_equivalent,
+    map_parameter_name,
+    parameter_name_mapping,
+    parse_circuit,
+)
 
 
 # Configure Matplotlib before any application figure or text artist is created.
@@ -10589,26 +10594,66 @@ class EISApplication:
         )
 
     @staticmethod
-    def _switch_parameter_blocks(state: ProjectState, cycle) -> bool:
-        circuit = re.sub(r"\s+", "", cycle.model(state.circuit))
-        if circuit != "R0-L0-p(R1,CPE1)-p(R2,CPE2)":
+    def _rcpe_block_ids(circuit: str) -> tuple[str, ...]:
+        """Return R/CPE branch suffixes in circuit order."""
+        try:
+            root = parse_circuit(circuit)
+        except ValueError:
+            return ()
+        block_ids: list[str] = []
+
+        def visit(node) -> None:
+            if node.kind == "parallel":
+                elements = [
+                    child.value
+                    for child in node.children
+                    if child.kind == "element" and child.value
+                ]
+                if len(elements) == 2:
+                    resistance = next(
+                        (
+                            match
+                            for value in elements
+                            if (match := re.fullmatch(r"R(\d+)", value)) is not None
+                        ),
+                        None,
+                    )
+                    cpe = next(
+                        (
+                            match
+                            for value in elements
+                            if (match := re.fullmatch(r"CPE(\d+)", value)) is not None
+                        ),
+                        None,
+                    )
+                    if resistance is not None and cpe is not None:
+                        if resistance.group(1) == cpe.group(1):
+                            block_ids.append(resistance.group(1))
+            for child in node.children:
+                visit(child)
+
+        visit(root)
+        return tuple(dict.fromkeys(block_ids))
+
+    @staticmethod
+    def _switch_parameter_blocks(
+        state: ProjectState,
+        cycle,
+        first_id: str = "1",
+        second_id: str = "2",
+    ) -> bool:
+        group_ids = EISApplication._rcpe_block_ids(cycle.model(state.circuit))
+        if len(group_ids) < 2 or first_id == second_id:
+            return False
+        if first_id not in group_ids or second_id not in group_ids:
             return False
         parameters = {parameter.name: parameter for parameter in cycle.parameters}
-        names = (
-            "R1",
-            "R2",
-            "CPE1_0",
-            "CPE2_0",
-            "CPE1_1",
-            "CPE2_1",
-        )
+        first_names = (f"R{first_id}", f"CPE{first_id}_0", f"CPE{first_id}_1")
+        second_names = (f"R{second_id}", f"CPE{second_id}_0", f"CPE{second_id}_1")
+        names = (*first_names, *second_names)
         if any(name not in parameters for name in names):
             return False
-        for first_name, second_name in (
-            ("R1", "R2"),
-            ("CPE1_0", "CPE2_0"),
-            ("CPE1_1", "CPE2_1"),
-        ):
+        for first_name, second_name in zip(first_names, second_names):
             first = parameters[first_name]
             second = parameters[second_name]
             first.initial, second.initial = second.initial, first.initial
@@ -10622,11 +10667,7 @@ class EISApplication:
                 parameter.name: float(value)
                 for parameter, value in zip(cycle.parameters, cycle.fit_parameters)
             }
-            for first_name, second_name in (
-                ("R1", "R2"),
-                ("CPE1_0", "CPE2_0"),
-                ("CPE1_1", "CPE2_1"),
-            ):
+            for first_name, second_name in zip(first_names, second_names):
                 fitted[first_name], fitted[second_name] = (
                     fitted[second_name],
                     fitted[first_name],
@@ -10638,6 +10679,61 @@ class EISApplication:
         cycle.invalidate_drt_cache()
         return True
 
+    def _choose_parameter_blocks(self, group_ids: tuple[str, ...]) -> tuple[str, str] | None:
+        popup = tk.Toplevel(self.root)
+        popup.title("Switch parameter blocks")
+        popup.transient(self.root)
+        popup.resizable(False, False)
+        popup.columnconfigure(1, weight=1)
+        result: list[tuple[str, str] | None] = [None]
+        block_values = tuple(f"Block {group_id} (R{group_id}, CPE{group_id})" for group_id in group_ids)
+        display_to_id = dict(zip(block_values, group_ids))
+        first_var = tk.StringVar(value=block_values[0])
+        second_var = tk.StringVar(value=block_values[1])
+
+        ttk.Label(
+            popup,
+            text="Select the two R/CPE blocks whose complete parameter groups should be exchanged.",
+            wraplength=430,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=2, padx=14, pady=(14, 12), sticky="w")
+        ttk.Label(popup, text="First block").grid(row=1, column=0, padx=(14, 8), pady=4, sticky="w")
+        ttk.Combobox(
+            popup, textvariable=first_var, values=block_values, state="readonly", width=30
+        ).grid(row=1, column=1, padx=(0, 14), pady=4, sticky="ew")
+        ttk.Label(popup, text="Second block").grid(row=2, column=0, padx=(14, 8), pady=4, sticky="w")
+        ttk.Combobox(
+            popup, textvariable=second_var, values=block_values, state="readonly", width=30
+        ).grid(row=2, column=1, padx=(0, 14), pady=4, sticky="ew")
+
+        buttons = ttk.Frame(popup)
+        buttons.grid(row=3, column=0, columnspan=2, padx=14, pady=(12, 14), sticky="e")
+
+        def close() -> None:
+            popup.grab_release()
+            popup.destroy()
+
+        def confirm() -> None:
+            first_id = display_to_id[first_var.get()]
+            second_id = display_to_id[second_var.get()]
+            if first_id == second_id:
+                messagebox.showerror(
+                    "Choose two different blocks",
+                    "Select two different R/CPE blocks to switch.",
+                    parent=popup,
+                )
+                return
+            result[0] = (first_id, second_id)
+            close()
+
+        ttk.Button(buttons, text="Switch", command=confirm).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="Cancel", command=close).pack(side=tk.LEFT, padx=3)
+        popup.protocol("WM_DELETE_WINDOW", close)
+        popup.grab_set()
+        popup.focus_force()
+        popup.wait_window()
+        return result[0]
+
     def switch_selected_parameter_blocks(self) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
@@ -10645,10 +10741,25 @@ class EISApplication:
         if not selected_rows:
             self._update_status("select one or more spectra in the explorer first")
             return
-        changed = 0
+        available_blocks: tuple[str, ...] = ()
+        selected_cycles = []
         for _dataset_id, loaded, spectrum in selected_rows:
             cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
-            if self._switch_parameter_blocks(loaded.state, cycle):
+            group_ids = self._rcpe_block_ids(cycle.model(loaded.state.circuit))
+            if len(group_ids) > len(available_blocks):
+                available_blocks = group_ids
+            selected_cycles.append((loaded, cycle))
+        if len(available_blocks) < 2:
+            self._update_status("switch blocks requires at least two R/CPE blocks")
+            return
+        block_pair = (available_blocks[0], available_blocks[1])
+        if len(available_blocks) > 2:
+            block_pair = self._choose_parameter_blocks(available_blocks)
+            if block_pair is None:
+                return
+        changed = 0
+        for loaded, cycle in selected_cycles:
+            if self._switch_parameter_blocks(loaded.state, cycle, *block_pair):
                 changed += 1
         self._restore_controls()
         self._refresh_explorer_values()
@@ -10656,7 +10767,7 @@ class EISApplication:
         self._update_status(
             f"parameter blocks switched for {changed} selected spectra"
             if changed
-            else "switch blocks requires R0-L0-p(R1,CPE1)-p(R2,CPE2)"
+            else "selected spectra do not contain the chosen R/CPE blocks"
         )
 
     def _sort_cycle_parameters_by_tau(
