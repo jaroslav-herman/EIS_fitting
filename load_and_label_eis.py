@@ -19,7 +19,7 @@ from eis_project import save_project_file
 from eis_services import load_cycle, load_projects
 
 DEFAULT_CIRCUIT = "R0-L0-p(R1,CPE1)"
-DEFAULT_FILE_CONTAINS = ("ay", "rocedure", "PEIS.mpr")
+DEFAULT_FILE_CONTAINS = ("ay", "rocedure", "PEIS")
 
 
 def _is_empty_file_error(error: str) -> bool:
@@ -200,6 +200,18 @@ def import_and_label(
         details = "; ".join(f"{path.name}: {error}" for path, error in fatal_errors)
         raise RuntimeError(f"import failed: {details}")
     projects = [project for _dataset_id, project in report.loaded]
+    usable_projects = []
+    for project in projects:
+        if project.skipped_cycles:
+            skipped = ", ".join(str(cycle) for cycle in project.skipped_cycles)
+            print(
+                f"Warning: skipping file {project.state.source_path.name}; "
+                f"empty cycle(s): {skipped}",
+                file=sys.stderr,
+            )
+            continue
+        usable_projects.append(project)
+    projects = usable_projects
     if not projects:
         raise RuntimeError(
             f"no non-empty Cell datasets could be imported from {len(candidates)} files"

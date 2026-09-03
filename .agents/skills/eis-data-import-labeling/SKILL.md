@@ -24,6 +24,7 @@ The source may be one `.mpr` file or a directory. Directory contents are enumera
 ## Behavior to preserve
 
 - Import only the `cell` spectrum (`spectrum_kinds_by_path={resolved_path: ["cell"]}`); do not silently import Working or Counter spectra.
+- Skip files containing empty cycles with a warning; continue with the remaining files. Propagate other import errors.
 - Sort files by source filename before assigning labels.
 - Detect the shortest whole-number repeating pattern from the mean `ewe_ece_v` per cycle.
 - Set `Time` to the one-based loop number continuing across files: `1, 2, 3, ...`.
