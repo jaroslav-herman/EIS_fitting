@@ -8371,6 +8371,12 @@ class EISApplication:
                 residuals = np.stack((measured_points, fitted_points), axis=1)
                 self.residual_artist.set_segments(residuals[included])
                 self.excluded_residual_artist.set_segments(residuals[~included])
+        self.included_artist.set_visible(True)
+        self.excluded_artist.set_visible(True)
+        if self.phase_included_artist is not None:
+            self.phase_included_artist.set_visible(True)
+        if self.phase_excluded_artist is not None:
+            self.phase_excluded_artist.set_visible(True)
         if not self.show_eec_fit_var.get():
             self.fit_artist.set_data([], [])
             self.fit_points_included_artist.set_data([], [])
