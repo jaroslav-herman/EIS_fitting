@@ -199,7 +199,7 @@ MODEL_PRESETS = (
 )
 
 ML_TRAINED_MODELS = {
-    "Sputtered cathode": Path(__file__).resolve().parent / "ml" / "analysis" / "number_aware_pipeline_455" / "pipeline.joblib",
+    "Sputtered cathode": Path(__file__).resolve().parent / "ml" / "analysis" / "number_aware_pipeline_453_455_457_voltage" / "pipeline.joblib",
 }
 
 
