@@ -1224,15 +1224,12 @@ class EISApplication:
             command=self.save_project,
         )
         self.file_menu.add_separator()
-        self.file_menu.add_command(label="Save current mask…", command=self.save_mask)
-        self.file_menu.add_separator()
         self.file_menu.add_command(label="Exit", command=self.close)
         menu_bar.add_cascade(label="File", menu=self.file_menu)
         self._project_menu_actions = (
             "Load RelaxIS 3 project",
             "Load project…",
             "Save project…",
-            "Save current mask…",
         )
         self.fit_menu = tk.Menu(menu_bar, tearoff=False)
         self.fit_menu.add_command(
@@ -14726,25 +14723,6 @@ class EISApplication:
             plotted_cycles,
             f"opened cell/working/counter comparison for cycle {spectrum.cycle}",
         )
-
-    def save_mask(self) -> None:
-        if self.busy or self.state is None:
-            return
-        default_name = (
-            f"{self._current_stem()}_cycle{self.state.active_cycle}_mask_included.npy"
-        )
-        selected = filedialog.asksaveasfilename(
-            parent=self.root,
-            title="Save included-point mask",
-            initialdir=str(self._current_directory()),
-            initialfile=default_name,
-            defaultextension=".npy",
-            filetypes=[("NumPy mask", "*.npy")],
-        )
-        if not selected:
-            return
-        np.save(Path(selected), self.state.active.included.astype(bool))
-        self._update_status(f"saved {Path(selected).name}")
 
     def import_data(self) -> None:
         if self.busy:

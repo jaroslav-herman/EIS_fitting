@@ -114,7 +114,7 @@ uv run python main.py PEIS_at_N2_flow_80_sccm_automated_01_PEIS.mpt --cycle 1 --
 - Export to Python: save fitted parameters and spectrum metadata from all loaded files to CSV, create a ready-to-run pandas script, and open it in VS Code or another available editor
 - Reset points: include all points and clear detected outliers
 
-The **File** menu contains additive multi-file data import, project load/save, mask saving, fit-parameter and Python-workspace exports, and exit commands. Import accepts several `.mpt` files at once and keeps previously loaded spectra.
+The **File** menu contains additive multi-file data import, project load/save, fit-parameter and Python-workspace exports, and exit commands. Import accepts several `.mpt` files at once and keeps previously loaded spectra.
 
 The **Fit** menu fits the selected spectrum or batch-fits upward/downward through the explorer's visible order. Metadata-limited batches use the last clicked numeric explorer column and stop at its nearest available target value.
 
