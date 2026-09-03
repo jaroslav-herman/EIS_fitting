@@ -8171,6 +8171,8 @@ class EISApplication:
             details.append("active points")
         if not result.has_eec_model:
             details.append("no ML EEC parameters")
+        if result.prediction_warnings:
+            details.append("; ".join(result.prediction_warnings))
         self.ml_results_status_var.set("ML: " + ", ".join(details) if details else "ML result available")
         self._update_legend_visibility()
         self.canvas.draw_idle()

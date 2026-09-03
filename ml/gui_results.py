@@ -45,6 +45,7 @@ class MLResult:
     initial_sources: dict[str, str] = field(default_factory=dict)
     parameter_limits: dict[str, tuple[float, float]] = field(default_factory=dict)
     parameter_reliability: dict[str, str] = field(default_factory=dict)
+    prediction_warnings: list[str] = field(default_factory=list)
 
     @property
     def has_eec_model(self) -> bool:
@@ -265,6 +266,13 @@ def _add_json_spectrum(
             reliability = _text(prediction.get("reliability"))
             if name and reliability:
                 result.parameter_reliability[name] = reliability
+            warning = _text(prediction.get("warning"))
+            if warning and warning not in result.prediction_warnings:
+                result.prediction_warnings.append(warning)
+    for warning in spectrum.get("parameter_prediction_warnings", []):
+        warning = _text(warning)
+        if warning and warning not in result.prediction_warnings:
+            result.prediction_warnings.append(warning)
     model = (
         _text(spectrum.get("predicted_eec_model"))
         or _text(spectrum.get("suggested_EEC"))

@@ -104,6 +104,8 @@ class PipelineBundle:
     parameter_stats: dict[str, dict[str, float | int | str]]
     training_samples: tuple[str, ...]
     circuit_classes: tuple[str, ...]
+    parameter_model_specs: dict[str, dict[str, object]] | None = None
+    parameter_limits: dict[str, dict[str, object]] | None = None
 
 
 def load_pipeline_bundle(path: Path) -> PipelineBundle:
@@ -220,9 +222,21 @@ def _fit_topology(records: list[SpectrumRecord], seed: int) -> tuple[SpectrumPre
     return preprocessor, model, tuple(sorted(set(labels)))
 
 
-def _fit_parameters(records: list[SpectrumRecord], projects: list[Path]) -> tuple[SpectrumPreprocessor, dict[str, object], dict[str, dict]]:
-    preprocessor = SpectrumPreprocessor(grid_size=64, use_metadata=True, spectrum_mode="raw", include_impedance_scale=True)
-    x = preprocessor.fit_transform(records)
+def _parameter_features(preprocessor: SpectrumPreprocessor, records: list[SpectrumRecord]) -> np.ndarray:
+    """Build spectral, voltage, current, and interaction features."""
+    base = preprocessor.transform(records)
+    metadata = []
+    for record in records:
+        voltage = float(record.voltage) if record.voltage is not None and np.isfinite(record.voltage) else 0.0
+        current = float(record.current) if record.current is not None and np.isfinite(record.current) else 0.0
+        safe_current = max(abs(current), 1.0e-9)
+        log_current = np.log10(safe_current)
+        inverse_current = 1.0 / safe_current
+        metadata.append((voltage, current, log_current, inverse_current, voltage * log_current, voltage * inverse_current))
+    return np.hstack([base, np.asarray(metadata, dtype=float)])
+
+
+def _parameter_training_rows(records: list[SpectrumRecord], projects: list[Path]):
     payloads = {}
     for path in projects:
         path = Path(path)
@@ -232,8 +246,7 @@ def _fit_parameters(records: list[SpectrumRecord], projects: list[Path]) -> tupl
             handle = path.open("r", encoding="utf-8")
         with handle:
             payloads[str(path.resolve())] = json.load(handle)
-    targets: dict[str, list[float]] = {}
-    target_rows: dict[str, list[int]] = {}
+    rows = []
     for index, record in enumerate(records):
         payload = payloads[str(Path(record.source_project).resolve())]
         found = None
@@ -253,18 +266,94 @@ def _fit_parameters(records: list[SpectrumRecord], projects: list[Path]) -> tupl
             continue
         for name, value in zip(names, values):
             if value > 0 and np.isfinite(value):
-                targets.setdefault(name, []).append(float(value))
-                target_rows.setdefault(name, []).append(index)
+                rows.append((index, record, str(record.original_eec_topology), name, float(value)))
+    return rows
+
+
+def _fit_parameter_candidate(x_train, y_train, mode: str, records: list[SpectrumRecord], indices: np.ndarray):
+    current = np.asarray([max(abs(float(records[i].current or 0.0)), 1.0e-9) for i in indices], dtype=float)
+    target = np.asarray(y_train, dtype=float)
+    if mode == "inverse_current":
+        target = target + np.log10(current)
+    model = _parameter_model()
+    model.fit(x_train, target)
+    return model
+
+
+def _predict_parameter_candidate(model, x, mode: str, records: list[SpectrumRecord], indices: np.ndarray) -> np.ndarray:
+    prediction = np.asarray(model.predict(x), dtype=float)
+    if mode == "inverse_current":
+        current = np.asarray([max(abs(float(records[i].current or 0.0)), 1.0e-9) for i in indices], dtype=float)
+        prediction = prediction - np.log10(current)
+    return prediction
+
+
+def _fit_parameters(records: list[SpectrumRecord], projects: list[Path], samples: tuple[str, ...]) -> tuple[SpectrumPreprocessor, dict[str, object], dict[str, dict], dict[str, dict[str, object]], dict[str, dict[str, object]]]:
+    preprocessor = SpectrumPreprocessor(grid_size=64, use_metadata=False, spectrum_mode="raw", include_impedance_scale=True)
+    x = preprocessor.fit_transform(records)
+    x = _parameter_features(preprocessor, records)
+    rows = _parameter_training_rows(records, projects)
     models: dict[str, object] = {}
     stats: dict[str, dict] = {}
-    for name, values in targets.items():
-        indices = np.asarray(target_rows[name], dtype=int)
-        model = _parameter_model()
+    specs: dict[str, dict[str, object]] = {}
+    limits: dict[str, dict[str, object]] = {}
+    groups = {}
+    for index, record, topology, name, value in rows:
+        groups.setdefault((topology, name), []).append((index, record, value))
+    for (topology, name), group in groups.items():
+        indices = np.asarray([item[0] for item in group], dtype=int)
+        values = np.asarray([item[2] for item in group], dtype=float)
         y = _transform_parameter(values, name)
-        model.fit(x[indices], y)
-        models[name] = model
-        stats[name] = {"training_spectra": int(len(values)), "target_transform": "log10" if _is_positive_parameter(name) else "identity", "target_median": float(np.median(values))}
-    return preprocessor, models, stats
+        candidate_modes = ["current_aware"]
+        currents = np.asarray([float(item[1].current or 0.0) for item in group], dtype=float)
+        valid_currents = currents[np.isfinite(currents) & (np.abs(currents) > 1.0e-9)]
+        if _is_positive_parameter(name) and valid_currents.size >= 30 and np.ptp(np.log10(np.abs(valid_currents))) >= 0.5:
+            candidate_modes.append("inverse_current")
+        scores = {mode: [] for mode in candidate_modes}
+        oof_by_mode = {mode: [] for mode in candidate_modes}
+        for held_out in samples:
+            train_mask = np.asarray([item[1].sample_id != held_out for item in group], dtype=bool)
+            test_mask = ~train_mask
+            if train_mask.sum() < 10 or not test_mask.any():
+                continue
+            train_indices, test_indices = indices[train_mask], indices[test_mask]
+            for mode in candidate_modes:
+                model = _fit_parameter_candidate(x[train_indices], y[train_mask], mode, records, train_indices)
+                prediction = _predict_parameter_candidate(model, x[test_indices], mode, records, test_indices)
+                residual = prediction - y[test_mask]
+                scores[mode].extend(np.abs(residual).tolist())
+                oof_by_mode[mode].extend(zip(test_indices.tolist(), residual.tolist()))
+        mean_scores = {mode: float(np.mean(values_)) if values_ else float("inf") for mode, values_ in scores.items()}
+        selected_mode = "current_aware"
+        if "inverse_current" in mean_scores and mean_scores["inverse_current"] < mean_scores["current_aware"] * 0.98:
+            selected_mode = "inverse_current"
+        key = f"{topology}::{name}"
+        model = _fit_parameter_candidate(x[indices], y, selected_mode, records, indices)
+        models[key] = model
+        residuals = []
+        if selected_mode in oof_by_mode:
+            entries = oof_by_mode[selected_mode]
+            residuals.extend(float(entry[1]) for entry in entries)
+        if not residuals:
+            residuals = [0.0]
+        residuals = np.asarray(residuals, dtype=float)
+        voltage = np.asarray([float(item[1].voltage) for item in group if item[1].voltage is not None and np.isfinite(item[1].voltage)], dtype=float)
+        current = np.asarray([abs(float(item[1].current)) for item in group if item[1].current is not None and np.isfinite(item[1].current)], dtype=float)
+        limits[key] = {
+            "level": 0.95, "lower_residual": float(np.quantile(residuals, 0.025)),
+            "upper_residual": float(np.quantile(residuals, 0.975)),
+            "method": "LOSO_transformed_residual_interval",
+            "training_spectra": int(len(group)), "topology": topology, "parameter": name,
+            "voltage_min": float(np.min(voltage)) if voltage.size else None,
+            "voltage_max": float(np.max(voltage)) if voltage.size else None,
+            "current_min": float(np.min(current)) if current.size else None,
+            "current_max": float(np.max(current)) if current.size else None,
+            "reliability": "high" if len(group) >= 100 else "medium" if len(group) >= 30 else "low_sparse",
+            "candidate_scores": mean_scores, "selected_mode": selected_mode,
+        }
+        specs[key] = {"topology": topology, "parameter": name, "mode": selected_mode, "training_spectra": int(len(group)), "candidate_scores": mean_scores}
+        stats[key] = {"training_spectra": int(len(group)), "target_transform": "log10" if _is_positive_parameter(name) else "logit", "target_median": float(np.median(values)), "topology": topology, "selected_mode": selected_mode}
+    return preprocessor, models, stats, specs, limits
 
 
 def train_bundle(training_projects: list[Path], sample_ids: dict[str, str], seed: int = 42) -> tuple[PipelineBundle, object]:
@@ -280,11 +369,11 @@ def train_bundle(training_projects: list[Path], sample_ids: dict[str, str], seed
     manual = _manual_masks(records)
     topology_records = _records_with_mask(records, manual)
     topology_preprocessor, topology_model, topology_classes = _fit_topology(topology_records, seed)
-    parameter_preprocessor, parameter_models, parameter_stats = _fit_parameters(records, training_projects)
+    parameter_preprocessor, parameter_models, parameter_stats, parameter_specs, parameter_limits = _fit_parameters(records, training_projects, samples)
     bundle = PipelineBundle(
         frequency_preprocessor, frequency_model, topology_preprocessor, topology_model,
         topology_classes, parameter_preprocessor, parameter_models, parameter_stats,
-        samples, circuit_classes,
+        samples, circuit_classes, parameter_specs, parameter_limits,
     )
     return bundle, extraction
 
@@ -323,52 +412,72 @@ def _predict_topologies(bundle: PipelineBundle, records: list[SpectrumRecord]) -
 
 
 def _predict_parameters_batch(bundle: PipelineBundle, records: list[SpectrumRecord], circuits: list[str]) -> list[tuple[list[ParameterValue], dict[str, dict]]]:
-    x = bundle.parameter_preprocessor.transform(records)
-    predictions = {name: np.asarray(model.predict(x), dtype=float) for name, model in bundle.parameter_models.items()}
+    x = _parameter_features(bundle.parameter_preprocessor, records)
+    models = getattr(bundle, "parameter_models", {}) or {}
+    specs = getattr(bundle, "parameter_model_specs", {}) or {}
+    learned_limits = getattr(bundle, "parameter_limits", {}) or {}
     result = []
     for index, circuit in enumerate(circuits):
         params = []
         info = {}
         for parameter in circuit_parameters(circuit):
-            model_available = parameter.name in predictions
-            value = _inverse_parameter(float(predictions[parameter.name][index]), parameter.name) if model_available else float(parameter.initial)
+            key = f"{circuit}::{parameter.name}"
+            model = models.get(key) or models.get(parameter.name)
+            spec = specs.get(key, specs.get(parameter.name, {}))
+            model_available = model is not None
+            transformed = None
+            if model_available:
+                transformed = float(model.predict(x[index:index + 1])[0])
+                if spec.get("mode") == "inverse_current":
+                    current = max(abs(float(records[index].current or 0.0)), 1.0e-9)
+                    transformed -= np.log10(current)
+                value = _inverse_parameter(transformed, parameter.name)
+            else:
+                value = float(parameter.initial)
             lower, upper = float(parameter.lower), float(parameter.upper)
             if _is_alpha_parameter(parameter.name):
                 lower, upper = max(lower, 1e-4), min(upper, 0.9999)
-            value = _physical_initial_cap(records[index], parameter.name, value)
+            limit = learned_limits.get(key, learned_limits.get(parameter.name))
+            warning = None
+            if limit is not None and transformed is not None:
+                lower_residual = float(limit.get("lower_residual", 0.0))
+                upper_residual = float(limit.get("upper_residual", 0.0))
+                learned_lower = _inverse_parameter(transformed + lower_residual, parameter.name)
+                learned_upper = _inverse_parameter(transformed + upper_residual, parameter.name)
+                lower = max(lower, learned_lower)
+                upper = min(upper, learned_upper)
+                if upper <= lower:
+                    lower, upper = float(parameter.lower), float(parameter.upper)
+                    if _is_alpha_parameter(parameter.name):
+                        lower, upper = max(lower, 1e-4), min(upper, 0.9999)
+                    warning = "learned_interval_incompatible_with_application_bounds"
+                voltage = float(records[index].voltage) if records[index].voltage is not None else None
+                current = abs(float(records[index].current)) if records[index].current is not None else None
+                if voltage is None or limit.get("voltage_min") is None or not (limit["voltage_min"] <= voltage <= limit["voltage_max"]):
+                    warning = warning or "voltage_outside_training_range"
+                if current is None or limit.get("current_min") is None or not (limit["current_min"] <= current <= limit["current_max"]):
+                    warning = warning or "current_outside_training_range"
+            physical_value = _physical_initial_cap(records[index], parameter.name, value)
+            physical_cap = _physical_initial_cap(records[index], parameter.name, float("inf"))
+            if np.isfinite(physical_cap) and physical_cap > 0:
+                upper = min(upper, physical_cap)
+                if lower >= upper:
+                    lower = float(parameter.lower)
+                    if _is_alpha_parameter(parameter.name):
+                        lower = max(lower, 1.0e-4)
+                    warning = warning or "learned_interval_incompatible_with_physical_cap"
+                if physical_value != value:
+                    warning = warning or "physical_initial_cap_applied"
+            value = physical_value
             value = float(np.clip(value, lower, upper))
             params.append(ParameterValue(parameter.name, parameter.unit, value, lower, upper, fixed=parameter.fixed))
-            info[parameter.name] = {"parameter_name": parameter.name, "initial_value": value, "lower_limit": lower, "upper_limit": upper, "source": "ml" if model_available else "repository_default", "available": model_available, "training_spectra": int(bundle.parameter_stats.get(parameter.name, {}).get("training_spectra", 0))}
+            info[parameter.name] = {"parameter_name": parameter.name, "initial_value": value, "lower_limit": lower, "upper_limit": upper, "source": "ml" if model_available else "repository_default", "available": model_available, "training_spectra": int((getattr(bundle, "parameter_stats", {}) or {}).get(key, (getattr(bundle, "parameter_stats", {}) or {}).get(parameter.name, {})).get("training_spectra", 0)), "limit_level": limit.get("level") if limit else None, "limit_method": limit.get("method") if limit else None, "reliability": limit.get("reliability") if limit else None, "selected_mode": spec.get("mode"), "warning": warning}
         result.append((params, info))
     return result
 
 
 def _predict_parameters(bundle: PipelineBundle, record: SpectrumRecord, circuit: str) -> tuple[list[ParameterValue], dict[str, dict]]:
-    definitions = circuit_parameters(circuit)
-    x = bundle.parameter_preprocessor.transform([record])
-    params: list[ParameterValue] = []
-    info: dict[str, dict] = {}
-    for parameter in definitions:
-        model = bundle.parameter_models.get(parameter.name)
-        if model is None:
-            value = float(parameter.initial)
-            source, available = "repository_default", False
-        else:
-            predicted = float(model.predict(x)[0])
-            value = _inverse_parameter(predicted, parameter.name)
-            source, available = "ml", True
-        lower, upper = float(parameter.lower), float(parameter.upper)
-        if parameter.name.startswith("CPE") and parameter.name.endswith("_1"):
-            lower, upper = max(lower, 1e-4), min(upper, 0.9999)
-        value = _physical_initial_cap(record, parameter.name, value)
-        value = float(np.clip(value, lower, upper))
-        params.append(ParameterValue(parameter.name, parameter.unit, value, lower, upper, fixed=parameter.fixed))
-        info[parameter.name] = {
-            "parameter_name": parameter.name, "initial_value": value, "lower_limit": lower,
-            "upper_limit": upper, "source": source, "available": available,
-            "training_spectra": int(bundle.parameter_stats.get(parameter.name, {}).get("training_spectra", 0)),
-        }
-    return params, info
+    return _predict_parameters_batch(bundle, [record], [circuit])[0]
 
 
 def infer_bundle_records(bundle: PipelineBundle, records: list[SpectrumRecord], *, threshold: float = 4.0) -> list[dict]:
@@ -400,6 +509,7 @@ def infer_bundle_records(bundle: PipelineBundle, records: list[SpectrumRecord], 
             "predicted_eec_model": predicted_circuit, "suggested_eec": predicted_circuit,
             "topology_probability": probabilities, "prediction_probability": confidence,
             "topology_prediction_warning": warning, "parameter_predictions": list(parameter_info.values()),
+            "parameter_prediction_warnings": sorted({item["warning"] for item in parameter_info.values() if item.get("warning")}),
             "initial_guess_only": True, "automatic_eec_fit": False,
             "deterministic_fit_executed": False,
             "deterministic_fit": {"success": None, "skipped": True, "reason": "GUI pipeline controls fitting"},
@@ -481,7 +591,7 @@ def run_pipeline(training_projects: list[Path], validation_project: Path, sample
         results.append(item)
     output.mkdir(parents=True, exist_ok=True)
     results_path = output / f"{validation_project.stem}_ml_results.json"
-    write_ml_results(results_path, results, source_project=str(validation_project), pipeline={"name": "number_aware_staged_eis", "version": "1", "training_samples": list(bundle.training_samples), "frequency_features": "spectrum+voltage+current+time", "outlier_threshold": threshold, "circuit_classes": list(bundle.circuit_classes), "validation_ground_truth": False})
+    write_ml_results(results_path, results, source_project=str(validation_project), pipeline={"name": "number_aware_staged_eis", "version": "2", "training_samples": list(bundle.training_samples), "frequency_features": "spectrum+voltage+current+time", "parameter_features": "spectral+voltage+current+log_current+inverse_current+voltage_current_interactions", "parameter_model_specs": bundle.parameter_model_specs, "parameter_limits": bundle.parameter_limits, "outlier_threshold": threshold, "circuit_classes": list(bundle.circuit_classes), "validation_ground_truth": False})
     report = {"training_samples": list(bundle.training_samples), "training_records": len(extraction.records), "validation_sample": validation_sample, "validation_records": len(results), "training_exclusions": extraction.exclusion_counts, "circuit_classes": list(bundle.circuit_classes), "parameter_training": bundle.parameter_stats, "output": str(results_path), "deterministic_fit_requested": bool(run_deterministic_fit), "warnings": ["raw-only validation has no ground-truth frequency, topology, or parameter accuracy metrics", "one-process class has only one training spectrum"]}
     if not run_deterministic_fit:
         report["warnings"].append("deterministic EEC fitting was disabled; ML initial guesses are available")
