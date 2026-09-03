@@ -3323,23 +3323,23 @@ class EISApplication:
         (self.ml_range_artist,) = self.axes.plot(
             [], [], "o", markerfacecolor="none", markeredgecolor="#00838f",
             markersize=10, markeredgewidth=1.2, alpha=0.35,
-            label="ML frequency range",
+            label="_nolegend_",
         )
         (self.ml_active_artist,) = self.axes.plot(
             [], [], "D", color="#2e7d32", markersize=5, alpha=0.8,
-            label="ML active points",
+            label="_nolegend_",
         )
         (self.ml_rejected_artist,) = self.axes.plot(
             [], [], "x", color="#ef6c00", markersize=6, alpha=0.75,
-            label="ML rejected points",
+            label="_nolegend_",
         )
         (self.ml_model_artist,) = self.axes.plot(
             [], [], "--", color="#d81b60", linewidth=2.0, alpha=0.9,
-            label="ML EEC model",
+            label="_nolegend_",
         )
         self.ml_residual_artist = self._line_collection_class(
             [], colors="#d81b60", linewidths=0.8, linestyles="dotted",
-            alpha=0.45, zorder=1, label="ML residuals",
+            alpha=0.45, zorder=1, label="_nolegend_",
         )
         self.axes.add_collection(self.ml_residual_artist)
         self.ml_phase_active_artist = None
@@ -3353,19 +3353,19 @@ class EISApplication:
         if self.phase_axes is not None:
             (self.ml_phase_active_artist,) = self.phase_axes.plot(
                 [], [], "D", color="#388e3c", markersize=4, alpha=0.75,
-                label="ML active phase",
+                label="_nolegend_",
             )
             (self.ml_phase_rejected_artist,) = self.phase_axes.plot(
                 [], [], "x", color="#f57c00", markersize=5, alpha=0.7,
-                label="ML rejected phase",
+                label="_nolegend_",
             )
             (self.ml_phase_model_artist,) = self.phase_axes.plot(
                 [], [], "--", color="#c2185b", linewidth=1.7, alpha=0.9,
-                label="ML EEC phase",
+                label="_nolegend_",
             )
             self.ml_phase_residual_artist = self._line_collection_class(
                 [], colors="#c2185b", linewidths=0.7, linestyles="dotted",
-                alpha=0.4, zorder=1, label="ML phase residuals",
+                alpha=0.4, zorder=1, label="_nolegend_",
             )
             self.phase_axes.add_collection(self.ml_phase_residual_artist)
         self.axes.legend(loc="best")
@@ -8076,7 +8076,7 @@ class EISApplication:
                 self._ml_range_patches.append(
                     self.axes.axvspan(
                         minimum, maximum, color="#80cbc4", alpha=0.12,
-                        label="ML frequency range",
+                        label="_nolegend_",
                     )
                 )
                 if self.phase_axes is not None:
