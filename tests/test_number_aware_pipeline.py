@@ -4,13 +4,15 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 
 from ml.dataset import SpectrumRecord, load_eisfit_projects
 from ml.frequency_range import active_frequency_bounds, _targets
-from ml.number_aware_pipeline import deterministic_masks, _candidate_topologies, _is_positive_parameter, _physical_initial_cap, _parameter_features, _usable_fit_parameter
+from ml.number_aware_pipeline import deterministic_masks, infer_bundle_records, _candidate_topologies, _is_positive_parameter, _physical_initial_cap, _parameter_features, _usable_fit_parameter
 from ml.preprocessing import SpectrumPreprocessor
 
 
@@ -125,6 +127,24 @@ class NumberAwarePipelineTests(unittest.TestCase):
         candidates = _candidate_topologies(Bundle(), "R0-L0-p(R1,CPE1)-p(R2,CPE2)", {Bundle.circuit_classes[0]: 0.55, Bundle.circuit_classes[1]: 0.45}, record)
         self.assertEqual(candidates[0], Bundle.circuit_classes[0])
         self.assertIn(Bundle.circuit_classes[1], candidates)
+
+    def test_parameter_inference_keeps_raw_spectrum_after_masking(self):
+        frequency = np.logspace(4, 0, 12)
+        record = SpectrumRecord("id", "source", "sample", 1, 1.6, 10.0, 1.0, frequency, np.ones(12), -np.ones(12), "R0-p(R1,CPE1)")
+        bundle = SimpleNamespace(
+            frequency_preprocessor=SimpleNamespace(transform=lambda records: np.zeros((len(records), 1))),
+            frequency_model=SimpleNamespace(predict=lambda x: np.asarray([[2.0, 0.0]] * len(x))),
+            topology_preprocessor=SimpleNamespace(transform=lambda records: np.zeros((len(records), 1))),
+            topology_model=SimpleNamespace(predict=lambda x: np.asarray(["R0-p(R1,CPE1)"] * len(x))),
+            parameter_preprocessor=SimpleNamespace(parameter_voltage_min_=1.4, parameter_voltage_max_=1.8),
+            topology_classes=("R0-p(R1,CPE1)",), circuit_classes=("R0-p(R1,CPE1)",),
+        )
+        captured = []
+        with patch("ml.number_aware_pipeline.deterministic_masks", return_value=({"id": np.asarray([True] * 11 + [False])}, {"id": {}})), \
+             patch("ml.number_aware_pipeline._predict_topologies", return_value=[("R0-p(R1,CPE1)", {}, 1.0, None)]), \
+             patch("ml.number_aware_pipeline._predict_parameters_batch", side_effect=lambda _bundle, records, _circuits: (captured.append(records) or [([], {})])):
+            infer_bundle_records(bundle, [record])
+        self.assertIs(captured[0][0], record)
 
     def test_frequency_target_uses_active_points_not_saved_boundaries(self):
         record = SpectrumRecord("id", "source", "sample", 1, 1.0, 2.0, 3.0,

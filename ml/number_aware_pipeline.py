@@ -18,7 +18,7 @@ from typing import Iterable
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import Ridge
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.pipeline import make_pipeline
@@ -377,8 +377,9 @@ def _fit_parameters(records: list[SpectrumRecord], projects: list[Path], samples
                 oof_by_mode[mode].extend(zip(test_indices.tolist(), residual.tolist()))
         mean_scores = {mode: float(np.mean(values_)) if values_ else float("inf") for mode, values_ in scores.items()}
         selected_mode = "current_aware"
-        if "inverse_current" in mean_scores and mean_scores["inverse_current"] < mean_scores["current_aware"] * 0.98:
-            selected_mode = "inverse_current"
+        best_mode = min(mean_scores, key=mean_scores.get)
+        if best_mode != "current_aware" and mean_scores[best_mode] < mean_scores["current_aware"] * 0.98:
+            selected_mode = best_mode
         key = f"{topology}::{name}"
         model = _fit_parameter_candidate(x[indices], y, selected_mode, records, indices)
         models[key] = model
@@ -568,7 +569,11 @@ def infer_bundle_records(bundle: PipelineBundle, records: list[SpectrumRecord], 
     masks, diagnostics = deterministic_masks(records, windows, threshold)
     masked_records = _records_with_mask(records, masks)
     topology_predictions = _predict_topologies(bundle, masked_records)
-    parameter_predictions = _predict_parameters_batch(bundle, masked_records, [item[0] for item in topology_predictions])
+    # Parameter models are trained on the raw, scale-preserving spectrum.
+    # Deterministic masks are intentionally used for topology selection, but
+    # feeding the shortened trace into the parameter models creates a train /
+    # inference mismatch and can collapse CPE exponents to their 0.5 floor.
+    parameter_predictions = _predict_parameters_batch(bundle, records, [item[0] for item in topology_predictions])
     results = []
     for record, topology_prediction, parameter_prediction in zip(records, topology_predictions, parameter_predictions):
         predicted_circuit, probabilities, confidence, warning = topology_prediction
@@ -660,7 +665,7 @@ def run_pipeline(training_projects: list[Path], validation_project: Path, sample
     masks, diagnostics = deterministic_masks(validation.records, windows, threshold)
     masked_records = _records_with_mask(validation.records, masks)
     topology_predictions = _predict_topologies(bundle, masked_records)
-    parameter_predictions = _predict_parameters_batch(bundle, masked_records, [item[0] for item in topology_predictions])
+    parameter_predictions = _predict_parameters_batch(bundle, validation.records, [item[0] for item in topology_predictions])
     results = []
     for record, masked, topology_prediction, parameter_prediction in zip(validation.records, masked_records, topology_predictions, parameter_predictions):
         predicted_circuit, probabilities, confidence, warning = topology_prediction
