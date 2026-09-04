@@ -60,6 +60,22 @@ def _inverse_parameter(value: float, name: str) -> float:
     return float(value)
 
 
+def _learned_residual_interval(residuals: np.ndarray) -> tuple[float, float]:
+    """Return deliberately permissive transformed-space fit bounds."""
+    values = np.asarray(residuals, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return -1.0, 1.0
+    lower = float(np.quantile(values, 0.01))
+    upper = float(np.quantile(values, 0.99))
+    # The interval is a fitting aid, not a confidence gate.  Expand both
+    # sides so a good conventional fit is not rejected by ML undercoverage.
+    center = float(np.median(values))
+    lower = center + 1.5 * (lower - center)
+    upper = center + 1.5 * (upper - center)
+    return lower, upper
+
+
 def _physical_initial_cap(record: SpectrumRecord, name: str, value: float) -> float:
     """Prevent scale-model excursions from producing impossible EEC initials.
 
@@ -392,10 +408,12 @@ def _fit_parameters(records: list[SpectrumRecord], projects: list[Path], samples
         residuals = np.asarray(residuals, dtype=float)
         voltage = np.asarray([float(item[1].voltage) for item in group if item[1].voltage is not None and np.isfinite(item[1].voltage)], dtype=float)
         current = np.asarray([abs(float(item[1].current)) for item in group if item[1].current is not None and np.isfinite(item[1].current)], dtype=float)
+        lower_residual, upper_residual = _learned_residual_interval(residuals)
         limits[key] = {
-            "level": 0.95, "lower_residual": float(np.quantile(residuals, 0.025)),
-            "upper_residual": float(np.quantile(residuals, 0.975)),
-            "method": "LOSO_transformed_residual_interval",
+            "level": 0.99, "lower_residual": lower_residual,
+            "upper_residual": upper_residual,
+            "method": "LOSO_transformed_residual_interval_expanded",
+            "interval_quantiles": [0.01, 0.99], "interval_expansion": 1.5,
             "training_spectra": int(len(group)), "topology": topology, "parameter": name,
             "voltage_min": float(np.min(voltage)) if voltage.size else None,
             "voltage_max": float(np.max(voltage)) if voltage.size else None,

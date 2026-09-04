@@ -12,7 +12,7 @@ import pandas as pd
 
 from ml.dataset import SpectrumRecord, load_eisfit_projects
 from ml.frequency_range import active_frequency_bounds, _targets
-from ml.number_aware_pipeline import deterministic_masks, infer_bundle_records, _candidate_topologies, _is_positive_parameter, _physical_initial_cap, _parameter_features, _usable_fit_parameter
+from ml.number_aware_pipeline import _learned_residual_interval, deterministic_masks, infer_bundle_records, _candidate_topologies, _is_positive_parameter, _physical_initial_cap, _parameter_features, _usable_fit_parameter
 from ml.preprocessing import SpectrumPreprocessor
 
 
@@ -92,6 +92,12 @@ class NumberAwarePipelineTests(unittest.TestCase):
         self.assertTrue(_usable_fit_parameter(record, "R0", 0.02))
         self.assertFalse(_usable_fit_parameter(record, "L0", 1e-14))
         self.assertTrue(_usable_fit_parameter(record, "L0", 1e-7))
+
+    def test_learned_fit_interval_is_wider_than_nominal_95_percent_interval(self):
+        residuals = np.asarray([-0.4, -0.2, 0.0, 0.1, 0.2, 0.3])
+        lower, upper = _learned_residual_interval(residuals)
+        self.assertLess(lower, np.quantile(residuals, 0.025))
+        self.assertGreater(upper, np.quantile(residuals, 0.975))
 
     def test_parameter_features_include_current_and_interactions(self):
         frequency = np.logspace(4, 0, 12)
