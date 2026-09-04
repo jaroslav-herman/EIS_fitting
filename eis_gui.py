@@ -400,6 +400,116 @@ class _ExplorerLineTool:
         )
 
 
+class _ExplorerPointHover:
+    """Show selected record metadata when hovering an explorer data point."""
+
+    _FIELD_LABELS = {
+        "source_file": "Source file",
+        "Spectrum": "Spectrum",
+        "cycle": "Cycle",
+        "Ecell_V": "Voltage (V)",
+        "I_mA": "Current (mA)",
+        "time/s": "Time (s)",
+        "Cycle mod 15": "Cycle mod 15",
+        "circuit": "Circuit",
+        "drt_mode": "DRT mode",
+    }
+
+    def __init__(self, axes, canvas, fields: list[str]) -> None:
+        self.axes = axes
+        self.canvas = canvas
+        self.fields = list(fields)
+        self._points: list[tuple[float, float, dict[str, object]]] = []
+        self._annotation = None
+        canvas.mpl_connect("motion_notify_event", self._on_motion)
+
+    def set_fields(self, fields: list[str]) -> None:
+        self.fields = list(fields)
+        if self._annotation is not None:
+            self._annotation.set_visible(False)
+
+    def set_points(self, points: list[tuple[float, float, dict[str, object]]]) -> None:
+        self._points = points
+        # Explorer refreshes clear and rebuild the axes, which also removes
+        # the previous annotation artist.
+        self._annotation = None
+
+    @classmethod
+    def _field_label(cls, field: str) -> str:
+        return cls._FIELD_LABELS.get(field, field)
+
+    @staticmethod
+    def _format_value(value: object) -> str:
+        if value is None:
+            return "—"
+        if isinstance(value, (float, np.floating)):
+            if not np.isfinite(value):
+                return "—"
+            return f"{float(value):.8g}"
+        return str(value)
+
+    def _hide(self) -> None:
+        if self._annotation is not None:
+            self._annotation.set_visible(False)
+            self.canvas.draw_idle()
+
+    def _on_motion(self, event) -> None:
+        if event.inaxes is not self.axes or event.x is None or event.y is None:
+            self._hide()
+            return
+        if not self._points or not self.fields:
+            self._hide()
+            return
+        try:
+            display_points = self.axes.transData.transform(
+                [(point[0], point[1]) for point in self._points]
+            )
+        except (TypeError, ValueError, OverflowError):
+            self._hide()
+            return
+        distances = [
+            float(np.hypot(display_x - event.x, display_y - event.y))
+            for display_x, display_y in display_points
+        ]
+        index = int(np.argmin(distances))
+        if distances[index] > 12.0:
+            self._hide()
+            return
+        x_value, y_value, record = self._points[index]
+        lines = [
+            f"{self._field_label(field)}: {self._format_value(record.get(field))}"
+            for field in self.fields
+            if field in record
+        ]
+        if not lines:
+            self._hide()
+            return
+        text = "\n".join(lines)
+        if self._annotation is None:
+            self._annotation = self.axes.annotate(
+                text,
+                xy=(x_value, y_value),
+                xytext=(10, 10),
+                textcoords="offset points",
+                ha="left",
+                va="bottom",
+                fontsize=8,
+                zorder=20,
+                bbox={
+                    "boxstyle": "round,pad=0.35",
+                    "facecolor": "#fffde7",
+                    "edgecolor": "#666666",
+                    "alpha": 0.94,
+                },
+                arrowprops={"arrowstyle": "->", "color": "#666666"},
+            )
+        else:
+            self._annotation.xy = (x_value, y_value)
+            self._annotation.set_text(text)
+        self._annotation.set_visible(True)
+        self.canvas.draw_idle()
+
+
 class ParameterTable(ttk.Frame):
     def __init__(self, parent: tk.Misc, name_double_click=None, display_name=None) -> None:
         super().__init__(parent)
@@ -1401,6 +1511,14 @@ class EISApplication:
         self._drt_explorer_y_preference = "R0"
         self._explorer_column_order_preference: list[str] = []
         self._explorer_hidden_columns_preference: list[str] = []
+        self._explorer_hover_metadata_preference: list[str] = [
+            "source_file",
+            "Spectrum",
+            "cycle",
+            "Ecell_V",
+            "I_mA",
+            "time/s",
+        ]
         self._explorer_new_columns_position = "end"
         self._eec_parameter_bounds = {
             "r": (0.0, 1e6),
@@ -1479,6 +1597,13 @@ class EISApplication:
                 self._explorer_hidden_columns_preference = [
                     str(value).strip()
                     for value in saved_hidden_columns
+                    if str(value).strip()
+                ]
+            saved_hover_metadata = payload.get("explorer_hover_metadata_fields")
+            if isinstance(saved_hover_metadata, list):
+                self._explorer_hover_metadata_preference = [
+                    str(value).strip()
+                    for value in saved_hover_metadata
                     if str(value).strip()
                 ]
             position = str(payload.get("explorer_new_columns_position", "end")).casefold()
@@ -1571,6 +1696,7 @@ class EISApplication:
                     "drt_explorer_y": drt_explorer_y,
                     "explorer_column_order": explorer_column_order,
                     "explorer_hidden_columns": explorer_hidden_columns,
+                    "explorer_hover_metadata_fields": self._explorer_hover_metadata_preference,
                     "explorer_new_columns_position": explorer_new_columns_position,
                     "eec_parameter_bounds": self._eec_parameter_bounds,
                     "outlier_thresholds": {
@@ -1635,8 +1761,8 @@ class EISApplication:
         popup = tk.Toplevel(self.root)
         self.preferences_popup = popup
         popup.title("Preferences")
-        popup.geometry("700x620")
-        popup.minsize(560, 420)
+        popup.geometry("780x720")
+        popup.minsize(620, 500)
         popup.transient(self.root)
         popup.columnconfigure(0, weight=1)
         popup.rowconfigure(0, weight=1)
@@ -1856,6 +1982,50 @@ class EISApplication:
         ttk.Button(order_buttons, text="Move down", command=lambda: move_order_item(1)).pack(
             side=tk.LEFT, padx=3
         )
+
+        hover_metadata_fields = list(dict.fromkeys(
+            [
+                "source_file",
+                "Spectrum",
+                "cycle",
+                "Ecell_V",
+                "I_mA",
+                "time/s",
+                "Cycle mod 15",
+                "circuit",
+                "drt_mode",
+            ]
+            + self._custom_metadata_columns
+        ))
+        selected_hover_metadata = set(self._explorer_hover_metadata_preference)
+        hover_metadata_frame = ttk.LabelFrame(
+            explorer_tab,
+            text="Metadata shown when hovering Fit/DRT explorer points",
+            padding=6,
+        )
+        hover_metadata_frame.grid(
+            row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0)
+        )
+        hover_metadata_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            hover_metadata_frame,
+            text="Select one or more fields. Manually inserted metadata columns are included automatically.",
+            wraplength=600,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        hover_metadata_list = tk.Listbox(
+            hover_metadata_frame,
+            selectmode=tk.EXTENDED,
+            exportselection=False,
+            height=7,
+        )
+        hover_metadata_list.grid(row=1, column=0, sticky="ew")
+        for index, field in enumerate(hover_metadata_fields):
+            hover_metadata_list.insert(
+                tk.END, _ExplorerPointHover._field_label(field)
+            )
+            if field in selected_hover_metadata:
+                hover_metadata_list.selection_set(index)
 
         ttk.Label(
             eec_tab,
@@ -2168,6 +2338,10 @@ class EISApplication:
                 self._deterministic_threshold_preference = self.deterministic_threshold_var.get()
                 self._refine_z_threshold_preference = self.refine_z_threshold_var.get()
                 self._refine_max_iterations_preference = self.refine_max_iterations_var.get()
+                self._explorer_hover_metadata_preference = [
+                    hover_metadata_fields[index]
+                    for index in hover_metadata_list.curselection()
+                ]
                 self._save_preferences(
                     circuits,
                     fit_x_var.get().strip() or "I_mA",
@@ -2205,6 +2379,7 @@ class EISApplication:
             self._explorer_new_columns_position = new_columns_position_var.get().casefold()
             self._explorer_current_column_order = None
             self._apply_explorer_column_order()
+            self._refresh_open_parameter_explorers()
             self._procedure_library_blocks = copy.deepcopy(self.procedure_blocks)
             self._procedure_library = copy.deepcopy(self.procedures)
             if hasattr(self, "model_box"):
@@ -12896,6 +13071,9 @@ class EISApplication:
         toolbar.grid(row=1, column=0, sticky="ew")
 
         line_tool = _ExplorerLineTool(axes, canvas, controls, lambda: refresh_plot())
+        point_hover = _ExplorerPointHover(
+            axes, canvas, self._explorer_hover_metadata_preference
+        )
 
         range_state: dict[str, tuple[tk.DoubleVar, tk.DoubleVar, float, float]] = {}
         range_labels: dict[str, tk.StringVar] = {}
@@ -12988,9 +13166,11 @@ class EISApplication:
             axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
             axes.axvline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
             x_field = x_var.get()
-            plotted_groups: list[tuple[str, list[tuple[float, float]]]] = []
+            plotted_groups: list[
+                tuple[str, list[tuple[float, float, dict[str, object]]]]
+            ] = []
             for y_value, split_value, equation, *_widgets in y_rows:
-                groups: dict[object, list[tuple[float, float]]] = {}
+                groups: dict[object, list[tuple[float, float, dict[str, object]]]] = {}
                 y_field = y_value.get()
                 split_field = split_value.get()
                 selected_fields = [x_field, y_field]
@@ -13009,7 +13189,9 @@ class EISApplication:
                         calculated = evaluate(record, equation.get(), "y", x_field, y_field)
                         if np.isfinite(x_value) and np.isfinite(calculated):
                             group = "DRT" if split_field == "None" else record.get(split_field)
-                            groups.setdefault(group, []).append((x_value, calculated))
+                            groups.setdefault(group, []).append(
+                                (x_value, calculated, record)
+                            )
                     except (KeyError, TypeError, ValueError, SyntaxError, ZeroDivisionError):
                         continue
                 natural_group_key = natsort_keygen(alg=ns.IGNORECASE)
@@ -13035,15 +13217,15 @@ class EISApplication:
             axes.relim()
             axes.autoscale(enable=True, axis="both", tight=False)
             axes.autoscale_view()
-            plotted_values = [
+            plotted_points = [
                 value for _label, values in plotted_groups for value in values
             ]
-            if plotted_values:
+            if plotted_points:
                 plotted_x = np.asarray(
-                    [value[0] for value in plotted_values], dtype=float
+                    [value[0] for value in plotted_points], dtype=float
                 )
                 plotted_y = np.asarray(
-                    [value[1] for value in plotted_values], dtype=float
+                    [value[1] for value in plotted_points], dtype=float
                 )
                 x_min, x_max = float(np.min(plotted_x)), float(np.max(plotted_x))
                 y_min, y_max = float(np.min(plotted_y)), float(np.max(plotted_y))
@@ -13081,7 +13263,11 @@ class EISApplication:
             axes.set_ylabel(" / ".join(y_labels))
             axes.set_xscale("log" if x_log.get() else "linear")
             axes.set_yscale("log" if y_log.get() else "linear")
-            line_tool.set_data(plotted_values)
+            line_tool.set_data(
+                [(point[0], point[1]) for point in plotted_points]
+            )
+            point_hover.set_fields(self._explorer_hover_metadata_preference)
+            point_hover.set_points(plotted_points)
             line_tool.redraw()
             if plotted_groups and not hide_legend.get():
                 axes.legend(loc="best")
@@ -13113,6 +13299,7 @@ class EISApplication:
                     split_box.configure(values=["None"])
                 axes.clear()
                 line_tool.set_data([])
+                point_hover.set_points([])
                 canvas.draw_idle()
                 self._update_status(f"no {current_mode} parameters are available")
                 return
@@ -13426,6 +13613,9 @@ class EISApplication:
         toolbar.grid(row=1, column=0, sticky="ew")
 
         line_tool = _ExplorerLineTool(axes, canvas, controls, lambda: refresh_plot())
+        point_hover = _ExplorerPointHover(
+            axes, canvas, self._explorer_hover_metadata_preference
+        )
 
         range_state: dict[str, tuple[tk.DoubleVar, tk.DoubleVar, float, float]] = {}
         range_labels: dict[str, tk.StringVar] = {}
@@ -13517,9 +13707,11 @@ class EISApplication:
             axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
             axes.axvline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
             x_field = x_var.get()
-            plotted_groups: list[tuple[str, list[tuple[float, float]]]] = []
+            plotted_groups: list[
+                tuple[str, list[tuple[float, float, dict[str, object]]]]
+            ] = []
             for y_var, split_var, equation, *_widgets in y_rows:
-                groups: dict[object, list[tuple[float, float]]] = {}
+                groups: dict[object, list[tuple[float, float, dict[str, object]]]] = {}
                 y_field = y_var.get()
                 split_field = split_var.get()
                 selected_fields = [x_field, y_field]
@@ -13545,7 +13737,7 @@ class EISApplication:
                         if x_log.get() and x_value <= 0 or y_log.get() and y_value <= 0:
                             continue
                         group = "All spectra" if split_field == "None" else record.get(split_field)
-                        groups.setdefault(group, []).append((x_value, y_value))
+                        groups.setdefault(group, []).append((x_value, y_value, record))
                     except Exception:
                         continue
                 natural_group_key = natsort_keygen(alg=ns.IGNORECASE)
@@ -13559,7 +13751,8 @@ class EISApplication:
             for index, (label, points) in enumerate(plotted_groups):
                 if not points:
                     continue
-                x_values, y_values = zip(*points)
+                x_values = [point[0] for point in points]
+                y_values = [point[1] for point in points]
                 axes.plot(
                     x_values,
                     y_values,
@@ -13570,10 +13763,10 @@ class EISApplication:
             axes.relim()
             axes.autoscale(enable=True, axis="both", tight=False)
             axes.autoscale_view()
-            plotted_values = [point for _label, points in plotted_groups for point in points]
-            if plotted_values:
-                plotted_x = np.asarray([point[0] for point in plotted_values], dtype=float)
-                plotted_y = np.asarray([point[1] for point in plotted_values], dtype=float)
+            plotted_points = [point for _label, points in plotted_groups for point in points]
+            if plotted_points:
+                plotted_x = np.asarray([point[0] for point in plotted_points], dtype=float)
+                plotted_y = np.asarray([point[1] for point in plotted_points], dtype=float)
                 x_min, x_max = float(np.min(plotted_x)), float(np.max(plotted_x))
                 y_min, y_max = float(np.min(plotted_y)), float(np.max(plotted_y))
                 if x_min == x_max:
@@ -13610,7 +13803,11 @@ class EISApplication:
             axes.set_ylabel(" / ".join(y_labels))
             axes.set_xscale("log" if x_log.get() else "linear")
             axes.set_yscale("log" if y_log.get() else "linear")
-            line_tool.set_data(plotted_values)
+            line_tool.set_data(
+                [(point[0], point[1]) for point in plotted_points]
+            )
+            point_hover.set_fields(self._explorer_hover_metadata_preference)
+            point_hover.set_points(plotted_points)
             line_tool.redraw()
             if plotted_groups and not hide_legend.get():
                 axes.legend(loc="best")
