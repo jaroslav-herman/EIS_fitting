@@ -503,6 +503,10 @@ class _ExplorerPointHover:
                 },
                 arrowprops={"arrowstyle": "->", "color": "#666666"},
             )
+            # Do not let the hover popup participate in constrained/tight
+            # layout.  Near the right edge matplotlib would otherwise move
+            # the axes to make room for the annotation, shifting every point.
+            self._annotation.set_in_layout(False)
         else:
             self._annotation.xy = (x_value, y_value)
             self._annotation.set_text(text)
@@ -1998,6 +2002,12 @@ class EISApplication:
             + self._custom_metadata_columns
         ))
         selected_hover_metadata = set(self._explorer_hover_metadata_preference)
+        hover_visible_fields = [
+            field for field in hover_metadata_fields if field in selected_hover_metadata
+        ]
+        hover_hidden_fields = [
+            field for field in hover_metadata_fields if field not in selected_hover_metadata
+        ]
         hover_metadata_frame = ttk.LabelFrame(
             explorer_tab,
             text="Metadata shown when hovering Fit/DRT explorer points",
@@ -2007,25 +2017,69 @@ class EISApplication:
             row=7, column=0, columnspan=2, sticky="ew", pady=(12, 0)
         )
         hover_metadata_frame.columnconfigure(0, weight=1)
+        hover_metadata_frame.columnconfigure(1, weight=0)
+        hover_metadata_frame.columnconfigure(2, weight=1)
+        hover_metadata_frame.rowconfigure(2, weight=1)
         ttk.Label(
             hover_metadata_frame,
             text="Select one or more fields. Manually inserted metadata columns are included automatically.",
             wraplength=600,
             justify=tk.LEFT,
-        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
-        hover_metadata_list = tk.Listbox(
-            hover_metadata_frame,
-            selectmode=tk.EXTENDED,
-            exportselection=False,
-            height=7,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Label(hover_metadata_frame, text="Shown metadata").grid(
+            row=1, column=0, sticky="w", padx=(0, 8)
         )
-        hover_metadata_list.grid(row=1, column=0, sticky="ew")
-        for index, field in enumerate(hover_metadata_fields):
-            hover_metadata_list.insert(
-                tk.END, _ExplorerPointHover._field_label(field)
-            )
-            if field in selected_hover_metadata:
-                hover_metadata_list.selection_set(index)
+        ttk.Label(hover_metadata_frame, text="Hidden metadata").grid(
+            row=1, column=2, sticky="w", padx=(8, 0)
+        )
+        hover_visible_list = tk.Listbox(
+            hover_metadata_frame,
+            exportselection=False,
+            height=6,
+        )
+        hover_visible_list.grid(row=2, column=0, sticky="nsew", padx=(0, 8))
+        hover_hidden_list = tk.Listbox(
+            hover_metadata_frame,
+            exportselection=False,
+            height=6,
+        )
+        hover_hidden_list.grid(row=2, column=2, sticky="nsew", padx=(8, 0))
+
+        def refresh_hover_metadata_lists() -> None:
+            hover_visible_list.delete(0, tk.END)
+            hover_hidden_list.delete(0, tk.END)
+            for field in hover_visible_fields:
+                hover_visible_list.insert(tk.END, _ExplorerPointHover._field_label(field))
+            for field in hover_hidden_fields:
+                hover_hidden_list.insert(tk.END, _ExplorerPointHover._field_label(field))
+
+        refresh_hover_metadata_lists()
+        hover_transfer_buttons = ttk.Frame(hover_metadata_frame)
+        hover_transfer_buttons.grid(row=2, column=1, padx=2)
+
+        def move_hover_metadata(shown: bool) -> None:
+            source_list = hover_visible_list if shown else hover_hidden_list
+            source_fields = hover_visible_fields if shown else hover_hidden_fields
+            target_fields = hover_hidden_fields if shown else hover_visible_fields
+            selected = list(source_list.curselection())
+            if not selected:
+                return
+            moving = [source_fields[index] for index in selected]
+            for index in reversed(selected):
+                del source_fields[index]
+            target_fields.extend(moving)
+            refresh_hover_metadata_lists()
+
+        ttk.Button(
+            hover_transfer_buttons,
+            text="Hide →",
+            command=lambda: move_hover_metadata(True),
+        ).pack(pady=2)
+        ttk.Button(
+            hover_transfer_buttons,
+            text="← Show",
+            command=lambda: move_hover_metadata(False),
+        ).pack(pady=2)
 
         ttk.Label(
             eec_tab,
@@ -2338,10 +2392,7 @@ class EISApplication:
                 self._deterministic_threshold_preference = self.deterministic_threshold_var.get()
                 self._refine_z_threshold_preference = self.refine_z_threshold_var.get()
                 self._refine_max_iterations_preference = self.refine_max_iterations_var.get()
-                self._explorer_hover_metadata_preference = [
-                    hover_metadata_fields[index]
-                    for index in hover_metadata_list.curselection()
-                ]
+                self._explorer_hover_metadata_preference = list(hover_visible_fields)
                 self._save_preferences(
                     circuits,
                     fit_x_var.get().strip() or "I_mA",
