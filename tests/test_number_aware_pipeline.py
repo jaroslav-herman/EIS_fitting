@@ -10,7 +10,7 @@ import pandas as pd
 
 from ml.dataset import SpectrumRecord, load_eisfit_projects
 from ml.frequency_range import active_frequency_bounds, _targets
-from ml.number_aware_pipeline import deterministic_masks, _is_positive_parameter, _physical_initial_cap, _parameter_features
+from ml.number_aware_pipeline import deterministic_masks, _is_positive_parameter, _physical_initial_cap, _parameter_features, _usable_fit_parameter
 from ml.preprocessing import SpectrumPreprocessor
 
 
@@ -79,6 +79,17 @@ class NumberAwarePipelineTests(unittest.TestCase):
                                 np.asarray([0.0, 0.0, 0.001, 0.002]),
                                 "R0-L0-p(R1,CPE1)")
         self.assertLess(_physical_initial_cap(record, "R0", 10.0), 0.03)
+
+    def test_optimizer_collapse_labels_are_excluded_for_scale_parameters(self):
+        frequency = np.logspace(4, 0, 12)
+        record = SpectrumRecord(
+            "id", "source", "sample", 1, 1.6, 100.0, 1.0, frequency,
+            np.full(12, 0.1), -np.full(12, 0.01), "R0-L0-p(R1,CPE1)",
+        )
+        self.assertFalse(_usable_fit_parameter(record, "R0", 1e-12))
+        self.assertTrue(_usable_fit_parameter(record, "R0", 0.02))
+        self.assertFalse(_usable_fit_parameter(record, "L0", 1e-14))
+        self.assertTrue(_usable_fit_parameter(record, "L0", 1e-7))
 
     def test_parameter_features_include_current_and_interactions(self):
         frequency = np.logspace(4, 0, 12)

@@ -92,6 +92,25 @@ def _physical_initial_cap(record: SpectrumRecord, name: str, value: float) -> fl
     return value
 
 
+def _usable_fit_parameter(record: SpectrumRecord, name: str, value: float) -> bool:
+    """Reject optimizer-collapse labels before they teach the ML model."""
+    if name not in {"R0", "L0"}:
+        return True
+    frequency = np.asarray(record.frequency, dtype=float)
+    impedance = np.asarray(record.impedance, dtype=complex)
+    valid = np.isfinite(frequency) & (frequency > 0) & np.isfinite(impedance.real) & np.isfinite(impedance.imag)
+    if valid.sum() < 3:
+        return False
+    frequency, impedance = frequency[valid], impedance[valid]
+    high = np.argsort(frequency)[-max(3, frequency.size // 10):]
+    if name == "R0":
+        scale = np.nanmedian(impedance.real[high])
+        return bool(np.isfinite(scale) and scale > 0 and value >= max(1.0e-6, 0.01 * scale))
+    apparent = np.abs(impedance.imag[high]) / (2.0 * np.pi * frequency[high])
+    scale = np.nanmedian(apparent[np.isfinite(apparent) & (apparent > 0)])
+    return bool(np.isfinite(scale) and scale > 0 and value >= max(1.0e-12, 0.01 * scale))
+
+
 @dataclass
 class PipelineBundle:
     frequency_preprocessor: SpectrumPreprocessor
@@ -265,7 +284,7 @@ def _parameter_training_rows(records: list[SpectrumRecord], projects: list[Path]
         if values.size != len(names) or not np.isfinite(values).all():
             continue
         for name, value in zip(names, values):
-            if value > 0 and np.isfinite(value):
+            if value > 0 and np.isfinite(value) and _usable_fit_parameter(record, name, float(value)):
                 rows.append((index, record, str(record.original_eec_topology), name, float(value)))
     return rows
 
@@ -458,16 +477,8 @@ def _predict_parameters_batch(bundle: PipelineBundle, records: list[SpectrumReco
                 if current is None or limit.get("current_min") is None or not (limit["current_min"] <= current <= limit["current_max"]):
                     warning = warning or "current_outside_training_range"
             physical_value = _physical_initial_cap(records[index], parameter.name, value)
-            physical_cap = _physical_initial_cap(records[index], parameter.name, float("inf"))
-            if np.isfinite(physical_cap) and physical_cap > 0:
-                upper = min(upper, physical_cap)
-                if lower >= upper:
-                    lower = float(parameter.lower)
-                    if _is_alpha_parameter(parameter.name):
-                        lower = max(lower, 1.0e-4)
-                    warning = warning or "learned_interval_incompatible_with_physical_cap"
-                if physical_value != value:
-                    warning = warning or "physical_initial_cap_applied"
+            if physical_value != value:
+                warning = warning or "physical_initial_cap_applied"
             value = physical_value
             value = float(np.clip(value, lower, upper))
             params.append(ParameterValue(parameter.name, parameter.unit, value, lower, upper, fixed=parameter.fixed))
