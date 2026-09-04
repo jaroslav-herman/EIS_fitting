@@ -40,6 +40,7 @@ class MLResult:
     confidence: float | None = None
     metadata: dict[str, object] = field(default_factory=dict)
     suggested_eec: str | None = None
+    topology_candidates: list[str] = field(default_factory=list)
     predicted_process_count: int | None = None
     predicted_l0_required: bool | None = None
     initial_sources: dict[str, str] = field(default_factory=dict)
@@ -127,6 +128,9 @@ def _add_row(results: dict[str, MLResult], row) -> None:
         or _text(row.get("predicted_eec_model"))
         or result.suggested_eec
     )
+    candidates = row.get("topology_candidates")
+    if isinstance(candidates, list):
+        result.topology_candidates = [str(value) for value in candidates if str(value).strip()]
     result.source_project = _text(row.get("source_project")) or result.source_project
     result.control = _text(row.get("control")) or result.control
     minimum = _number(row.get("predicted_fmin"))
@@ -195,9 +199,13 @@ def _add_json_spectrum(
         "suggested_EEC": spectrum.get("suggested_EEC")
         or spectrum.get("suggested_eec")
         or spectrum.get("predicted_eec_model"),
+        "topology_candidates": spectrum.get("topology_candidates"),
     }
     _add_row(results, row)
     result = results[spectrum_id]
+    candidates = spectrum.get("topology_candidates")
+    if isinstance(candidates, list):
+        result.topology_candidates = [str(value) for value in candidates if str(value).strip()]
     result.spectrum_key = (
         _text(spectrum.get("spectrum_key"))
         or _text(spectrum.get("canonical_spectrum_id"))

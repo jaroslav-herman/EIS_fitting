@@ -2044,3 +2044,89 @@ def batch_fit_spectra(
                 skipped_labels=[item.label for item in targets[index + 1 :]],
             )
     return SpectrumBatchReport(completed)
+
+
+def batch_fit_candidate_spectra(
+    targets: list[SpectrumFitTarget],
+    candidate_circuits: dict[str, list[str]],
+    *,
+    stop_event=None,
+    fit_timeout_seconds: float | None = None,
+    fit_options: FitOptions | None = None,
+) -> SpectrumBatchReport:
+    """Fit ML-ranked EEC candidates and retain the best impedance result.
+
+    This is intentionally a separate entry point: ordinary manual and batch
+    fitting continue to use the explicitly selected circuit.
+    """
+    completed: list[SpectrumBatchFit] = []
+    for index, target in enumerate(targets):
+        if stop_event is not None and stop_event.is_set():
+            return SpectrumBatchReport(completed, stopped=True, skipped_labels=[item.label for item in targets[index:]])
+        project = target.loaded.state
+        cycle = project.cycles.get(target.cycle)
+        if cycle is None:
+            cycle = load_cycle(target.loaded.dataframe, target.cycle, project.control)
+        selected = cycle.model(project.circuit)
+        target_parameters = project.parameters_for(target.cycle)
+        circuits = list(dict.fromkeys(candidate_circuits.get(target.label, [selected])))
+        if selected not in circuits:
+            circuits.insert(0, selected)
+        results = []
+        failures = []
+        for circuit in circuits:
+            try:
+                parameters = circuit_parameters(circuit)
+                source = {parameter.name: parameter for parameter in target_parameters}
+                for parameter in parameters:
+                    original = source.get(parameter.name)
+                    if original is not None:
+                        parameter.initial = _clamp_initial(original.initial, parameter)
+                        parameter.lower = max(parameter.lower, original.lower)
+                        parameter.upper = min(parameter.upper, original.upper)
+                        if parameter.upper <= parameter.lower:
+                            parameter.lower, parameter.upper = original.lower, original.upper
+                fit_function = fit_cycle_with_timeout if fit_timeout_seconds is not None else fit_cycle
+                kwargs = {"timeout_seconds": fit_timeout_seconds} if fit_timeout_seconds is not None else {}
+                if fit_options is not None:
+                    kwargs["options"] = fit_options
+                result = fit_function(cycle, circuit, parameters, **kwargs)
+                included = cycle.included
+                residual = result.fit_at_data_impedance[included] - cycle.impedance[included]
+                scale = max(float(np.nanmedian(np.abs(cycle.impedance[included]))), np.finfo(float).eps)
+                normalized_rmse = float(np.sqrt(np.mean(np.abs(residual / scale) ** 2)))
+                results.append((normalized_rmse, len(parameters), circuit, parameters, result))
+            except Exception as error:
+                failures.append(f"{circuit}: {type(error).__name__}: {error}")
+        if not results:
+            return SpectrumBatchReport(completed, target.label, "; ".join(failures), skipped_labels=[item.label for item in targets[index + 1:]])
+        results.sort(key=lambda item: (item[0], item[1]))
+        best_score, _complexity, best_circuit, best_parameters, fit_result = results[0]
+        fitted_parameters = [
+            ParameterValue(parameter.name, parameter.unit, float(value), parameter.lower, parameter.upper, float(error), parameter.fixed)
+            for parameter, value, error in zip(best_parameters, fit_result.fitted_parameters, fit_result.errors_percent)
+        ]
+        provenance = _fit_provenance(fit_result)
+        provenance.update({
+            "candidate_selection": "normalized_impedance_rmse_then_complexity",
+            "selected_circuit": best_circuit,
+            "candidate_scores": [
+                {"circuit": circuit, "normalized_rmse": score, "parameter_count": complexity}
+                for score, complexity, circuit, _parameters, _result in results
+            ],
+            "candidate_failures": failures,
+        })
+        completed.append(SpectrumBatchFit(
+            loaded=target.loaded,
+            fit=BatchCycleFit(
+                cycle=cycle,
+                parameters=fitted_parameters,
+                fitted_parameters=fit_result.fitted_parameters,
+                fitted_errors_percent=fit_result.errors_percent,
+                fit_frequency_hz=fit_result.fit_frequency_hz,
+                fit_impedance=fit_result.fit_impedance,
+                fit_at_data_impedance=fit_result.fit_at_data_impedance,
+                fit_provenance=provenance,
+            ),
+        ))
+    return SpectrumBatchReport(completed)

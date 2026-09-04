@@ -92,6 +92,25 @@ def _physical_initial_cap(record: SpectrumRecord, name: str, value: float) -> fl
     return value
 
 
+def _physical_initial_estimate(record: SpectrumRecord, name: str) -> float | None:
+    """Estimate series scale from the measured high-frequency tail."""
+    frequency = np.asarray(record.frequency, dtype=float)
+    impedance = np.asarray(record.impedance, dtype=complex)
+    valid = np.isfinite(frequency) & (frequency > 0) & np.isfinite(impedance.real) & np.isfinite(impedance.imag)
+    if valid.sum() < 3:
+        return None
+    frequency, impedance = frequency[valid], impedance[valid]
+    high = np.argsort(frequency)[-max(3, frequency.size // 10):]
+    if name == "R0":
+        values = impedance.real[high]
+    elif name == "L0":
+        values = np.abs(impedance.imag[high]) / (2.0 * np.pi * frequency[high])
+    else:
+        return None
+    values = values[np.isfinite(values) & (values > 0)]
+    return float(np.nanmedian(values)) if values.size else None
+
+
 def _usable_fit_parameter(record: SpectrumRecord, name: str, value: float) -> bool:
     """Reject optimizer-collapse labels before they teach the ML model."""
     if name not in {"R0", "L0"}:
@@ -246,12 +265,21 @@ def _parameter_features(preprocessor: SpectrumPreprocessor, records: list[Spectr
     base = preprocessor.transform(records)
     metadata = []
     for record in records:
-        voltage = float(record.voltage) if record.voltage is not None and np.isfinite(record.voltage) else 0.0
+        voltage = float(record.voltage) if record.voltage is not None and np.isfinite(record.voltage) else float(getattr(preprocessor, "parameter_voltage_mean_", 0.0))
         current = float(record.current) if record.current is not None and np.isfinite(record.current) else 0.0
         safe_current = max(abs(current), 1.0e-9)
         log_current = np.log10(safe_current)
         inverse_current = 1.0 / safe_current
-        metadata.append((voltage, current, log_current, inverse_current, voltage * log_current, voltage * inverse_current))
+        voltage_mean = float(getattr(preprocessor, "parameter_voltage_mean_", 0.0))
+        voltage_scale = max(float(getattr(preprocessor, "parameter_voltage_scale_", 1.0)), 1.0e-12)
+        voltage_min = getattr(preprocessor, "parameter_voltage_min_", voltage_mean)
+        voltage_max = getattr(preprocessor, "parameter_voltage_max_", voltage_mean)
+        normalized_voltage = (voltage - voltage_mean) / voltage_scale
+        low_distance = max(0.0, (float(voltage_min) - voltage) / voltage_scale)
+        high_distance = max(0.0, (voltage - float(voltage_max)) / voltage_scale)
+        metadata.append((normalized_voltage, normalized_voltage ** 2, current, log_current, inverse_current,
+                         normalized_voltage * log_current, normalized_voltage * inverse_current,
+                         low_distance, high_distance, float(low_distance > 0), float(high_distance > 0)))
     return np.hstack([base, np.asarray(metadata, dtype=float)])
 
 
@@ -309,7 +337,12 @@ def _predict_parameter_candidate(model, x, mode: str, records: list[SpectrumReco
 
 def _fit_parameters(records: list[SpectrumRecord], projects: list[Path], samples: tuple[str, ...]) -> tuple[SpectrumPreprocessor, dict[str, object], dict[str, dict], dict[str, dict[str, object]], dict[str, dict[str, object]]]:
     preprocessor = SpectrumPreprocessor(grid_size=64, use_metadata=False, spectrum_mode="raw", include_impedance_scale=True)
-    x = preprocessor.fit_transform(records)
+    preprocessor.fit(records)
+    voltages = np.asarray([float(r.voltage) for r in records if r.voltage is not None and np.isfinite(r.voltage)], dtype=float)
+    preprocessor.parameter_voltage_mean_ = float(np.mean(voltages)) if voltages.size else 0.0
+    preprocessor.parameter_voltage_scale_ = float(np.std(voltages)) if voltages.size else 1.0
+    preprocessor.parameter_voltage_min_ = float(np.min(voltages)) if voltages.size else 0.0
+    preprocessor.parameter_voltage_max_ = float(np.max(voltages)) if voltages.size else 0.0
     x = _parameter_features(preprocessor, records)
     rows = _parameter_training_rows(records, projects)
     models: dict[str, object] = {}
@@ -430,6 +463,22 @@ def _predict_topologies(bundle: PipelineBundle, records: list[SpectrumRecord]) -
     return result
 
 
+def _candidate_topologies(bundle: PipelineBundle, predicted: str, probabilities: dict[str, float], record: SpectrumRecord) -> list[str]:
+    """Return the ML choice plus plausible alternatives at boundaries."""
+    ordered = sorted(probabilities, key=probabilities.get, reverse=True)
+    candidates = [predicted]
+    top_probability = probabilities.get(predicted, 0.0)
+    outside = bool(record.voltage is None)
+    voltage_values = [float(r) for r in (record.voltage,) if r is not None and np.isfinite(r)]
+    if voltage_values:
+        outside = voltage_values[0] < getattr(bundle.parameter_preprocessor, "parameter_voltage_min_", -np.inf) or voltage_values[0] > getattr(bundle.parameter_preprocessor, "parameter_voltage_max_", np.inf)
+    for label in ordered:
+        probability = probabilities.get(label, 0.0)
+        if label != predicted and (probability >= max(0.15, 0.70 * top_probability) or outside and probability >= 0.10):
+            candidates.append(label)
+    return candidates[:3]
+
+
 def _predict_parameters_batch(bundle: PipelineBundle, records: list[SpectrumRecord], circuits: list[str]) -> list[tuple[list[ParameterValue], dict[str, dict]]]:
     x = _parameter_features(bundle.parameter_preprocessor, records)
     models = getattr(bundle, "parameter_models", {}) or {}
@@ -461,8 +510,20 @@ def _predict_parameters_batch(bundle: PipelineBundle, records: list[SpectrumReco
             if limit is not None and transformed is not None:
                 lower_residual = float(limit.get("lower_residual", 0.0))
                 upper_residual = float(limit.get("upper_residual", 0.0))
-                learned_lower = _inverse_parameter(transformed + lower_residual, parameter.name)
-                learned_upper = _inverse_parameter(transformed + upper_residual, parameter.name)
+                voltage = float(records[index].voltage) if records[index].voltage is not None else None
+                voltage_min = limit.get("voltage_min")
+                voltage_max = limit.get("voltage_max")
+                voltage_scale = max(float(voltage_max - voltage_min), 1.0e-12) if voltage_min is not None and voltage_max is not None else 1.0
+                extrapolation = 0.0
+                if voltage is None or voltage_min is None or voltage_max is None:
+                    extrapolation = 1.0
+                elif voltage < voltage_min:
+                    extrapolation = (voltage_min - voltage) / voltage_scale
+                elif voltage > voltage_max:
+                    extrapolation = (voltage - voltage_max) / voltage_scale
+                interval_scale = 1.0 + min(max(extrapolation, 0.0), 2.0)
+                learned_lower = _inverse_parameter(transformed + lower_residual * interval_scale, parameter.name)
+                learned_upper = _inverse_parameter(transformed + upper_residual * interval_scale, parameter.name)
                 lower = max(lower, learned_lower)
                 upper = min(upper, learned_upper)
                 if upper <= lower:
@@ -470,14 +531,19 @@ def _predict_parameters_batch(bundle: PipelineBundle, records: list[SpectrumReco
                     if _is_alpha_parameter(parameter.name):
                         lower, upper = max(lower, 1e-4), min(upper, 0.9999)
                     warning = "learned_interval_incompatible_with_application_bounds"
-                voltage = float(records[index].voltage) if records[index].voltage is not None else None
                 current = abs(float(records[index].current)) if records[index].current is not None else None
                 if voltage is None or limit.get("voltage_min") is None or not (limit["voltage_min"] <= voltage <= limit["voltage_max"]):
                     warning = warning or "voltage_outside_training_range"
+                if extrapolation > 0:
+                    warning = warning or "voltage_extrapolation_interval_widened"
                 if current is None or limit.get("current_min") is None or not (limit["current_min"] <= current <= limit["current_max"]):
                     warning = warning or "current_outside_training_range"
+            original_value = value
+            physical_estimate = _physical_initial_estimate(records[index], parameter.name)
+            if physical_estimate is not None and _is_positive_parameter(parameter.name) and parameter.name in {"R0", "L0"} and value > 0:
+                value = float(np.sqrt(value * physical_estimate))
             physical_value = _physical_initial_cap(records[index], parameter.name, value)
-            if physical_value != value:
+            if physical_value != original_value:
                 warning = warning or "physical_initial_cap_applied"
             value = physical_value
             value = float(np.clip(value, lower, upper))
@@ -518,6 +584,7 @@ def infer_bundle_records(bundle: PipelineBundle, records: list[SpectrumRecord], 
             "deterministic_outlier_mask": (~mask).tolist(), "final_ml_active_mask": mask.tolist(),
             "deterministic_diagnostics": diagnostics[record.spectrum_id],
             "predicted_eec_model": predicted_circuit, "suggested_eec": predicted_circuit,
+            "topology_candidates": _candidate_topologies(bundle, predicted_circuit, probabilities, record),
             "topology_probability": probabilities, "prediction_probability": confidence,
             "topology_prediction_warning": warning, "parameter_predictions": list(parameter_info.values()),
             "parameter_prediction_warnings": sorted({item["warning"] for item in parameter_info.values() if item.get("warning")}),
@@ -528,15 +595,31 @@ def infer_bundle_records(bundle: PipelineBundle, records: list[SpectrumRecord], 
     return results
 
 
-def _fit_validation(record: SpectrumRecord, circuit: str, parameters: list[ParameterValue]) -> dict:
+def _fit_validation(record: SpectrumRecord, circuit: str, parameters: list[ParameterValue], candidates: list[str] | None = None) -> dict:
     state = CycleState(record.cycle, record.frequency.copy(), record.impedance.copy(), record.voltage or 0.0, record.current or 0.0, record.time)
     state.frequency_window = (float(record.manual_f_min), float(record.manual_f_max)) if record.manual_f_min and record.manual_f_max else (float(np.min(record.frequency)), float(np.max(record.frequency)))
     state.manually_included = np.ones(record.frequency.size, dtype=bool)
-    try:
-        result = fit_cycle(state, circuit, parameters, FitOptions(method="least_squares"))
-    except Exception as error:
-        return {"success": False, "error": f"{type(error).__name__}: {error}"}
-    return {"success": bool(result.converged), "converged": bool(result.converged), "objective": float(result.objective), "rmse": float(result.rmse), "fitted_parameters": result.fitted_parameters.tolist(), "errors_percent": result.errors_percent.tolist()}
+    scores = []
+    for candidate in list(dict.fromkeys(candidates or [circuit])):
+        try:
+            candidate_parameters = parameters if candidate == circuit else circuit_parameters(candidate)
+            result = fit_cycle(state, candidate, candidate_parameters, FitOptions(method="least_squares"))
+            residual = result.fit_at_data_impedance[state.included] - state.impedance[state.included]
+            scale = max(float(np.nanmedian(np.abs(state.impedance[state.included]))), np.finfo(float).eps)
+            normalized_rmse = float(np.sqrt(np.mean(np.abs(residual / scale) ** 2)))
+            scores.append((normalized_rmse, len(candidate_parameters), candidate, result))
+        except Exception:
+            continue
+    if not scores:
+        return {"success": False, "error": "all candidate fits failed"}
+    scores.sort(key=lambda item: (item[0], item[1]))
+    normalized_rmse, _count, selected, result = scores[0]
+    residual = result.fit_at_data_impedance[state.included] - state.impedance[state.included]
+    frequencies = state.frequency_hz[state.included]
+    regions = {}
+    for region, mask in (("high_frequency", frequencies >= np.nanpercentile(frequencies, 75)), ("mid_frequency", (frequencies > np.nanpercentile(frequencies, 25)) & (frequencies < np.nanpercentile(frequencies, 75))), ("low_frequency", frequencies <= np.nanpercentile(frequencies, 25))):
+        regions[region] = float(np.sqrt(np.mean(np.abs(residual[mask]) ** 2))) if np.any(mask) else None
+    return {"success": bool(result.converged), "converged": bool(result.converged), "selected_circuit": selected, "objective": float(result.objective), "rmse": float(result.rmse), "normalized_rmse": normalized_rmse, "residual_rmse_by_frequency_region": regions, "candidate_scores": [{"circuit": name, "normalized_rmse": score, "parameter_count": count} for score, count, name, _result in scores], "fitted_parameters": result.fitted_parameters.tolist(), "errors_percent": result.errors_percent.tolist()}
 
 
 def _loso_summary(records: list[SpectrumRecord], seed: int) -> list[dict]:
@@ -582,7 +665,8 @@ def run_pipeline(training_projects: list[Path], validation_project: Path, sample
     for record, masked, topology_prediction, parameter_prediction in zip(validation.records, masked_records, topology_predictions, parameter_predictions):
         predicted_circuit, probabilities, confidence, warning = topology_prediction
         parameters, parameter_info = parameter_prediction
-        fit = _fit_validation(masked, predicted_circuit, parameters) if run_deterministic_fit else {"success": None, "skipped": True, "reason": "deterministic EEC fitting disabled"}
+        candidates = _candidate_topologies(bundle, predicted_circuit, probabilities, record)
+        fit = _fit_validation(masked, predicted_circuit, parameters, candidates) if run_deterministic_fit else {"success": None, "skipped": True, "reason": "deterministic EEC fitting disabled"}
         minimum, maximum = windows[record.spectrum_id]
         mask = masks[record.spectrum_id]
         item = {
@@ -594,6 +678,7 @@ def run_pipeline(training_projects: list[Path], validation_project: Path, sample
             "deterministic_outlier_mask": (~mask).tolist(), "final_ml_active_mask": mask.tolist(),
             "deterministic_diagnostics": diagnostics[record.spectrum_id],
             "predicted_eec_model": predicted_circuit, "suggested_eec": predicted_circuit,
+            "topology_candidates": _candidate_topologies(bundle, predicted_circuit, probabilities, record),
             "topology_probability": probabilities, "prediction_probability": confidence,
             "topology_prediction_warning": warning, "parameter_predictions": list(parameter_info.values()),
             "initial_guess_only": True, "automatic_eec_fit": False,
@@ -602,7 +687,7 @@ def run_pipeline(training_projects: list[Path], validation_project: Path, sample
         results.append(item)
     output.mkdir(parents=True, exist_ok=True)
     results_path = output / f"{validation_project.stem}_ml_results.json"
-    write_ml_results(results_path, results, source_project=str(validation_project), pipeline={"name": "number_aware_staged_eis", "version": "2", "training_samples": list(bundle.training_samples), "frequency_features": "spectrum+voltage+current+time", "parameter_features": "spectral+voltage+current+log_current+inverse_current+voltage_current_interactions", "parameter_model_specs": bundle.parameter_model_specs, "parameter_limits": bundle.parameter_limits, "outlier_threshold": threshold, "circuit_classes": list(bundle.circuit_classes), "validation_ground_truth": False})
+    write_ml_results(results_path, results, source_project=str(validation_project), pipeline={"name": "number_aware_staged_eis", "version": "3", "training_samples": list(bundle.training_samples), "frequency_features": "spectrum+voltage+current+time", "parameter_features": "spectral+normalized_voltage+voltage_squared+current+log_current+inverse_current+voltage_current_interactions+boundary_distance_flags", "parameter_model_specs": bundle.parameter_model_specs, "parameter_limits": bundle.parameter_limits, "outlier_threshold": threshold, "circuit_classes": list(bundle.circuit_classes), "validation_ground_truth": False, "candidate_fit": "normalized_impedance_rmse_then_complexity"})
     report = {"training_samples": list(bundle.training_samples), "training_records": len(extraction.records), "validation_sample": validation_sample, "validation_records": len(results), "training_exclusions": extraction.exclusion_counts, "circuit_classes": list(bundle.circuit_classes), "parameter_training": bundle.parameter_stats, "output": str(results_path), "deterministic_fit_requested": bool(run_deterministic_fit), "warnings": ["raw-only validation has no ground-truth frequency, topology, or parameter accuracy metrics", "one-process class has only one training spectrum"]}
     if not run_deterministic_fit:
         report["warnings"].append("deterministic EEC fitting was disabled; ML initial guesses are available")

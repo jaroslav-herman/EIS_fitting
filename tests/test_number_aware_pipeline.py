@@ -10,7 +10,7 @@ import pandas as pd
 
 from ml.dataset import SpectrumRecord, load_eisfit_projects
 from ml.frequency_range import active_frequency_bounds, _targets
-from ml.number_aware_pipeline import deterministic_masks, _is_positive_parameter, _physical_initial_cap, _parameter_features, _usable_fit_parameter
+from ml.number_aware_pipeline import deterministic_masks, _candidate_topologies, _is_positive_parameter, _physical_initial_cap, _parameter_features, _usable_fit_parameter
 from ml.preprocessing import SpectrumPreprocessor
 
 
@@ -99,9 +99,32 @@ class NumberAwarePipelineTests(unittest.TestCase):
         ]
         processor = SpectrumPreprocessor(grid_size=8, include_impedance_scale=True).fit(records)
         features = _parameter_features(processor, records)
-        self.assertEqual(features.shape, (2, 8 * 3 + 1 + 6))
-        self.assertNotEqual(features[0, -4], features[1, -4])  # log(current)
-        self.assertNotEqual(features[0, -3], features[1, -3])  # 1/current
+        self.assertEqual(features.shape, (2, 8 * 3 + 1 + 11))
+        self.assertNotEqual(features[0, -8], features[1, -8])  # log(current)
+        self.assertNotEqual(features[0, -7], features[1, -7])  # 1/current
+
+    def test_boundary_features_mark_voltage_extrapolation(self):
+        frequency = np.logspace(4, 0, 12)
+        records = [SpectrumRecord("a", "source", "sample", 1, 1.6, 10.0, 1.0, frequency, np.ones(12), -np.ones(12), "R0-p(R1,CPE1)")]
+        processor = SpectrumPreprocessor(grid_size=8, include_impedance_scale=True).fit(records)
+        processor.parameter_voltage_mean_ = 1.6
+        processor.parameter_voltage_scale_ = 0.1
+        processor.parameter_voltage_min_ = 1.5
+        processor.parameter_voltage_max_ = 1.7
+        outside = SpectrumRecord("b", "source", "sample", 2, 1.9, 10.0, 1.0, frequency, np.ones(12), -np.ones(12), "R0-p(R1,CPE1)")
+        features = _parameter_features(processor, [outside])
+        self.assertEqual(features[0, -1], 1.0)
+        self.assertGreater(features[0, -3], 0.0)
+
+    def test_candidate_topologies_include_competitive_alternative(self):
+        class Bundle:
+            circuit_classes = ("R0-L0-p(R1,CPE1)-p(R2,CPE2)", "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)")
+            parameter_preprocessor = type("Pre", (), {"parameter_voltage_min_": 1.4, "parameter_voltage_max_": 1.8})()
+        frequency = np.logspace(4, 0, 12)
+        record = SpectrumRecord("id", "source", "sample", 1, 1.9, 10.0, 1.0, frequency, np.ones(12), -np.ones(12), "R0-L0-p(R1,CPE1)-p(R2,CPE2)")
+        candidates = _candidate_topologies(Bundle(), "R0-L0-p(R1,CPE1)-p(R2,CPE2)", {Bundle.circuit_classes[0]: 0.55, Bundle.circuit_classes[1]: 0.45}, record)
+        self.assertEqual(candidates[0], Bundle.circuit_classes[0])
+        self.assertIn(Bundle.circuit_classes[1], candidates)
 
     def test_frequency_target_uses_active_points_not_saved_boundaries(self):
         record = SpectrumRecord("id", "source", "sample", 1, 1.0, 2.0, 3.0,

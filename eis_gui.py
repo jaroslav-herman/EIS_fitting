@@ -61,6 +61,7 @@ from eis_services import (
     SpectrumMetadata,
     batch_fit_from_cycle,
     batch_fit_spectra,
+    batch_fit_candidate_spectra,
     calculate_hybrid_drt,
     calculate_lin_kk_residuals,
     catalog_spectra,
@@ -7550,6 +7551,7 @@ class EISApplication:
         ):
             return
         assignments = []
+        candidate_circuits = {}
         missing: list[str] = []
         for dataset_id, loaded, spectrum in selected_rows:
             result = self._ml_result_for_spectrum(dataset_id, loaded, spectrum)
@@ -7603,6 +7605,7 @@ class EISApplication:
                                 parameter.lower, parameter.upper = limits
                             parameter.initial = self._clamp_parameter_value(value, parameter.lower, parameter.upper)
                     cycle.clear_fit()
+                candidate_circuits[label] = list(dict.fromkeys(result.topology_candidates or [circuit]))
             assignments.append((dataset_id, loaded, spectrum, cycle))
 
         if assignments and assignments[0][1] is self.loaded and assignments[0][3].cycle == self.state.active_cycle:
@@ -7621,12 +7624,10 @@ class EISApplication:
             self._update_status(f"ML processing unavailable for {len(missing)} selected spectra")
             return
         self.status_var.set(f"ML processing and fitting {len(targets)} selected spectra…")
-        initial_parameters = assignments[0][3].parameters
         self._submit(
-            lambda: batch_fit_spectra(
+            lambda: batch_fit_candidate_spectra(
                 targets,
-                initial_parameters,
-                use_target_initial_parameters=True,
+                candidate_circuits,
                 stop_event=self._stop_event,
                 fit_timeout_seconds=self._fit_timeout_seconds,
             ),
