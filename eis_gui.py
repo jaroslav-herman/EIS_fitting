@@ -1119,6 +1119,7 @@ class EISApplication:
         self._explorer_lookup: dict[tuple[str, int], str] = {}
         self._explorer_anchor_item: str | None = None
         self._explorer_primary_item: str | None = None
+        self._explorer_navigation_column: str | None = None
         self._suspend_explorer_select = False
         self._explorer_shift_double_click = False
         self.executor = ThreadPoolExecutor(
@@ -3774,6 +3775,12 @@ class EISApplication:
         )
         self.explorer.bind("<Up>", lambda event: self._on_explorer_arrow(event, -1))
         self.explorer.bind("<Down>", lambda event: self._on_explorer_arrow(event, 1))
+        self.explorer.bind(
+            "<Prior>", lambda event: self._on_explorer_page_navigation(event, -1)
+        )
+        self.explorer.bind(
+            "<Next>", lambda event: self._on_explorer_page_navigation(event, 1)
+        )
         self.explorer.bind("<Control-a>", self.select_all_spectra)
 
         explorer_actions = ttk.Frame(group)
@@ -4325,6 +4332,45 @@ class EISApplication:
             preserve_selection=shift_pressed,
             focus_only=control_pressed and not shift_pressed,
         )
+        return "break"
+
+    def _on_explorer_page_navigation(self, _event, direction: int):
+        if self.busy or self.state is None or not self._explorer_navigation_column:
+            return "break"
+        visible_items = list(self.explorer.get_children(""))
+        if not visible_items:
+            return "break"
+        current_item = self.explorer.focus()
+        if current_item not in visible_items:
+            current_item = self._explorer_primary_item
+        if current_item not in visible_items:
+            return "break"
+        current_index = visible_items.index(current_item)
+        current_row = self._explorer_rows.get(current_item)
+        if current_row is None:
+            return "break"
+        column = self._explorer_navigation_column
+        current_value = self._format_explorer_value(
+            self._explorer_value(current_row[1], current_row[2], column),
+            column,
+        )
+        target_index = current_index
+        step = -1 if direction < 0 else 1
+        while 0 <= target_index + step < len(visible_items):
+            candidate = visible_items[target_index + step]
+            candidate_row = self._explorer_rows.get(candidate)
+            if candidate_row is None:
+                break
+            candidate_value = self._format_explorer_value(
+                self._explorer_value(candidate_row[1], candidate_row[2], column),
+                column,
+            )
+            if candidate_value != current_value:
+                break
+            target_index += step
+        target_item = visible_items[target_index]
+        self._set_explorer_selection([target_item], primary=target_item)
+        self._activate_explorer_item(target_item)
         return "break"
 
     def select_all_spectra(self, _event=None):
@@ -5552,6 +5598,12 @@ class EISApplication:
         item = self.explorer.identify_row(event.y)
         if not item:
             return "break"
+        column_id = self.explorer.identify_column(event.x)
+        columns = self._explorer_display_columns()
+        if column_id.startswith("#"):
+            column_index = int(column_id[1:]) - 1
+            if 0 <= column_index < len(columns):
+                self._explorer_navigation_column = columns[column_index]
         visible_items = list(self.explorer.get_children(""))
         if item not in visible_items:
             return "break"
