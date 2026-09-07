@@ -6778,9 +6778,16 @@ class EISApplication:
 
     def _register_dataset(self, dataset_id: str, loaded: LoadedProject) -> None:
         loaded.state.source_path = loaded.state.source_path.resolve()
-        if dataset_id not in self.loaded_projects:
-            self._dataset_order.append(dataset_id)
-        self.loaded_projects[dataset_id] = loaded
+        unique_dataset_id = dataset_id
+        copy_number = 2
+        while unique_dataset_id in self.loaded_projects:
+            unique_dataset_id = f"{dataset_id}::copy-{copy_number}"
+            copy_number += 1
+        if unique_dataset_id != dataset_id:
+            loaded.dataset_label = f"{loaded.dataset_label} (copy {copy_number - 1})"
+        loaded.dataset_id = unique_dataset_id
+        self._dataset_order.append(unique_dataset_id)
+        self.loaded_projects[unique_dataset_id] = loaded
 
     def _switch_dataset(
         self,
@@ -14991,12 +14998,21 @@ class EISApplication:
             loaded.state.source_path.resolve()
             for loaded in self.loaded_projects.values()
         }
-        new_paths = [
-            path for path in selected_paths if path not in imported_paths
+        duplicate_paths = [
+            path for path in selected_paths if path in imported_paths
         ]
-        if not new_paths:
-            self._update_status("all selected files are already imported")
-            return
+        if duplicate_paths:
+            duplicate_names = "\n".join(f"• {path.name}" for path in duplicate_paths)
+            messagebox.showwarning(
+                "File already imported",
+                (
+                    "The following file(s) are already in this project. "
+                    "They will be imported again as separate dataset copies:\n\n"
+                    f"{duplicate_names}"
+                ),
+                parent=self.root,
+            )
+        new_paths = selected_paths
         if self.state is not None and not self._capture_controls():
             return
         circuit = (
