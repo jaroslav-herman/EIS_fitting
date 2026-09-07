@@ -415,24 +415,21 @@ class _ExplorerPointHover:
         "drt_mode": "DRT mode",
     }
 
-    def __init__(self, axes, canvas, fields: list[str]) -> None:
+    def __init__(self, axes, canvas, fields: list[str], info_var=None) -> None:
         self.axes = axes
         self.canvas = canvas
         self.fields = list(fields)
+        self.info_var = info_var
         self._points: list[tuple[float, float, dict[str, object]]] = []
-        self._annotation = None
         canvas.mpl_connect("motion_notify_event", self._on_motion)
 
     def set_fields(self, fields: list[str]) -> None:
         self.fields = list(fields)
-        if self._annotation is not None:
-            self._annotation.set_visible(False)
+        self._hide()
 
     def set_points(self, points: list[tuple[float, float, dict[str, object]]]) -> None:
         self._points = points
-        # Explorer refreshes clear and rebuild the axes, which also removes
-        # the previous annotation artist.
-        self._annotation = None
+        self._hide()
 
     @classmethod
     def _field_label(cls, field: str) -> str:
@@ -449,9 +446,8 @@ class _ExplorerPointHover:
         return str(value)
 
     def _hide(self) -> None:
-        if self._annotation is not None:
-            self._annotation.set_visible(False)
-            self.canvas.draw_idle()
+        if self.info_var is not None:
+            self.info_var.set("")
 
     def _on_motion(self, event) -> None:
         if event.inaxes is not self.axes or event.x is None or event.y is None:
@@ -475,7 +471,7 @@ class _ExplorerPointHover:
         if distances[index] > 12.0:
             self._hide()
             return
-        x_value, y_value, record = self._points[index]
+        _x_value, _y_value, record = self._points[index]
         lines = [
             f"{self._field_label(field)}: {self._format_value(record.get(field))}"
             for field in self.fields
@@ -485,33 +481,8 @@ class _ExplorerPointHover:
             self._hide()
             return
         text = "\n".join(lines)
-        if self._annotation is None:
-            self._annotation = self.axes.annotate(
-                text,
-                xy=(x_value, y_value),
-                xytext=(10, 10),
-                textcoords="offset points",
-                ha="left",
-                va="bottom",
-                fontsize=8,
-                zorder=20,
-                bbox={
-                    "boxstyle": "round,pad=0.35",
-                    "facecolor": "#fffde7",
-                    "edgecolor": "#666666",
-                    "alpha": 0.94,
-                },
-                arrowprops={"arrowstyle": "->", "color": "#666666"},
-            )
-            # Do not let the hover popup participate in constrained/tight
-            # layout.  Near the right edge matplotlib would otherwise move
-            # the axes to make room for the annotation, shifting every point.
-            self._annotation.set_in_layout(False)
-        else:
-            self._annotation.xy = (x_value, y_value)
-            self._annotation.set_text(text)
-        self._annotation.set_visible(True)
-        self.canvas.draw_idle()
+        if self.info_var is not None:
+            self.info_var.set(text)
 
 
 class ParameterTable(ttk.Frame):
@@ -13117,13 +13088,21 @@ class EISApplication:
         canvas = FigureCanvasTkAgg(figure, master=chart_frame)
         self._attach_plot_export_menu(canvas, popup)
         canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        hover_info_var = tk.StringVar(value="Hover over a point to see its selected metadata.")
+        ttk.Label(
+            chart_frame,
+            textvariable=hover_info_var,
+            anchor="nw",
+            justify=tk.LEFT,
+            wraplength=900,
+        ).grid(row=1, column=0, sticky="ew", pady=(4, 2))
         toolbar = NavigationToolbar2Tk(canvas, chart_frame, pack_toolbar=False)
         toolbar.update()
-        toolbar.grid(row=1, column=0, sticky="ew")
+        toolbar.grid(row=2, column=0, sticky="ew")
 
         line_tool = _ExplorerLineTool(axes, canvas, controls, lambda: refresh_plot())
         point_hover = _ExplorerPointHover(
-            axes, canvas, self._explorer_hover_metadata_preference
+            axes, canvas, self._explorer_hover_metadata_preference, hover_info_var
         )
 
         range_state: dict[str, tuple[tk.DoubleVar, tk.DoubleVar, float, float]] = {}
@@ -13659,13 +13638,21 @@ class EISApplication:
         canvas = FigureCanvasTkAgg(figure, master=chart_frame)
         self._attach_plot_export_menu(canvas, popup)
         canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        hover_info_var = tk.StringVar(value="Hover over a point to see its selected metadata.")
+        ttk.Label(
+            chart_frame,
+            textvariable=hover_info_var,
+            anchor="nw",
+            justify=tk.LEFT,
+            wraplength=900,
+        ).grid(row=1, column=0, sticky="ew", pady=(4, 2))
         toolbar = NavigationToolbar2Tk(canvas, chart_frame, pack_toolbar=False)
         toolbar.update()
-        toolbar.grid(row=1, column=0, sticky="ew")
+        toolbar.grid(row=2, column=0, sticky="ew")
 
         line_tool = _ExplorerLineTool(axes, canvas, controls, lambda: refresh_plot())
         point_hover = _ExplorerPointHover(
-            axes, canvas, self._explorer_hover_metadata_preference
+            axes, canvas, self._explorer_hover_metadata_preference, hover_info_var
         )
 
         range_state: dict[str, tuple[tk.DoubleVar, tk.DoubleVar, float, float]] = {}
