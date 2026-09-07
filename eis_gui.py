@@ -480,7 +480,7 @@ class _ExplorerPointHover:
         if not lines:
             self._hide()
             return
-        text = "\n".join(lines)
+        text = "  |  ".join(lines)
         if self.info_var is not None:
             self.info_var.set(text)
 
@@ -13101,7 +13101,6 @@ class EISApplication:
             textvariable=hover_info_var,
             anchor="nw",
             justify=tk.LEFT,
-            wraplength=900,
         ).grid(row=1, column=0, sticky="ew", pady=(4, 2))
         toolbar = NavigationToolbar2Tk(canvas, chart_frame, pack_toolbar=False)
         toolbar.update()
@@ -13651,7 +13650,6 @@ class EISApplication:
             textvariable=hover_info_var,
             anchor="nw",
             justify=tk.LEFT,
-            wraplength=900,
         ).grid(row=1, column=0, sticky="ew", pady=(4, 2))
         toolbar = NavigationToolbar2Tk(canvas, chart_frame, pack_toolbar=False)
         toolbar.update()
