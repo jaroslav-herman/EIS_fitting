@@ -3775,12 +3775,7 @@ class EISApplication:
         )
         self.explorer.bind("<Up>", lambda event: self._on_explorer_arrow(event, -1))
         self.explorer.bind("<Down>", lambda event: self._on_explorer_arrow(event, 1))
-        self.explorer.bind(
-            "<Prior>", lambda event: self._on_explorer_page_navigation(event, -1)
-        )
-        self.explorer.bind(
-            "<Next>", lambda event: self._on_explorer_page_navigation(event, 1)
-        )
+        self.explorer.bind("<KeyPress>", self._on_explorer_keypress, add="+")
         self.explorer.bind("<Control-a>", self.select_all_spectra)
 
         explorer_actions = ttk.Frame(group)
@@ -4372,6 +4367,13 @@ class EISApplication:
         self._set_explorer_selection([target_item], primary=target_item)
         self._activate_explorer_item(target_item)
         return "break"
+
+    def _on_explorer_keypress(self, event):
+        if event.keysym in {"Prior", "Page_Up"}:
+            return self._on_explorer_page_navigation(event, -1)
+        if event.keysym in {"Next", "Page_Down"}:
+            return self._on_explorer_page_navigation(event, 1)
+        return None
 
     def select_all_spectra(self, _event=None):
         if self.busy or self.state is None or not hasattr(self, "explorer"):
@@ -5598,6 +5600,7 @@ class EISApplication:
         item = self.explorer.identify_row(event.y)
         if not item:
             return "break"
+        self.explorer.focus_set()
         column_id = self.explorer.identify_column(event.x)
         columns = self._explorer_display_columns()
         if column_id.startswith("#"):
