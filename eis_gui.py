@@ -7527,7 +7527,7 @@ class EISApplication:
         ttk.Combobox(frame, textvariable=model_var, values=tuple(ML_TRAINED_MODELS), state="readonly", width=28).grid(row=1, column=1, sticky="ew", pady=(8, 2))
         ttk.Label(frame, text="Pipeline actions (top to bottom)").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
         action_labels = {
-            "frequency": "ML frequency range",
+            "frequency_limits": "Frequency limits",
             "outliers": "Deterministic outliers removal",
             "model": "ML EEC model selection",
             "initial_parameters": "ML initial parameters",
@@ -7535,8 +7535,8 @@ class EISApplication:
             "refine": "Refine fit",
         }
         action_values = tuple(action_labels)
-        actions = ["frequency", "outliers", "model", "initial_parameters", "fit", "refine"]
-        action_var = tk.StringVar(value="frequency")
+        actions = ["frequency_limits", "outliers", "model", "initial_parameters", "fit", "refine"]
+        action_var = tk.StringVar(value="frequency_limits")
         action_box = ttk.Combobox(frame, textvariable=action_var, values=action_values, state="readonly", width=22)
         action_box.grid(row=3, column=0, sticky="ew")
         action_list = tk.Listbox(frame, height=6, width=38, exportselection=False)
@@ -7625,7 +7625,7 @@ class EISApplication:
             messagebox.showerror("Invalid ML pipeline settings", str(error), parent=self.root)
             return
         selected_keys = {(dataset_id, int(spectrum.cycle)) for dataset_id, _loaded, spectrum in selected_rows}
-        needs_ml = bool(set(actions) & {"frequency", "model", "initial_parameters"})
+        needs_ml = bool(set(actions) & {"frequency_limits", "model", "initial_parameters"})
         targets = []
         target_labels = []
         failures = []
@@ -7690,7 +7690,7 @@ class EISApplication:
             self._update_status("ML pipeline completed")
             return
         action = actions[index]
-        if action == "frequency":
+        if action == "frequency_limits":
             self.apply_ml_frequency_to_selected()
         elif action == "outliers":
             for _dataset_id, loaded, spectrum in selected_rows:
