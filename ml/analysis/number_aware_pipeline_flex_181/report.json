@@ -1,12 +1,14 @@
 {
   "model_name": "Flex",
   "training_projects": [
-    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\181.eisfit.json.gz"
+    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\181.eisfit.json.gz",
+    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\466.eisfit.json.gz"
   ],
   "training_samples": [
-    "181"
+    "181",
+    "466"
   ],
-  "training_records": 1260,
+  "training_records": 1665,
   "training_exclusions": {
     "invalid_topology": 15
   },
@@ -21,7 +23,7 @@
     "R0-L0-p(R1,CPE1)-p(R3,CPE3)"
   ],
   "parameter_models": 21,
-  "validation_policy": "single physical sample; no independent validation",
+  "validation_policy": "leave-one-physical-sample-out provenance recorded; no separate unseen inference sample",
   "seed": 42,
   "artifact": "ml\\analysis\\number_aware_pipeline_flex_181\\pipeline.joblib"
 }
