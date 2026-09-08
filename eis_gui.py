@@ -7530,12 +7530,13 @@ class EISApplication:
             "frequency_limits": "Frequency limits",
             "outliers": "Deterministic outliers removal",
             "model": "ML EEC model selection",
+            "parameter_limits": "Parameters limits",
             "initial_parameters": "ML initial parameters",
             "fit": "Fit selected spectra",
             "refine": "Refine fit",
         }
         action_values = tuple(action_labels)
-        actions = ["frequency_limits", "outliers", "model", "initial_parameters", "fit", "refine"]
+        actions = ["frequency_limits", "outliers", "model", "parameter_limits", "initial_parameters", "fit", "refine"]
         action_var = tk.StringVar(value="frequency_limits")
         action_box = ttk.Combobox(frame, textvariable=action_var, values=action_values, state="readonly", width=22)
         action_box.grid(row=3, column=0, sticky="ew")
@@ -7625,7 +7626,7 @@ class EISApplication:
             messagebox.showerror("Invalid ML pipeline settings", str(error), parent=self.root)
             return
         selected_keys = {(dataset_id, int(spectrum.cycle)) for dataset_id, _loaded, spectrum in selected_rows}
-        needs_ml = bool(set(actions) & {"frequency_limits", "model", "initial_parameters"})
+        needs_ml = bool(set(actions) & {"frequency_limits", "model", "parameter_limits", "initial_parameters"})
         targets = []
         target_labels = []
         failures = []
@@ -7700,8 +7701,10 @@ class EISApplication:
             self._refresh_explorer_values(); self._refresh_plot(rescale=True)
         elif action == "model":
             self._run_ml_processing({"model"}, selected_rows)
+        elif action == "parameter_limits":
+            self._run_ml_processing({"parameter_limits"}, selected_rows)
         elif action == "initial_parameters":
-            self._apply_ml_initial_parameters_to_selected()
+            self._apply_ml_initial_parameters_to_selected(apply_limits=False)
         elif action == "fit":
             self._ml_pipeline_pending = (actions, index + 1, threshold, refine_z, refine_iterations, selected_rows)
             self.fit_selected()
@@ -7801,7 +7804,7 @@ class EISApplication:
         if self.busy or self.state is None:
             return
         selected_rows = selected_rows or self._selected_spectrum_rows()
-        if bool(operations & {"frequency", "active_points", "model", "initial_parameters"}) and any(
+        if bool(operations & {"frequency", "active_points", "model", "parameter_limits", "initial_parameters"}) and any(
             self._loaded_cycle_for_popup(loaded, spectrum.cycle).fit_parameters is not None
             for _dataset_id, loaded, spectrum in selected_rows
         ) and not messagebox.askyesno(
@@ -7840,7 +7843,7 @@ class EISApplication:
                     cycle.outliers = ~cycle.manually_included
                 cycle.invalidate_drt_cache()
                 cycle.clear_fit()
-            if "model" in operations or "initial_parameters" in operations:
+            if "model" in operations or "parameter_limits" in operations or "initial_parameters" in operations:
                 circuit = suggested_eec(result)
                 if not circuit:
                     missing.append(f"{label} (EEC model unavailable)")
@@ -7852,18 +7855,26 @@ class EISApplication:
                     continue
                 if "model" in operations:
                     self._configure_cycle_model(cycle, circuit, parameters, loaded.state.circuit)
-                if "initial_parameters" in operations:
+                if "parameter_limits" in operations or "initial_parameters" in operations:
                     by_name = {parameter.name: parameter for parameter in cycle.parameters}
                     current_model = cycle.model(loaded.state.circuit)
                     mapping = parameter_name_mapping(circuit, current_model) if circuits_equivalent(circuit, current_model) else {}
-                    for name, value in result.model_parameters.items():
+                    parameter_names = set(result.model_parameters)
+                    if "parameter_limits" in operations:
+                        parameter_names.update(result.parameter_limits)
+                    for name in parameter_names:
+                        value = result.model_parameters.get(name)
                         target_name = map_parameter_name(name, mapping) or name
                         parameter = by_name.get(target_name)
                         if parameter is not None:
-                            limits = result.parameter_limits.get(name)
+                            if "parameter_limits" in operations:
+                                limits = result.parameter_limits.get(name)
+                            else:
+                                limits = None
                             if limits is not None:
                                 parameter.lower, parameter.upper = limits
-                            parameter.initial = self._clamp_parameter_value(value, parameter.lower, parameter.upper)
+                            if "initial_parameters" in operations and name in result.model_parameters:
+                                parameter.initial = self._clamp_parameter_value(value, parameter.lower, parameter.upper)
                     cycle.clear_fit()
                 candidate_circuits[label] = list(dict.fromkeys(result.topology_candidates or [circuit]))
             assignments.append((dataset_id, loaded, spectrum, cycle))
@@ -8119,7 +8130,7 @@ class EISApplication:
         self._refresh_plot(rescale=True)
         self._update_status(f"original selection restored for {restored} spectra")
 
-    def _apply_ml_initial_parameters_to_selected(self) -> None:
+    def _apply_ml_initial_parameters_to_selected(self, *, apply_limits: bool = True) -> None:
         if self.busy or self.state is None:
             return
         selected_rows = self._selected_spectrum_rows()
@@ -8157,7 +8168,7 @@ class EISApplication:
                     target_name = map_parameter_name(name, mapping or {}) or name
                 parameter = by_name.get(target_name)
                 if parameter is not None:
-                    limits = result.parameter_limits.get(name)
+                    limits = result.parameter_limits.get(name) if apply_limits else None
                     if limits is not None:
                         parameter.lower, parameter.upper = limits
                     parameter.initial = self._clamp_parameter_value(
