@@ -90,6 +90,19 @@ class BatchStopTests(unittest.TestCase):
         self.assertEqual(["cycle 3"], report.skipped_labels)
         self.assertTrue(report.stopped)
 
+    @patch("eis_services.fit_cycle")
+    def test_fit_failure_retains_completed_results_and_stops_batch(self, fit):
+        fit.side_effect = [
+            fake_fit(self.loaded.state.cycles[1], "R0", self.parameters),
+            RuntimeError("synthetic fit failure"),
+        ]
+        report = batch_fit_spectra(self.targets, self.parameters)
+        self.assertEqual(1, len(report.fits))
+        self.assertEqual("cycle 2", report.failed_label)
+        self.assertIn("synthetic fit failure", report.error)
+        self.assertEqual(["cycle 3"], report.skipped_labels)
+        self.assertFalse(report.stopped)
+
     @patch("eis_services.fit_cycle", side_effect=fake_fit)
     def test_batch_accepts_equivalent_element_numbering(self, _fit):
         source_parameters = [

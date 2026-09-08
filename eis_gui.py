@@ -7674,6 +7674,8 @@ class EISApplication:
             self.ml_results_directory = None
         self._attach_ml_initial_results_to_projects()
         self._refresh_ml_visuals()
+        self._ml_pipeline_failures = []
+        self._ml_pipeline_successful_fit_count = None
         self._run_named_ml_pipeline_steps(actions, 0, threshold, refine_z, refine_iterations, selected_rows)
 
     def _show_ml_spectrum_failures(self, failures, processed: int, total: int) -> None:
@@ -7688,7 +7690,25 @@ class EISApplication:
 
     def _run_named_ml_pipeline_steps(self, actions: list[str], index: int, threshold: float, refine_z: float, refine_iterations: int, selected_rows) -> None:
         if index >= len(actions):
-            self._update_status("ML pipeline completed")
+            failures = list(getattr(self, "_ml_pipeline_failures", []))
+            successful = getattr(self, "_ml_pipeline_successful_fit_count", None)
+            if failures:
+                details = "\n".join(f"• {label}: {error}" for label, error in failures)
+                refined = int(successful if successful is not None else len(selected_rows))
+                messagebox.showwarning(
+                    "ML pipeline completed with skipped spectra",
+                    f"Successful fits retained and refined where possible: {refined}.\n\n"
+                    f"Failed or skipped spectra:\n{details}",
+                    parent=self.root,
+                )
+                self._update_status(
+                    f"ML pipeline completed: {refined} successful spectra refined; "
+                    f"{len(failures)} failed or skipped"
+                )
+            else:
+                self._update_status("ML pipeline completed")
+            self._ml_pipeline_failures = []
+            self._ml_pipeline_successful_fit_count = None
             return
         action = actions[index]
         if action == "frequency_limits":
@@ -7711,8 +7731,12 @@ class EISApplication:
             return
         elif action == "refine":
             self.refine_z_threshold_var.set(str(refine_z)); self.refine_max_iterations_var.set(str(refine_iterations))
+            if not selected_rows:
+                self._update_status("ML pipeline: no successful fits available for refinement")
+                self.root.after(0, lambda: self._run_named_ml_pipeline_steps(actions, index + 1, threshold, refine_z, refine_iterations, selected_rows))
+                return
             self._ml_pipeline_pending = (actions, index + 1, threshold, refine_z, refine_iterations, selected_rows)
-            self.refine_fit_selected()
+            self.refine_fit_selected(selected_rows)
             return
         self.root.after(0, lambda: self._run_named_ml_pipeline_steps(actions, index + 1, threshold, refine_z, refine_iterations, selected_rows))
 
@@ -11984,7 +12008,7 @@ class EISApplication:
             operation_name="Selected fit",
         )
 
-    def refine_fit_selected(self) -> None:
+    def refine_fit_selected(self, selected_rows=None) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
         if self.analysis_mode_var.get() != "EEC":
@@ -12000,7 +12024,7 @@ class EISApplication:
             messagebox.showerror("Invalid refinement settings", str(error), parent=self.root)
             return
 
-        selected_rows = self._selected_spectrum_rows()
+        selected_rows = self._selected_spectrum_rows() if selected_rows is None else selected_rows
         if not selected_rows:
             messagebox.showerror(
                 "No spectra selected",
@@ -12485,6 +12509,44 @@ class EISApplication:
         self._restore_controls()
         self._refresh_plot(rescale=True)
         self._refresh_open_parameter_explorers()
+        ml_pending = getattr(self, "_ml_pipeline_pending", None)
+        if ml_pending is not None:
+            if report.stopped or self._stop_event.is_set():
+                self._ml_pipeline_pending = None
+                self._update_status(
+                    f"ML pipeline fit stopped: processed {len(report.fits)}, "
+                    f"skipped {len(report.skipped_labels)} spectra"
+                )
+                return
+            if report.failed_label is not None:
+                actions, index, threshold, refine_z, refine_iterations, selected_rows = ml_pending
+                successful_keys = {
+                    (id(result.loaded), int(result.fit.cycle.cycle))
+                    for result in report.fits
+                }
+                selected_rows = [
+                    row for row in selected_rows
+                    if (id(row[1]), int(row[2].cycle)) in successful_keys
+                ]
+                self._ml_pipeline_successful_fit_count = len(selected_rows)
+                failures = [
+                    (report.failed_label, report.error or "fit failed"),
+                    *[
+                        (label, "skipped because a previous spectrum failed to fit")
+                        for label in report.skipped_labels
+                    ],
+                ]
+                self._ml_pipeline_failures.extend(failures)
+                self._ml_pipeline_pending = (
+                    actions,
+                    index,
+                    threshold,
+                    refine_z,
+                    refine_iterations,
+                    selected_rows,
+                )
+            if self._continue_named_ml_pipeline():
+                return
         if getattr(self, "_batch_fit_both_pending", False):
             if getattr(self, "_batch_fit_both_stage", "") == "up":
                 self._batch_fit_both_up_completed = len(report.fits)
