@@ -1,0 +1,27 @@
+{
+  "model_name": "Flex",
+  "training_projects": [
+    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\181.eisfit.json.gz"
+  ],
+  "training_samples": [
+    "181"
+  ],
+  "training_records": 1260,
+  "training_exclusions": {
+    "invalid_topology": 15
+  },
+  "circuit_classes": [
+    "R0-L0-p(R1,CPE1)",
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+    "R0-L0-p(R1,CPE1)-p(R3,CPE3)"
+  ],
+  "topology_classes": [
+    "R0-L0-p(R1,CPE1)",
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+    "R0-L0-p(R1,CPE1)-p(R3,CPE3)"
+  ],
+  "parameter_models": 21,
+  "validation_policy": "single physical sample; no independent validation",
+  "seed": 42,
+  "artifact": "ml\\analysis\\number_aware_pipeline_flex_181\\pipeline.joblib"
+}

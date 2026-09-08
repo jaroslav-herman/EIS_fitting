@@ -427,13 +427,19 @@ def _fit_parameters(records: list[SpectrumRecord], projects: list[Path], samples
     return preprocessor, models, stats, specs, limits
 
 
-def train_bundle(training_projects: list[Path], sample_ids: dict[str, str], seed: int = 42) -> tuple[PipelineBundle, object]:
+def train_bundle(
+    training_projects: list[Path],
+    sample_ids: dict[str, str],
+    seed: int = 42,
+    *,
+    allow_single_sample: bool = False,
+) -> tuple[PipelineBundle, object]:
     extraction = load_eisfit_projects(training_projects, sample_ids, require_fit=True, require_frequency_window=True)
     records = extraction.records
     if not records:
         raise ValueError("no labelled training spectra were extracted")
     samples = tuple(sorted({r.sample_id for r in records}))
-    if len(samples) < 2:
+    if len(samples) < 2 and not allow_single_sample:
         raise ValueError("at least two physical samples are required")
     circuit_classes = tuple(sorted({str(r.original_eec_topology) for r in records}))
     frequency_preprocessor, frequency_model = _fit_frequency(records, seed)

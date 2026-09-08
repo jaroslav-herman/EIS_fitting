@@ -201,6 +201,7 @@ MODEL_PRESETS = (
 
 ML_TRAINED_MODELS = {
     "Sputtered cathode": Path(__file__).resolve().parent / "ml" / "analysis" / "number_aware_pipeline_453_455_457_467_voltage" / "pipeline.joblib",
+    "Flex": Path(__file__).resolve().parent / "ml" / "analysis" / "number_aware_pipeline_flex_181" / "pipeline.joblib",
 }
 
 
