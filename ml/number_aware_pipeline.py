@@ -433,8 +433,15 @@ def train_bundle(
     seed: int = 42,
     *,
     allow_single_sample: bool = False,
+    allow_invalid_frequency_window: bool = False,
 ) -> tuple[PipelineBundle, object]:
-    extraction = load_eisfit_projects(training_projects, sample_ids, require_fit=True, require_frequency_window=True)
+    extraction = load_eisfit_projects(
+        training_projects,
+        sample_ids,
+        require_fit=True,
+        require_frequency_window=not allow_invalid_frequency_window,
+        allow_invalid_frequency_window=allow_invalid_frequency_window,
+    )
     records = extraction.records
     if not records:
         raise ValueError("no labelled training spectra were extracted")

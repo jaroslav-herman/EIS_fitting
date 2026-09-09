@@ -3,17 +3,20 @@
   "training_projects": [
     "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\181.eisfit.json.gz",
     "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\466.eisfit.json.gz",
-    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\465.eisfit.json.gz"
+    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\465.eisfit.json.gz",
+    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\462.eisfit.json.gz"
   ],
   "training_samples": [
     "181",
+    "462",
     "465",
     "466"
   ],
-  "training_records": 1935,
+  "training_records": 2340,
   "training_exclusions": {
     "invalid_topology": 15
   },
+  "invalid_frequency_window_policy": "used the last valid manually active point as the low-frequency cutoff and preserved a valid saved upper bound",
   "circuit_classes": [
     "R0-L0-p(R1,CPE1)",
     "R0-L0-p(R1,CPE1)-p(R2,CPE2)",

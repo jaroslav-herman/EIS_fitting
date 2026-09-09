@@ -16,7 +16,7 @@ from ml.number_aware_pipeline import _learned_residual_interval, deterministic_m
 from ml.preprocessing import SpectrumPreprocessor
 
 
-def _project(path: Path, circuit: str, *, with_window: bool = True) -> None:
+def _project(path: Path, circuit: str, *, with_window: bool = True, invalid_window: bool = False) -> None:
     frequency = np.logspace(4, 0, 12)
     frame = pd.DataFrame({
         "freq_hz": frequency,
@@ -32,7 +32,7 @@ def _project(path: Path, circuit: str, *, with_window: bool = True) -> None:
         "potential_v": 1.6,
         "current_ma": 4.0,
         "time_s": 1.0,
-        "frequency_window": [1.0, 10000.0] if with_window else None,
+        "frequency_window": [0.0, 10000.0] if invalid_window else ([1.0, 10000.0] if with_window else None),
         "manually_included": [True] * frequency.size,
         "outliers": [False] * frequency.size,
         "fit_parameters": [0.1, 1e-7, 1.0, 0.01, 0.9, 0.5, 0.02, 0.85],
@@ -59,6 +59,21 @@ class NumberAwarePipelineTests(unittest.TestCase):
             report = load_eisfit_projects([path], {str(path): "validation"}, require_fit=False, require_frequency_window=False)
         self.assertEqual(len(report.records), 1)
         self.assertIsNone(report.records[0].manual_f_min)
+
+    def test_invalid_frequency_window_uses_last_active_point_when_allowed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "invalid-window.eisfit.json"
+            _project(path, "R0-L0-p(R1,CPE1)", invalid_window=True)
+            report = load_eisfit_projects(
+                [path],
+                {str(path): "training"},
+                require_fit=True,
+                require_frequency_window=False,
+                allow_invalid_frequency_window=True,
+            )
+        self.assertEqual(len(report.records), 1)
+        self.assertEqual(report.records[0].manual_f_min, 1.0)
+        self.assertEqual(report.records[0].cleaned_frequency.min(), 1.0)
 
     def test_deterministic_mask_keeps_raw_length_and_rejects_outside_window(self):
         frequency = np.logspace(4, 0, 12)

@@ -21,6 +21,7 @@ DEFAULT_SOURCES = (
     DEFAULT_SOURCE,
     Path(r"C:\Users\Herman\OneDrive - Univerzita Karlova\Ti overlayer\466.eisfit.json.gz"),
     Path(r"C:\Users\Herman\OneDrive - Univerzita Karlova\Ti overlayer\465.eisfit.json.gz"),
+    Path(r"C:\Users\Herman\OneDrive - Univerzita Karlova\Ti overlayer\462.eisfit.json.gz"),
 )
 DEFAULT_OUTPUT = Path("ml/analysis/number_aware_pipeline_flex_181")
 
@@ -49,12 +50,22 @@ def train_flex(
         sample_ids[str(source)] = sample_id
         sample_ids[str(source.resolve())] = sample_id
     extraction = load_eisfit_projects(
-        list(sources), sample_ids, require_fit=True, require_frequency_window=True
+        list(sources),
+        sample_ids,
+        require_fit=True,
+        require_frequency_window=False,
+        allow_invalid_frequency_window=True,
     )
     if not extraction.records:
         raise ValueError(f"no labelled training spectra were extracted from {sources}")
 
-    bundle, _ = train_bundle(list(sources), sample_ids, seed, allow_single_sample=True)
+    bundle, _ = train_bundle(
+        list(sources),
+        sample_ids,
+        seed,
+        allow_single_sample=True,
+        allow_invalid_frequency_window=True,
+    )
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     temporary = output / "pipeline.joblib.tmp"
@@ -66,6 +77,7 @@ def train_flex(
         "training_samples": list(bundle.training_samples),
         "training_records": len(extraction.records),
         "training_exclusions": extraction.exclusion_counts,
+        "invalid_frequency_window_policy": "used the last valid manually active point as the low-frequency cutoff and preserved a valid saved upper bound",
         "circuit_classes": list(bundle.circuit_classes),
         "topology_classes": list(bundle.topology_classes),
         "parameter_models": len(bundle.parameter_models),

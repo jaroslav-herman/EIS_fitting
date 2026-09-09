@@ -144,6 +144,7 @@ def load_eisfit_projects(
     *,
     require_fit: bool = True,
     require_frequency_window: bool = True,
+    allow_invalid_frequency_window: bool = False,
 ) -> ExtractionReport:
     """Extract labelled spectra from saved projects.
 
@@ -192,6 +193,8 @@ def load_eisfit_projects(
                     report.exclusions.append({"spectrum_id": spectrum_id, "reason": "missing_fit"})
                     continue
                 window = saved.get("frequency_window")
+                invalid_window_fallback = False
+                fallback_maximum = None
                 if window is None and require_frequency_window:
                     report.exclusions.append({"spectrum_id": spectrum_id, "reason": "missing_frequency_window"})
                     continue
@@ -201,11 +204,25 @@ def load_eisfit_projects(
                     try:
                         manual_f_min, manual_f_max = sorted((float(window[0]), float(window[1])))
                     except (TypeError, ValueError, IndexError):
-                        report.exclusions.append({"spectrum_id": spectrum_id, "reason": "invalid_frequency_window"})
-                        continue
-                    if not np.isfinite(manual_f_min) or not np.isfinite(manual_f_max) or manual_f_min <= 0 or manual_f_max <= manual_f_min:
-                        report.exclusions.append({"spectrum_id": spectrum_id, "reason": "invalid_frequency_window"})
-                        continue
+                        if not allow_invalid_frequency_window:
+                            report.exclusions.append({"spectrum_id": spectrum_id, "reason": "invalid_frequency_window"})
+                            continue
+                        invalid_window_fallback = True
+                        window = None
+                        manual_f_min = manual_f_max = None
+                    if window is not None and (
+                        not np.isfinite(manual_f_min)
+                        or not np.isfinite(manual_f_max)
+                        or manual_f_min <= 0
+                        or manual_f_max <= manual_f_min
+                    ):
+                        if not allow_invalid_frequency_window:
+                            report.exclusions.append({"spectrum_id": spectrum_id, "reason": "invalid_frequency_window"})
+                            continue
+                        invalid_window_fallback = True
+                        fallback_maximum = manual_f_max if np.isfinite(manual_f_max) and manual_f_max > 0 else None
+                        window = None
+                        manual_f_min = manual_f_max = None
                 try:
                     cycle: CycleState = load_cycle(dataframe, cycle_number, control)
                     frequency = np.asarray(cycle.frequency_hz, dtype=float)
@@ -217,7 +234,23 @@ def load_eisfit_projects(
                     manual_mask = np.asarray(saved.get("manually_included", np.ones(frequency.size)), dtype=bool)
                     if manual_mask.size != frequency.size:
                         raise ValueError("manual_mask_length_mismatch")
-                    window = saved.get("frequency_window")
+                    if invalid_window_fallback:
+                        active_indices = np.flatnonzero(
+                            manual_mask
+                            & valid
+                            & np.isfinite(frequency)
+                            & (frequency > 0)
+                        )
+                        if active_indices.size == 0:
+                            raise ValueError("invalid_frequency_window_without_active_point")
+                        manual_f_min = float(frequency[active_indices[-1]])
+                        measured_maximum = float(np.max(frequency[valid]))
+                        manual_f_max = (
+                            float(fallback_maximum)
+                            if fallback_maximum is not None and fallback_maximum > manual_f_min
+                            else measured_maximum
+                        )
+                        window = (manual_f_min, manual_f_max)
                     if window is not None:
                         minimum, maximum = sorted((float(window[0]), float(window[1])))
                         manual_mask &= (frequency >= minimum) & (frequency <= maximum)
