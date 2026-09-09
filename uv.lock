@@ -129,7 +129,7 @@ wheels = [
 
 [[package]]
 name = "eisyfit"
-version = "0.1.4"
+version = "0.1.5"
 source = { editable = "." }
 dependencies = [
     { name = "eisyfit-bayes-drt2" },
@@ -183,14 +183,14 @@ wheels = [
 
 [[package]]
 name = "eisyfit-galvani"
-version = "0.5.0"
+version = "0.5.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ab/fa/2e53e755d1dd85c308ec66b56620fd6b6e3afcab3b03d379d4ecd67b2a43/eisyfit_galvani-0.5.0.tar.gz", hash = "sha256:f4a2a5c05fd9f328eb68cf707520133d412414955d93f3909f0c1fe380247723", size = 41360, upload-time = "2026-08-27T10:18:57.926Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/de/ab/b7debe11c10623248abc32fa98817f4612bc69b3197d321cbb5c1105c0af/eisyfit_galvani-0.5.1.tar.gz", hash = "sha256:f5ee585639bd12c310959517e8321d606ede930d602deb9242ff548467f3b084", size = 42071, upload-time = "2026-09-09T08:29:14.587Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f0/12/d7b9b2ca5a0b2fa3a6d8b4ad46d046d18310256a2ead24c7d2127157d150/eisyfit_galvani-0.5.0-py3-none-any.whl", hash = "sha256:519e539e440245d4df0a47347caf10a4e63ca31a883a8b045fd0534ad56c887e", size = 30520, upload-time = "2026-08-27T10:18:57.016Z" },
+    { url = "https://files.pythonhosted.org/packages/fe/71/847912995730678a5378b55fc1c4326b913ad976dace9a3e237fc05455de/eisyfit_galvani-0.5.1-py3-none-any.whl", hash = "sha256:93acaf3509fc1ed1e2d0834ec1f7e7f5db8e88469a8771f174360f86e4bf8acd", size = 30980, upload-time = "2026-09-09T08:29:13.545Z" },
 ]
 
 [[package]]
@@ -227,7 +227,7 @@ wheels = [
 
 [[package]]
 name = "eisyfit-wepy"
-version = "0.1.2"
+version = "0.1.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "eisyfit-bayes-drt2" },
@@ -239,9 +239,9 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/84/29/1b2794f36529e5b3e209109e22b814ba0c14f84fc078fe55430fb2c770b6/eisyfit_wepy-0.1.2.tar.gz", hash = "sha256:33a4ba65d7e858168a10ba06446bc327b71f2620350731210b8b18284d2ff245", size = 45790, upload-time = "2026-08-27T10:53:43.167Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c5/cb/2838cc72ffd5b311d9bee787cc239e99b631c897ca548f9617afa412d1d7/eisyfit_wepy-0.1.4.tar.gz", hash = "sha256:efe8eba60ef5b3f21c6dcb6f94261179de39dd1e084072fed830e083dadd82b8", size = 46931, upload-time = "2026-09-09T08:36:16.157Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6f/74/d47e58417414c193321ccb068c0351c3874d4e0bb15f52854d923f2a42b4/eisyfit_wepy-0.1.2-py3-none-any.whl", hash = "sha256:019dc7d51e9bf95b3eaa6f9d11fffd4d6c29082a22c1d1b3e5c9e1daa60859f1", size = 38845, upload-time = "2026-08-27T10:53:41.86Z" },
+    { url = "https://files.pythonhosted.org/packages/43/82/220be7eff95cf6e2ba79018d086542ecfd19f7c71c5416c0352fc7961928/eisyfit_wepy-0.1.4-py3-none-any.whl", hash = "sha256:2c3ddea5a6a18e6ee641a91d3ef27f4a322ac26d445951d76df3178722c5cadb", size = 38978, upload-time = "2026-09-09T08:36:15.202Z" },
 ]
 
 [[package]]
