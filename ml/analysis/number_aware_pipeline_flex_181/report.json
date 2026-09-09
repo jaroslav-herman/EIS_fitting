@@ -2,13 +2,15 @@
   "model_name": "Flex",
   "training_projects": [
     "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\181.eisfit.json.gz",
-    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\466.eisfit.json.gz"
+    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\466.eisfit.json.gz",
+    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\Ti overlayer\\465.eisfit.json.gz"
   ],
   "training_samples": [
     "181",
+    "465",
     "466"
   ],
-  "training_records": 1665,
+  "training_records": 1935,
   "training_exclusions": {
     "invalid_topology": 15
   },
