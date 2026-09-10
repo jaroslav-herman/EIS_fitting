@@ -13624,7 +13624,10 @@ class EISApplication:
             if field not in {"source_file", "circuit"}
             and field not in parameter_fields
         ]
-        split_fields = ["None", *dict.fromkeys(["Spectrum", *split_candidates])]
+        split_fields = [
+            "None",
+            *dict.fromkeys(["Spectrum", "Source file", *split_candidates]),
+        ]
         x_default = (
             self._fit_explorer_x_preference
             if self._fit_explorer_x_preference in numeric_fields
@@ -13884,6 +13887,9 @@ class EISApplication:
                 groups: dict[object, list[tuple[float, float, dict[str, object]]]] = {}
                 y_field = y_var.get()
                 split_field = split_var.get()
+                split_record_field = (
+                    "source_file" if split_field == "Source file" else split_field
+                )
                 selected_fields = [x_field, y_field]
                 if split_field not in {"None", "Spectrum"} and split_field in numeric_fields:
                     selected_fields.append(split_field)
@@ -13906,7 +13912,11 @@ class EISApplication:
                             continue
                         if x_log.get() and x_value <= 0 or y_log.get() and y_value <= 0:
                             continue
-                        group = "All spectra" if split_field == "None" else record.get(split_field)
+                        group = (
+                            "All spectra"
+                            if split_field == "None"
+                            else record.get(split_record_field)
+                        )
                         groups.setdefault(group, []).append((x_value, y_value, record))
                     except Exception:
                         continue
