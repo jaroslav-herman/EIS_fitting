@@ -14083,7 +14083,10 @@ class EISApplication:
     def _existing_time_label_max(self) -> int:
         values: list[float] = []
         for loaded in self.loaded_projects.values():
-            if "Time" in loaded.dataframe.columns:
+            # Raw BioLogic data may contain a measurement-time column named
+            # ``Time``.  It is not a loop label unless the paired Cycle mod
+            # column is present as well.
+            if "Time" in loaded.dataframe.columns and "Cycle mod" in loaded.dataframe.columns:
                 values.extend(
                     float(value)
                     for value in loaded.dataframe["Time"].dropna().to_numpy()
@@ -14110,7 +14113,11 @@ class EISApplication:
             if all(item.cycle != spectrum.cycle for item in entry[1]):
                 entry[1].append(spectrum)
 
-        time_offset = self._existing_time_label_max()
+        selected_has_existing_labels = any(
+            spectrum.custom_metadata.get("Time") is not None
+            for _dataset_id, _loaded, spectrum in selected_rows
+        )
+        time_offset = 0 if selected_has_existing_labels else self._existing_time_label_max()
         labeled = 0
         for loaded, spectra in grouped.values():
             voltages = np.asarray([spectrum.potential_v for spectrum in spectra], dtype=float)
@@ -15301,10 +15308,12 @@ class EISApplication:
         return selected_kinds
 
     def _finish_imports(self, report: ProjectImportReport) -> None:
+        # Compute the continuation point before registering raw imported
+        # dataframes; their ``Time`` column can be measurement timestamps.
+        time_offset = self._existing_time_label_max()
         for dataset_id, loaded in report.loaded:
             self._register_dataset(dataset_id, loaded)
         labeling_messages: list[str] = []
-        time_offset = self._existing_time_label_max()
         for _dataset_id, loaded in report.loaded:
             try:
                 loop_count, pattern_length = label_project_catalog(

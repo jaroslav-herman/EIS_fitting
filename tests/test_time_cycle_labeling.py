@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 
 import pandas as pd
 
 from eis_services import load_project_from_dataframe
+from eis_gui import EISApplication
 from load_and_label_eis import label_project_catalog
 
 
@@ -53,6 +55,17 @@ class TimeCycleLabelingTests(unittest.TestCase):
         self.assertEqual(loops, 2)
         self.assertEqual(project.state.cycles[1].custom_metadata["Time"], 8)
         self.assertEqual(project.state.cycles[4].custom_metadata["Time"], 9)
+
+    def test_raw_measurement_time_is_not_used_as_label_offset(self):
+        application = object.__new__(EISApplication)
+        application.loaded_projects = {
+            "raw": SimpleNamespace(
+                dataframe=pd.DataFrame({"Time": [21.0, 22.0]}),
+                state=SimpleNamespace(cycles={}),
+            )
+        }
+
+        self.assertEqual(application._existing_time_label_max(), 0)
 
 
 if __name__ == "__main__":
