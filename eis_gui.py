@@ -1117,6 +1117,7 @@ class EISApplication:
         self._explorer_current_column_order: list[str] | None = None
         self._fit_explorer_filter = FilterDefinition()
         self._drt_explorer_filter = FilterDefinition()
+        self._fit_parameter_explorers: list[tuple[tk.Toplevel, Callable[[], None]]] = []
         self._explorer_lookup: dict[tuple[str, int], str] = {}
         self._explorer_anchor_item: str | None = None
         self._explorer_primary_item: str | None = None
@@ -13538,11 +13539,6 @@ class EISApplication:
         if self.busy or self.state is None:
             return
         self._sync_custom_metadata_columns()
-        existing_popup = getattr(self, "fit_parameters_popup", None)
-        if existing_popup is not None and existing_popup.winfo_exists():
-            existing_popup.lift()
-            existing_popup.focus_force()
-            return
         records: list[dict[str, object]] = []
         for dataset_id in self._dataset_order:
             loaded = self.loaded_projects[dataset_id]
@@ -13641,7 +13637,6 @@ class EISApplication:
         )
 
         popup = tk.Toplevel(self.root)
-        self.fit_parameters_popup = popup
         popup.title("Fit Parameters Explorer")
         popup.geometry("1180x760")
         popup.minsize(900, 600)
@@ -13649,8 +13644,11 @@ class EISApplication:
         popup.rowconfigure(1, weight=1)
 
         def close_popup() -> None:
-            self.fit_parameters_popup = None
-            self._fit_parameters_refresh_callback = None
+            self._fit_parameter_explorers[:] = [
+                (window, callback)
+                for window, callback in self._fit_parameter_explorers
+                if window is not popup and window.winfo_exists()
+            ]
             popup.destroy()
 
         popup.protocol("WM_DELETE_WINDOW", close_popup)
@@ -14022,7 +14020,7 @@ class EISApplication:
 
         x_box.bind("<<ComboboxSelected>>", lambda _event: refresh_ranges())
         add_y_row()
-        self._fit_parameters_refresh_callback = refresh_data
+        self._fit_parameter_explorers.append((popup, refresh_data))
         ttk.Button(controls, text="Active view", command=active_view).grid(row=4, column=1, pady=(6, 0), sticky="w")
         ttk.Button(
             controls,
@@ -14042,14 +14040,16 @@ class EISApplication:
         self.open_fit_parameters_explorer()
 
     def _refresh_open_parameter_explorers(self) -> None:
-        for attribute, callback_attribute in (
-            ("fit_parameters_popup", "_fit_parameters_refresh_callback"),
-            ("drt_parameters_popup", "_drt_parameters_refresh_callback"),
-        ):
-            popup = getattr(self, attribute, None)
-            callback = getattr(self, callback_attribute, None)
-            if popup is None or not popup.winfo_exists() or callback is None:
-                continue
+        open_fit_explorers: list[tuple[tk.Toplevel, Callable[[], None]]] = []
+        for popup, callback in self._fit_parameter_explorers:
+            if popup.winfo_exists():
+                open_fit_explorers.append((popup, callback))
+                callback()
+        self._fit_parameter_explorers = open_fit_explorers
+
+        popup = getattr(self, "drt_parameters_popup", None)
+        callback = getattr(self, "_drt_parameters_refresh_callback", None)
+        if popup is not None and popup.winfo_exists() and callback is not None:
             callback()
 
     def _metadata_edit_project_key(self) -> str:
