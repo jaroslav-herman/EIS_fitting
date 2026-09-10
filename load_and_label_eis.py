@@ -16,7 +16,7 @@ import numpy as np
 import wepy.basics as we
 
 from eis_project import save_project_file
-from eis_services import load_cycle, load_projects
+from eis_services import catalog_spectra, load_cycle, load_projects
 
 DEFAULT_CIRCUIT = "R0-L0-p(R1,CPE1)"
 DEFAULT_FILE_CONTAINS = ("ay", "rocedure", "PEIS")
@@ -161,9 +161,50 @@ def _label_project(project, time_offset: int, tolerance: float):
             {"Time": cycle_to_time[cycle_number], "Cycle mod": cycle_to_mod[cycle_number]}
         )
         project.state.cycles[cycle_number] = cycle
+    # The explorer uses the catalog, not only the dataframe/state payload.
+    # Keep the in-memory metadata synchronized before the project is displayed.
+    for spectrum in project.spectra:
+        cycle = project.state.cycles.get(spectrum.cycle)
+        if cycle is not None:
+            spectrum.custom_metadata.update(cycle.custom_metadata)
     project.state.available_cycles = cycles
     project.state.active_cycle = cycles[0]
     return len(cycles) // pattern_length, pattern_length
+
+
+def label_loaded_project(
+    project,
+    time_offset: int = 0,
+    tolerance: float = 0.01,
+) -> tuple[int, int]:
+    """Label one already-loaded project and return ``(loops, cycle_mod_length)``.
+
+    This is shared by the command-line importer and the GUI import/metadata
+    workflows so both paths write identical dataframe and cycle metadata.
+    """
+    return _label_project(project, int(time_offset), float(tolerance))
+
+
+def label_project_catalog(
+    project,
+    time_offset: int = 0,
+    tolerance: float = 0.01,
+) -> tuple[int, int]:
+    """Label a project and rebuild its explorer catalog when needed."""
+    result = label_loaded_project(project, time_offset, tolerance)
+    project.spectra = catalog_spectra(
+        project.dataframe,
+        project.state.available_cycles,
+        project.state.control,
+        {
+            cycle_number: {
+                **cycle.custom_metadata,
+                "time_s": cycle.time_s,
+            }
+            for cycle_number, cycle in project.state.cycles.items()
+        },
+    )
+    return result
 
 
 def import_and_label(

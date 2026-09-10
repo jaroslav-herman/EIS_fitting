@@ -78,6 +78,7 @@ from eis_services import (
     load_projects,
     select_eec_model_from_hybrid_drt,
 )
+from load_and_label_eis import find_pattern_length, label_project_catalog
 from ml.gui_results import MLResult, load_ml_results, load_ml_results_payload, suggested_eec
 from ml.results_schema import spectrum_identifier, write_ml_results
 from ml.point_validity import detect_outliers_in_active_points
@@ -842,8 +843,18 @@ class MetadataEditDialog(tk.Toplevel):
             text="Repeat pattern",
             command=lambda: self._accept(repeat_pattern=True),
         ).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(
+            buttons,
+            text="Auto-label Time / Cycle mod",
+            command=self._accept_time_cycle_labels,
+        ).pack(side=tk.LEFT)
         self.bind("<Control-Return>", lambda _event: self._accept())
         self.grab_set()
+
+    def _accept_time_cycle_labels(self) -> None:
+        """Request the shared voltage-loop labeling operation."""
+        self.result = ("__auto_label_time_cycle__", [], False)
+        self.destroy()
 
     def _toggle_new_column(self) -> None:
         enabled = self.new_column_var.get()
@@ -14069,6 +14080,72 @@ class EISApplication:
             return f"source::{self.loaded.state.source_path.resolve()}"
         return "session"
 
+    def _existing_time_label_max(self) -> int:
+        values: list[float] = []
+        for loaded in self.loaded_projects.values():
+            if "Time" in loaded.dataframe.columns:
+                values.extend(
+                    float(value)
+                    for value in loaded.dataframe["Time"].dropna().to_numpy()
+                    if np.isfinite(float(value))
+                )
+            for cycle in loaded.state.cycles.values():
+                value = cycle.custom_metadata.get("Time")
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(numeric):
+                    values.append(numeric)
+        return int(max(values, default=0))
+
+    def _auto_label_selected_time_cycle(
+        self,
+        selected_rows: list[tuple[str, LoadedProject, SpectrumMetadata]],
+    ) -> None:
+        """Apply voltage-loop labels to selected spectra in explorer order."""
+        grouped: dict[str, tuple[LoadedProject, list[SpectrumMetadata]]] = {}
+        for dataset_id, loaded, spectrum in selected_rows:
+            entry = grouped.setdefault(dataset_id, (loaded, []))
+            if all(item.cycle != spectrum.cycle for item in entry[1]):
+                entry[1].append(spectrum)
+
+        time_offset = self._existing_time_label_max()
+        labeled = 0
+        for loaded, spectra in grouped.values():
+            voltages = np.asarray([spectrum.potential_v for spectrum in spectra], dtype=float)
+            if not np.isfinite(voltages).all():
+                raise ValueError(
+                    f"{loaded.state.source_path.name}: selected spectra have no finite voltages"
+                )
+            pattern_length = find_pattern_length(voltages)
+            if pattern_length < 1:
+                continue
+            frame = loaded.dataframe
+            for index, spectrum in enumerate(spectra):
+                time_value = time_offset + index // pattern_length + 1
+                mod_value = index % pattern_length + 1
+                cycle = loaded.state.cycles.get(spectrum.cycle)
+                if cycle is None:
+                    cycle = load_cycle(frame, spectrum.cycle, loaded.state.control)
+                    cycle.circuit = loaded.state.circuit
+                    loaded.state.cycles[spectrum.cycle] = cycle
+                cycle.custom_metadata.update({"Time": time_value, "Cycle mod": mod_value})
+                spectrum.custom_metadata.update(cycle.custom_metadata)
+                if "cycle_number" in frame.columns:
+                    rows = frame["cycle_number"] == spectrum.cycle
+                else:
+                    rows = np.ones(len(frame), dtype=bool)
+                for column, value in (("Time", time_value), ("Cycle mod", mod_value)):
+                    if column not in frame.columns:
+                        frame[column] = np.full(len(frame), None, dtype=object)
+                    frame[column] = frame[column].astype(object)
+                    frame.loc[rows, column] = value
+                labeled += 1
+            time_offset += (len(spectra) + pattern_length - 1) // pattern_length
+        self._populate_explorer()
+        self._update_status(f"labeled {labeled} spectra with Time and Cycle mod")
+
     def edit_metadata_column_from_clipboard(self) -> None:
         if self.busy or self.state is None:
             return
@@ -14096,6 +14173,12 @@ class EISApplication:
         if dialog.result is None:
             return
         column_name, values, create_new = dialog.result
+        if column_name == "__auto_label_time_cycle__":
+            try:
+                self._auto_label_selected_time_cycle(selected_rows)
+            except (TypeError, ValueError) as error:
+                messagebox.showerror("Could not label spectra", str(error), parent=self.root)
+            return
         if len(values) != len(selected_rows):
             messagebox.showerror(
                 "Wrong number of values",
@@ -15220,6 +15303,23 @@ class EISApplication:
     def _finish_imports(self, report: ProjectImportReport) -> None:
         for dataset_id, loaded in report.loaded:
             self._register_dataset(dataset_id, loaded)
+        labeling_messages: list[str] = []
+        time_offset = self._existing_time_label_max()
+        for _dataset_id, loaded in report.loaded:
+            try:
+                loop_count, pattern_length = label_project_catalog(
+                    loaded,
+                    time_offset=time_offset,
+                )
+                time_offset += loop_count
+                labeling_messages.append(
+                    f"{loaded.dataset_label}: labeled {loop_count} loop(s) "
+                    f"with Cycle mod {pattern_length}"
+                )
+            except (TypeError, ValueError) as error:
+                labeling_messages.append(
+                    f"{loaded.dataset_label}: Time/Cycle mod labeling skipped ({error})"
+                )
         skipped_messages = [
             f"{loaded.dataset_label}: skipped cycles without impedance data: "
             f"{', '.join(str(cycle) for cycle in loaded.skipped_cycles)}"
@@ -15239,6 +15339,9 @@ class EISApplication:
             f"{path.name}: {error}" for path, error in report.errors
         ]
         warning_details.extend(skipped_messages)
+        warning_details.extend(
+            message for message in labeling_messages if "skipped" in message
+        )
         if warning_details:
             details = "\n".join(warning_details)
             messagebox.showwarning(
