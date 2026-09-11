@@ -38,7 +38,13 @@ class PlotNavigationTests(unittest.TestCase):
         self.assertGreater(self.axes.get_ylim()[0], 0.0)
 
     def test_middle_drag_pan_preserves_view_span(self):
-        state = {"axes": self.axes, "x": 100.0, "y": 100.0}
+        state = {
+            "axes": self.axes,
+            "x": 100.0,
+            "y": 100.0,
+            "xlim": self.axes.get_xlim(),
+            "ylim": self.axes.get_ylim(),
+        }
         before_x = self.axes.get_xlim()
         before_y = self.axes.get_ylim()
         EISApplication._pan_axes_from_state(
@@ -51,6 +57,26 @@ class PlotNavigationTests(unittest.TestCase):
         self.assertAlmostEqual(after_y[1] - after_y[0], before_y[1] - before_y[0])
         self.assertNotEqual(after_x, before_x)
         self.assertNotEqual(after_y, before_y)
+        EISApplication._pan_axes_from_state(
+            state,
+            SimpleNamespace(inaxes=self.axes, x=120.0, y=80.0),
+        )
+        self.assertEqual(self.axes.get_xlim(), after_x)
+        self.assertEqual(self.axes.get_ylim(), after_y)
+
+    def test_zoom_rectangle_tracks_dragged_area(self):
+        rectangle = EISApplication._create_zoom_rectangle(self.axes, 2.0, 3.0)
+        try:
+            EISApplication._update_zoom_rectangle(rectangle, 7.0, 8.0)
+            self.assertEqual(rectangle.get_xy(), (2.0, 3.0))
+            self.assertEqual(rectangle.get_width(), 5.0)
+            self.assertEqual(rectangle.get_height(), 5.0)
+            EISApplication._update_zoom_rectangle(rectangle, 1.0, 1.0)
+            self.assertEqual(rectangle.get_xy(), (1.0, 1.0))
+            self.assertEqual(rectangle.get_width(), 1.0)
+            self.assertEqual(rectangle.get_height(), 2.0)
+        finally:
+            EISApplication._remove_zoom_rectangle(rectangle)
 
 
 if __name__ == "__main__":

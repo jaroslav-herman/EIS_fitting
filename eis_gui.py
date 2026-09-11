@@ -18,6 +18,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable
 
 import matplotlib
+from matplotlib.patches import Rectangle
 import numpy as np
 from natsort import natsort_keygen, ns
 from scipy.optimize import curve_fit
@@ -2646,8 +2647,18 @@ class EISApplication:
             return
         dx = event.x - state["x"]
         dy = event.y - state["y"]
-        x0, x1 = axes.get_xlim()
-        y0, y1 = axes.get_ylim()
+        if max(abs(dx), abs(dy)) < state.get("threshold", 5.0):
+            if "xlim" in state and "ylim" in state:
+                axes.set_xlim(*state["xlim"])
+                axes.set_ylim(*state["ylim"])
+            return
+        sensitivity = state.get("sensitivity", 0.65)
+        dx *= sensitivity
+        dy *= sensitivity
+        x0, x1 = state.get("xlim", axes.get_xlim())
+        y0, y1 = state.get("ylim", axes.get_ylim())
+        axes.set_xlim(x0, x1)
+        axes.set_ylim(y0, y1)
         display_corners = axes.transData.transform(((x0, y0), (x1, y1)))
         shifted = display_corners - np.asarray((dx, dy), dtype=float)
         data_corners = axes.transData.inverted().transform(shifted)
@@ -2659,6 +2670,36 @@ class EISApplication:
             return
         axes.set_xlim(*new_x)
         axes.set_ylim(*new_y)
+
+    @staticmethod
+    def _create_zoom_rectangle(axes, xdata: float, ydata: float):
+        rectangle = Rectangle(
+            (xdata, ydata),
+            0.0,
+            0.0,
+            fill=False,
+            edgecolor="#1565c0",
+            linestyle="--",
+            linewidth=1.2,
+            alpha=0.9,
+            zorder=1000,
+        )
+        rectangle._eis_start = (xdata, ydata)
+        axes.add_patch(rectangle)
+        return rectangle
+
+    @staticmethod
+    def _update_zoom_rectangle(rectangle, xdata: float, ydata: float) -> None:
+        x0, y0 = rectangle._eis_start
+        rectangle.set_x(min(x0, xdata))
+        rectangle.set_y(min(y0, ydata))
+        rectangle.set_width(abs(xdata - x0))
+        rectangle.set_height(abs(ydata - y0))
+
+    @staticmethod
+    def _remove_zoom_rectangle(rectangle) -> None:
+        if rectangle is not None:
+            rectangle.remove()
 
     def _canvas_axes(self, canvas):
         return tuple(axis for axis in canvas.figure.axes if axis.get_visible())
@@ -2711,8 +2752,15 @@ class EISApplication:
                     "axes": event.inaxes,
                     "x": event.x,
                     "y": event.y,
+                    "xlim": event.inaxes.get_xlim(),
+                    "ylim": event.inaxes.get_ylim(),
                 }
-            elif event.button == 1 and not self._event_has_control(event):
+            elif (
+                event.button == 1
+                and not self._event_has_control(event)
+                and event.xdata is not None
+                and event.ydata is not None
+            ):
                 canvas._eis_plot_navigation_state = {
                     "kind": "zoom",
                     "axes": event.inaxes,
@@ -2720,20 +2768,34 @@ class EISApplication:
                     "y": event.y,
                     "xdata": event.xdata,
                     "ydata": event.ydata,
+                    "rectangle": self._create_zoom_rectangle(
+                        event.inaxes, event.xdata, event.ydata
+                    ),
                 }
 
         def on_motion(event) -> None:
             state = canvas._eis_plot_navigation_state
-            if state is None or state["kind"] != "pan":
+            if state is None:
                 return
-            self._pan_axes_from_state(state, event)
+            if state["kind"] == "pan":
+                self._pan_axes_from_state(state, event)
+            elif (
+                state["kind"] == "zoom"
+                and event.inaxes is state["axes"]
+                and event.xdata is not None
+                and event.ydata is not None
+            ):
+                self._update_zoom_rectangle(state["rectangle"], event.xdata, event.ydata)
             canvas.draw_idle()
 
         def on_release(event) -> None:
             state = canvas._eis_plot_navigation_state
             canvas._eis_plot_navigation_state = None
-            if state is None or state["kind"] != "zoom":
+            if state is None:
                 return
+            if state["kind"] == "pan":
+                return
+            self._remove_zoom_rectangle(state.get("rectangle"))
             axes = state["axes"]
             if event.inaxes is not axes or state["xdata"] is None or state["ydata"] is None:
                 return
@@ -10475,8 +10537,18 @@ class EISApplication:
         if axes not in self._active_plot_axes():
             return
         if event.button == 2 and event.x is not None and event.y is not None:
-            self._pan_state = {"axes": axes, "x": event.x, "y": event.y}
-        elif event.button == 1 and event.xdata is not None and event.ydata is not None:
+            self._pan_state = {
+                "axes": axes,
+                "x": event.x,
+                "y": event.y,
+                "xlim": axes.get_xlim(),
+                "ylim": axes.get_ylim(),
+            }
+        elif (
+            event.button == 1
+            and event.xdata is not None
+            and event.ydata is not None
+        ):
             state = {
                 "axes": axes,
                 "inaxes": axes,
@@ -10490,6 +10562,9 @@ class EISApplication:
             if self._event_has_control(event):
                 self._edit_state = state
             else:
+                state["rectangle"] = self._create_zoom_rectangle(
+                    axes, event.xdata, event.ydata
+                )
                 self._zoom_state = state
 
     def _on_plot_button_release(self, event) -> None:
@@ -10512,6 +10587,7 @@ class EISApplication:
         state = self._zoom_state
         self._zoom_state = None
         if state is not None:
+            self._remove_zoom_rectangle(state.get("rectangle"))
             if (
                 event.inaxes is state["axes"]
                 and event.xdata is not None
@@ -10569,6 +10645,16 @@ class EISApplication:
             self.canvas.draw_idle()
             return
         if self._pan_state is None:
+            if self._zoom_state is not None:
+                if (
+                    event.inaxes is self._zoom_state["axes"]
+                    and event.xdata is not None
+                    and event.ydata is not None
+                ):
+                    self._update_zoom_rectangle(
+                        self._zoom_state["rectangle"], event.xdata, event.ydata
+                    )
+                    self.canvas.draw_idle()
             self._update_point_hover(event)
             return
         self._hide_point_hover()
