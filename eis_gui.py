@@ -353,7 +353,14 @@ class _ExplorerLineTool:
         return nearest if distances[nearest] <= 12.0 else None
 
     def _on_press(self, event) -> None:
-        if event.inaxes is self.axes and event.button == 1:
+        if (
+            event.inaxes is self.axes
+            and event.button == 1
+            and (
+                getattr(event, "key", None) in {"control", "ctrl"}
+                or bool(getattr(getattr(event, "guiEvent", None), "state", 0) & 0x0004)
+            )
+        ):
             self._active_point = self._nearest_point(event)
 
     def _on_motion(self, event) -> None:
@@ -2471,13 +2478,12 @@ class EISApplication:
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         from matplotlib.collections import LineCollection
         from matplotlib.figure import Figure
-        from matplotlib.widgets import RectangleSelector
-
         self._line_collection_class = LineCollection
-        self._rectangle_selector_class = RectangleSelector
         self.point_toggle_mode = False
         self.point_auto_fit = False
         self._pan_state = None
+        self._zoom_state = None
+        self._edit_state = None
         self.plot_controls = ttk.Frame(self.plot_frame)
         self.plot_controls.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
         self.toggle_points_button = ttk.Button(
@@ -2593,62 +2599,187 @@ class EISApplication:
         self.figure = Figure(figsize=(7.5, 6.5), dpi=100, constrained_layout=True)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
         self.canvas.draw()
-        self.toolbar = self._create_toolbar(
-            self.canvas,
-            self.plot_frame,
-            self.reset_plot_view,
-        )
-        self.toolbar.update()
-        self.toolbar.pack(side=tk.BOTTOM, fill=tk.X)
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.canvas.mpl_connect("button_press_event", self._on_plot_button_press)
-        self.canvas.mpl_connect("button_press_event", self._on_plot_click)
         self.canvas.mpl_connect("button_release_event", self._on_plot_button_release)
         self.canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
         self.canvas.mpl_connect("scroll_event", self._on_plot_scroll)
-        self._attach_plot_export_menu(self.canvas, self.plot_frame)
+        self._attach_plot_export_menu(
+            self.canvas, self.plot_frame, reset_callback=self.reset_plot_view
+        )
         self._configure_plot_layout()
 
-    def _create_toolbar(
-        self,
-        canvas,
-        master: tk.Misc,
-        home_callback: Callable[[], None] | None = None,
-    ):
-        from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+    @staticmethod
+    def _event_has_control(event) -> bool:
+        key = getattr(event, "key", None)
+        if isinstance(key, str) and key.lower() in {"control", "ctrl"}:
+            return True
+        gui_event = getattr(event, "guiEvent", None)
+        state = getattr(gui_event, "state", 0)
+        return bool(state & 0x0004)
 
-        class _ActiveZoomToolbar(NavigationToolbar2Tk):
-            def __init__(self, *args, home_callback=None, **kwargs):
-                self._home_callback = home_callback
-                super().__init__(*args, **kwargs)
+    @staticmethod
+    def _zoom_axes_at_event(axes, event, scale: float) -> None:
+        if event.xdata is None or event.ydata is None:
+            return
+        x_min, x_max = axes.get_xlim()
+        y_min, y_max = axes.get_ylim()
+        if axes.get_xscale() == "log" and event.xdata <= 0:
+            return
+        if axes.get_yscale() == "log" and event.ydata <= 0:
+            return
+        new_x_min = event.xdata - (event.xdata - x_min) * scale
+        new_x_max = event.xdata + (x_max - event.xdata) * scale
+        new_y_min = event.ydata - (event.ydata - y_min) * scale
+        new_y_max = event.ydata + (y_max - event.ydata) * scale
+        if axes.get_xscale() == "log" and min(new_x_min, new_x_max) <= 0:
+            return
+        if axes.get_yscale() == "log" and min(new_y_min, new_y_max) <= 0:
+            return
+        axes.set_xlim(new_x_min, new_x_max)
+        axes.set_ylim(new_y_min, new_y_max)
 
-            def home(self, *args):
-                if self._home_callback is not None:
-                    self._home_callback()
-                    return
-                super().home(*args)
+    @staticmethod
+    def _pan_axes_from_state(state, event) -> None:
+        axes = state["axes"]
+        if event.inaxes is not axes or event.x is None or event.y is None:
+            return
+        dx = event.x - state["x"]
+        dy = event.y - state["y"]
+        x0, x1 = axes.get_xlim()
+        y0, y1 = axes.get_ylim()
+        display_corners = axes.transData.transform(((x0, y0), (x1, y1)))
+        shifted = display_corners - np.asarray((dx, dy), dtype=float)
+        data_corners = axes.transData.inverted().transform(shifted)
+        new_x = sorted((float(data_corners[0, 0]), float(data_corners[1, 0])))
+        new_y = sorted((float(data_corners[0, 1]), float(data_corners[1, 1])))
+        if axes.get_xscale() == "log" and new_x[0] <= 0:
+            return
+        if axes.get_yscale() == "log" and new_y[0] <= 0:
+            return
+        axes.set_xlim(*new_x)
+        axes.set_ylim(*new_y)
 
-        return _ActiveZoomToolbar(
-            canvas,
-            master,
-            pack_toolbar=False,
-            home_callback=home_callback,
+    def _canvas_axes(self, canvas):
+        return tuple(axis for axis in canvas.figure.axes if axis.get_visible())
+
+    def _canvas_grid_state(self, canvas) -> bool:
+        return any(
+            any(line.get_visible() for line in axis.get_xgridlines() + axis.get_ygridlines())
+            for axis in self._canvas_axes(canvas)
         )
 
-    def _attach_plot_export_menu(self, canvas, owner: tk.Misc | None = None) -> None:
+    def _canvas_legend_state(self, canvas) -> bool:
+        return any(
+            axis.get_legend() is not None and axis.get_legend().get_visible()
+            for axis in self._canvas_axes(canvas)
+        )
+
+    def _toggle_canvas_grid(self, canvas) -> None:
+        visible = not self._canvas_grid_state(canvas)
+        for axis in self._canvas_axes(canvas):
+            axis.grid(visible)
+        canvas.draw_idle()
+
+    def _toggle_canvas_legends(self, canvas) -> None:
+        visible = not self._canvas_legend_state(canvas)
+        for axis in self._canvas_axes(canvas):
+            legend = axis.get_legend()
+            if legend is not None:
+                legend.set_visible(visible)
+        canvas.draw_idle()
+
+    def _attach_plot_navigation(self, canvas, reset_callback=None) -> None:
+        if getattr(canvas, "_eis_plot_navigation_bound", False):
+            return
+        canvas._eis_plot_navigation_bound = True
+        canvas._eis_plot_navigation_state = None
+
+        def on_scroll(event) -> None:
+            if event.inaxes not in self._canvas_axes(canvas):
+                return
+            scale = 1 / 1.2 if event.button == "up" else 1.2
+            self._zoom_axes_at_event(event.inaxes, event, scale)
+            canvas.draw_idle()
+
+        def on_press(event) -> None:
+            if event.inaxes not in self._canvas_axes(canvas):
+                return
+            if event.button == 2 and event.x is not None and event.y is not None:
+                canvas._eis_plot_navigation_state = {
+                    "kind": "pan",
+                    "axes": event.inaxes,
+                    "x": event.x,
+                    "y": event.y,
+                }
+            elif event.button == 1 and not self._event_has_control(event):
+                canvas._eis_plot_navigation_state = {
+                    "kind": "zoom",
+                    "axes": event.inaxes,
+                    "x": event.x,
+                    "y": event.y,
+                    "xdata": event.xdata,
+                    "ydata": event.ydata,
+                }
+
+        def on_motion(event) -> None:
+            state = canvas._eis_plot_navigation_state
+            if state is None or state["kind"] != "pan":
+                return
+            self._pan_axes_from_state(state, event)
+            canvas.draw_idle()
+
+        def on_release(event) -> None:
+            state = canvas._eis_plot_navigation_state
+            canvas._eis_plot_navigation_state = None
+            if state is None or state["kind"] != "zoom":
+                return
+            axes = state["axes"]
+            if event.inaxes is not axes or state["xdata"] is None or state["ydata"] is None:
+                return
+            if event.xdata is None or event.ydata is None:
+                return
+            if (
+                event.x is None
+                or event.y is None
+                or state["x"] is None
+                or state["y"] is None
+                or abs(event.x - state["x"]) < 5
+                or abs(event.y - state["y"]) < 5
+            ):
+                return
+            x0, x1 = sorted((state["xdata"], event.xdata))
+            y0, y1 = sorted((state["ydata"], event.ydata))
+            if axes.get_xscale() == "log" and x0 <= 0:
+                return
+            if axes.get_yscale() == "log" and y0 <= 0:
+                return
+            axes.set_xlim(x0, x1)
+            axes.set_ylim(y0, y1)
+            canvas.draw_idle()
+
+        canvas.mpl_connect("scroll_event", on_scroll)
+        canvas.mpl_connect("button_press_event", on_press)
+        canvas.mpl_connect("motion_notify_event", on_motion)
+        canvas.mpl_connect("button_release_event", on_release)
+
+    def _attach_plot_export_menu(
+        self,
+        canvas,
+        owner: tk.Misc | None = None,
+        reset_callback: Callable[[], None] | None = None,
+    ) -> None:
         """Add the common displayed-data export menu to a Matplotlib canvas."""
         if getattr(canvas, "_eis_plot_export_bound", False):
             return
         canvas._eis_plot_export_bound = True
+        if canvas is not getattr(self, "canvas", None):
+            self._attach_plot_navigation(canvas, reset_callback)
         menu_owner = owner or self.root
         widget = canvas.get_tk_widget()
 
         def show_menu(event) -> str | None:
             if event.button != 3:
-                return None
-            if self.point_toggle_mode or self.point_auto_fit:
-                # Let Matplotlib deliver the right-click event to the point
-                # editor instead of opening the graph context menu.
                 return None
             axes = event.inaxes
             if axes is None:
@@ -2681,6 +2812,30 @@ class EISApplication:
             menu.add_command(
                 label="Export data",
                 command=lambda: self._export_displayed_plot_data(axes, menu_owner),
+            )
+            menu.add_separator()
+            if reset_callback is not None:
+                menu.add_command(label="Reset view", command=reset_callback)
+            menu.add_command(
+                label="Show grid" if not self._canvas_grid_state(canvas) else "Hide grid",
+                command=lambda: self._toggle_canvas_grid(canvas),
+            )
+            menu.add_command(
+                label="Show legends" if not self._canvas_legend_state(canvas) else "Hide legends",
+                command=lambda: self._toggle_canvas_legends(canvas),
+            )
+            menu.add_separator()
+            menu.add_command(
+                label="Interaction help",
+                command=lambda: messagebox.showinfo(
+                    "Graph controls",
+                    "Mouse wheel: zoom\n"
+                    "Middle-button drag: pan\n"
+                    "Left-button drag: zoom to area\n"
+                    "Ctrl+left click/drag: edit or select points\n"
+                    "Right-click: graph options",
+                    parent=menu_owner,
+                ),
             )
             try:
                 menu.tk_popup(int(x_root), int(y_root))
@@ -3622,28 +3777,6 @@ class EISApplication:
         else:
             self.drt_artist = None
         self._update_legend_visibility()
-        self.zoom_selector = self._rectangle_selector_class(
-            self.axes,
-            self._on_zoom_select,
-            useblit=True,
-            button=[1],
-            minspanx=5,
-            minspany=5,
-            spancoords="pixels",
-            interactive=False,
-        )
-        self.zoom_selector.set_active(not self.point_toggle_mode)
-        self.edit_selector = self._rectangle_selector_class(
-            self.axes,
-            self._on_edit_area_select,
-            useblit=True,
-            button=[3],
-            minspanx=5,
-            minspany=5,
-            spancoords="pixels",
-            interactive=False,
-        )
-        self.edit_selector.set_active(self.point_toggle_mode)
         self.canvas.draw_idle()
 
     def _build_explorer(self, parent: ttk.Frame) -> None:
@@ -10283,7 +10416,8 @@ class EISApplication:
         if (
             self.busy
             or self.state is None
-            or event.button not in (1, 3)
+            or event.button != 1
+            or not self._event_has_control(event)
             or event.inaxes not in {self.axes, getattr(self, "phase_axes", None)}
             or not self.point_toggle_mode
         ):
@@ -10323,29 +10457,40 @@ class EISApplication:
         if (
             event.button == 1
             and event.inaxes is getattr(self, "drt_axes", None)
+            and self._event_has_control(event)
             and self._start_drt_peak_drag(event)
         ):
             self._drt_peak_drag_moved = False
             return
-        if event.button == 1 and event.inaxes is getattr(self, "drt_axes", None):
+        if (
+            event.button == 1
+            and self._event_has_control(event)
+            and event.inaxes is getattr(self, "drt_axes", None)
+        ):
             self._select_drt_peak_from_event(event)
             return
-        if self.busy or self.state is None or event.button != 2 or event.inaxes is None:
+        if self.busy or event.inaxes is None:
             return
         axes = event.inaxes
         if axes not in self._active_plot_axes():
             return
-        if event.xdata is None or event.ydata is None:
-            return
-        self._pan_state = {
-            "axes": axes,
-            "xdata": event.xdata,
-            "ydata": event.ydata,
-            "xlim": axes.get_xlim(),
-            "ylim": axes.get_ylim(),
-        }
-        if hasattr(self, "zoom_selector"):
-            self.zoom_selector.set_active(False)
+        if event.button == 2 and event.x is not None and event.y is not None:
+            self._pan_state = {"axes": axes, "x": event.x, "y": event.y}
+        elif event.button == 1 and event.xdata is not None and event.ydata is not None:
+            state = {
+                "axes": axes,
+                "inaxes": axes,
+                "button": 1,
+                "key": "control" if self._event_has_control(event) else None,
+                "x": event.x,
+                "y": event.y,
+                "xdata": event.xdata,
+                "ydata": event.ydata,
+            }
+            if self._event_has_control(event):
+                self._edit_state = state
+            else:
+                self._zoom_state = state
 
     def _on_plot_button_release(self, event) -> None:
         if event.button == 1 and self._drt_peak_drag is not None:
@@ -10359,11 +10504,41 @@ class EISApplication:
             self._update_drt_peak_table()
             self.canvas.draw_idle()
             return
-        if event.button != 2 or self._pan_state is None:
+        if event.button == 2:
+            self._pan_state = None
             return
-        self._pan_state = None
-        if hasattr(self, "zoom_selector"):
-            self.zoom_selector.set_active(not self.point_toggle_mode)
+        if event.button != 1:
+            return
+        state = self._zoom_state
+        self._zoom_state = None
+        if state is not None:
+            if (
+                event.inaxes is state["axes"]
+                and event.xdata is not None
+                and event.ydata is not None
+                and event.x is not None
+                and event.y is not None
+                and abs(event.x - state["x"]) >= 5
+                and abs(event.y - state["y"]) >= 5
+            ):
+                self._on_zoom_select(
+                    type("PressEvent", (), state)(), event
+                )
+            return
+        state = self._edit_state
+        self._edit_state = None
+        if state is None:
+            return
+        press_event = type("PressEvent", (), state)()
+        if (
+            event.x is not None
+            and event.y is not None
+            and abs(event.x - state["x"]) >= 5
+            and abs(event.y - state["y"]) >= 5
+        ):
+            self._on_edit_area_select(press_event, event)
+        else:
+            self._on_plot_click(press_event)
 
     def _on_plot_motion(self, event) -> None:
         if self._drt_peak_drag is not None:
@@ -10397,15 +10572,7 @@ class EISApplication:
             self._update_point_hover(event)
             return
         self._hide_point_hover()
-        axes = self._pan_state["axes"]
-        if event.inaxes is not axes or event.xdata is None or event.ydata is None:
-            return
-        delta_x = event.xdata - self._pan_state["xdata"]
-        delta_y = event.ydata - self._pan_state["ydata"]
-        x_min, x_max = self._pan_state["xlim"]
-        y_min, y_max = self._pan_state["ylim"]
-        axes.set_xlim(x_min - delta_x, x_max - delta_x)
-        axes.set_ylim(y_min - delta_y, y_max - delta_y)
+        self._pan_axes_from_state(self._pan_state, event)
         self.canvas.draw_idle()
 
     def _on_plot_scroll(self, event) -> None:
@@ -10417,21 +10584,14 @@ class EISApplication:
         if event.xdata is None or event.ydata is None:
             return
         scale = 1 / 1.2 if event.button == "up" else 1.2
-        x_min, x_max = axes.get_xlim()
-        y_min, y_max = axes.get_ylim()
-        new_x_min = event.xdata - (event.xdata - x_min) * scale
-        new_x_max = event.xdata + (x_max - event.xdata) * scale
-        new_y_min = event.ydata - (event.ydata - y_min) * scale
-        new_y_max = event.ydata + (y_max - event.ydata) * scale
-        axes.set_xlim(new_x_min, new_x_max)
-        axes.set_ylim(new_y_min, new_y_max)
+        self._zoom_axes_at_event(axes, event, scale)
         self.canvas.draw_idle()
 
     def _on_zoom_select(self, press_event, release_event) -> None:
         if (
-            self.point_toggle_mode
-            or self._pan_state is not None
-            or press_event.inaxes is not self.axes
+            self._pan_state is not None
+            or self._event_has_control(press_event)
+            or press_event.inaxes not in self._active_plot_axes()
         ):
             return
         if (
@@ -10445,8 +10605,8 @@ class EISApplication:
         y0, y1 = sorted((press_event.ydata, release_event.ydata))
         if abs(x1 - x0) <= np.finfo(float).eps or abs(y1 - y0) <= np.finfo(float).eps:
             return
-        self.axes.set_xlim(x0, x1)
-        self.axes.set_ylim(y0, y1)
+        press_event.inaxes.set_xlim(x0, x1)
+        press_event.inaxes.set_ylim(y0, y1)
         self.canvas.draw_idle()
 
     def _on_edit_area_select(self, press_event, release_event) -> None:
@@ -10454,6 +10614,7 @@ class EISApplication:
             not self.point_toggle_mode
             or self.busy
             or self.state is None
+            or not self._event_has_control(press_event)
             or press_event.inaxes is not self.axes
             or release_event.inaxes is not self.axes
             or press_event.xdata is None
@@ -10500,10 +10661,6 @@ class EISApplication:
         self.toggle_points_button.configure(
             text=f"Edit points: {'On' if self.point_toggle_mode else 'Off'}"
         )
-        if hasattr(self, "zoom_selector"):
-            self.zoom_selector.set_active(not self.point_toggle_mode)
-        if hasattr(self, "edit_selector"):
-            self.edit_selector.set_active(self.point_toggle_mode)
         self._update_status()
         return "break" if _event is not None else None
 
@@ -10514,10 +10671,6 @@ class EISApplication:
         if self.point_auto_fit and not self.point_toggle_mode:
             self.point_toggle_mode = True
             self.toggle_points_button.configure(text="Edit points: On")
-            if hasattr(self, "zoom_selector"):
-                self.zoom_selector.set_active(False)
-            if hasattr(self, "edit_selector"):
-                self.edit_selector.set_active(True)
         self.auto_fit_points_button.configure(
             text=f"Edit points and fit: {'On' if self.point_auto_fit else 'Off'}"
         )
@@ -13229,13 +13382,15 @@ class EISApplication:
         chart_frame.rowconfigure(0, weight=1)
 
         from matplotlib import colormaps
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         from matplotlib.figure import Figure
 
         figure = Figure(figsize=(8.5, 5.8), dpi=100, constrained_layout=True)
         axes = figure.add_subplot(111)
         canvas = FigureCanvasTkAgg(figure, master=chart_frame)
-        self._attach_plot_export_menu(canvas, popup)
+        self._attach_plot_export_menu(
+            canvas, popup, reset_callback=lambda: active_view()
+        )
         canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         hover_info_var = tk.StringVar(value="Hover over a point to see its selected metadata.")
         ttk.Label(
@@ -13244,10 +13399,6 @@ class EISApplication:
             anchor="nw",
             justify=tk.LEFT,
         ).grid(row=1, column=0, sticky="ew", pady=(4, 2))
-        toolbar = NavigationToolbar2Tk(canvas, chart_frame, pack_toolbar=False)
-        toolbar.update()
-        toolbar.grid(row=2, column=0, sticky="ew")
-
         line_tool = _ExplorerLineTool(axes, canvas, controls, lambda: refresh_plot())
         point_hover = _ExplorerPointHover(
             axes, canvas, self._explorer_hover_metadata_preference, hover_info_var
@@ -13778,13 +13929,15 @@ class EISApplication:
         chart_frame.rowconfigure(0, weight=1)
 
         from matplotlib import colormaps
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
         from matplotlib.figure import Figure
 
         figure = Figure(figsize=(8.5, 5.8), dpi=100, constrained_layout=True)
         axes = figure.add_subplot(111)
         canvas = FigureCanvasTkAgg(figure, master=chart_frame)
-        self._attach_plot_export_menu(canvas, popup)
+        self._attach_plot_export_menu(
+            canvas, popup, reset_callback=lambda: active_view()
+        )
         canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         hover_info_var = tk.StringVar(value="Hover over a point to see its selected metadata.")
         ttk.Label(
@@ -13793,10 +13946,6 @@ class EISApplication:
             anchor="nw",
             justify=tk.LEFT,
         ).grid(row=1, column=0, sticky="ew", pady=(4, 2))
-        toolbar = NavigationToolbar2Tk(canvas, chart_frame, pack_toolbar=False)
-        toolbar.update()
-        toolbar.grid(row=2, column=0, sticky="ew")
-
         line_tool = _ExplorerLineTool(axes, canvas, controls, lambda: refresh_plot())
         point_hover = _ExplorerPointHover(
             axes, canvas, self._explorer_hover_metadata_preference, hover_info_var
@@ -14795,7 +14944,9 @@ class EISApplication:
 
         figure = Figure(figsize=(8.2, 6.2), dpi=100, constrained_layout=True)
         canvas = FigureCanvasTkAgg(figure, master=popup)
-        self._attach_plot_export_menu(canvas, popup)
+        self._attach_plot_export_menu(
+            canvas, popup, reset_callback=lambda: _reset_popup_view()
+        )
         popup_axes: dict[str, object | None] = {"main": None, "phase": None}
 
         def _render_popup() -> None:
@@ -14943,9 +15094,6 @@ class EISApplication:
 
         toggle_button.configure(command=_toggle_popup_mode)
         _render_popup()
-        toolbar = self._create_toolbar(canvas, popup, _reset_popup_view)
-        toolbar.update()
-        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self._update_status(status_message)
 
@@ -14982,7 +15130,9 @@ class EISApplication:
 
         figure = Figure(figsize=(8.2, 6.2), dpi=100, constrained_layout=True)
         canvas = FigureCanvasTkAgg(figure, master=popup)
-        self._attach_plot_export_menu(canvas, popup)
+        self._attach_plot_export_menu(
+            canvas, popup, reset_callback=lambda: _reset_popup_view()
+        )
         popup_axes: dict[str, object | None] = {"main": None}
 
         def _drt_limits(selected_mode: str):
@@ -15087,9 +15237,6 @@ class EISApplication:
 
         mode_box.bind("<<ComboboxSelected>>", _on_mode_change)
         canvas.draw()
-        toolbar = self._create_toolbar(canvas, popup, _reset_popup_view)
-        toolbar.update()
-        toolbar.pack(side=tk.BOTTOM, fill=tk.X)
         canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         _render_popup()
         self._update_status(status_message)
