@@ -1241,6 +1241,8 @@ class EISApplication:
         self.root.bind("<Control-L>", lambda _event: self.load_project())
         self.root.bind("<Control-i>", lambda _event: self.import_data())
         self.root.bind("<Control-I>", lambda _event: self.import_data())
+        self.root.bind("<Control-p>", lambda _event: self.open_preferences())
+        self.root.bind("<Control-P>", lambda _event: self.open_preferences())
         self.root.bind("<Alt-a>", self._on_alt_a)
         self.root.bind("<Alt-A>", self._on_alt_a)
         self.root.bind("<Alt-d>", self._on_alt_d)
@@ -1374,12 +1376,11 @@ class EISApplication:
             command=self.open_procedure_builder,
         )
         menu_bar.add_cascade(label="Procedures", menu=self.procedure_menu)
-        self.preferences_menu = tk.Menu(menu_bar, tearoff=False)
-        self.preferences_menu.add_command(
-            label="Preferences…",
+        menu_bar.add_command(
+            label="Preferences",
+            accelerator="Ctrl+P",
             command=self.open_preferences,
         )
-        menu_bar.add_cascade(label="Preferences", menu=self.preferences_menu)
         self.export_menu = tk.Menu(menu_bar, tearoff=False)
         self.export_menu.add_command(
             label="Export fit parameters - all spectra…",
