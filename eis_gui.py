@@ -616,9 +616,15 @@ class ParameterTable(ttk.Frame):
             )
         return parameters
 
-    def restore_limits(self, parameters: list[ParameterValue]) -> None:
+    def restore_limits(
+        self,
+        parameters: list[ParameterValue],
+        names: set[str] | None = None,
+    ) -> None:
         defaults = {parameter.name: parameter for parameter in parameters}
         for name, _unit, _error_percent, _fixed, _initial, lower, upper in self._rows:
+            if names is not None and name not in names:
+                continue
             default = defaults.get(name)
             if default is None:
                 continue
@@ -1240,6 +1246,8 @@ class EISApplication:
         self.root.bind("<Shift-Down>", lambda _event: self.change_cycle(1, True))
         self.root.bind("<Control-Up>", lambda _event: self.change_cycle(-1, focus_only=True))
         self.root.bind("<Control-Down>", lambda _event: self.change_cycle(1, focus_only=True))
+        self.root.bind("<Alt-w>", lambda _event: self.open_parameter_limits_window())
+        self.root.bind("<Alt-W>", lambda _event: self.open_parameter_limits_window())
         self.root.bind("<Control-a>", self.select_all_spectra)
         self.root.bind("<Delete>", self._on_delete_key)
         self.root.bind("<Control-e>", lambda _event: self.export_selected_fits())
@@ -6137,37 +6145,13 @@ class EISApplication:
             command=self.apply_parameters_to_selected,
         )
         self.parameters_selected_button.grid(row=0, column=0, columnspan=2, sticky="ew")
-        self.apply_fix_selected_button = ttk.Button(
+        self.parameters_limits_button = ttk.Button(
             parameter_actions,
-            text="Apply Fix",
-            command=lambda: self.apply_parameters_to_selected({"fixed"}),
+            text="Parameters limits",
+            command=self.open_parameter_limits_window,
         )
-        self.apply_fix_selected_button.grid(row=1, column=0, padx=(0, 3), pady=(4, 0), sticky="ew")
-        self.apply_initial_selected_button = ttk.Button(
-            parameter_actions,
-            text="Apply Initial",
-            command=lambda: self.apply_parameters_to_selected({"initial"}),
-        )
-        self.apply_initial_selected_button.grid(row=1, column=1, padx=(3, 0), pady=(4, 0), sticky="ew")
-        self.apply_lower_selected_button = ttk.Button(
-            parameter_actions,
-            text="Apply Lower",
-            command=lambda: self.apply_parameters_to_selected({"lower"}),
-        )
-        self.apply_lower_selected_button.grid(row=2, column=0, padx=(0, 3), pady=(4, 0), sticky="ew")
-        self.apply_upper_selected_button = ttk.Button(
-            parameter_actions,
-            text="Apply Upper",
-            command=lambda: self.apply_parameters_to_selected({"upper"}),
-        )
-        self.apply_upper_selected_button.grid(row=2, column=1, padx=(3, 0), pady=(4, 0), sticky="ew")
-        self.restore_parameter_limits_button = ttk.Button(
-            parameter_actions,
-            text="Restore parameter limits",
-            command=self.restore_parameter_limits,
-        )
-        self.restore_parameter_limits_button.grid(
-            row=3, column=0, columnspan=2, pady=(4, 0), sticky="ew"
+        self.parameters_limits_button.grid(
+            row=1, column=0, columnspan=2, pady=(4, 0), sticky="ew"
         )
         self.root.bind_all("<MouseWheel>", self._parameter_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self._parameter_mousewheel, add="+")
@@ -6474,10 +6458,7 @@ class EISApplication:
             self.import_simulator_fit_button,
             self.open_drt_analysis_button,
             self.parameters_selected_button,
-            self.apply_fix_selected_button,
-            self.apply_initial_selected_button,
-            self.apply_lower_selected_button,
-            self.apply_upper_selected_button,
+            self.parameters_limits_button,
         )
 
     def _build_simulator_controls(self, parent: ttk.Frame) -> None:
@@ -7464,6 +7445,7 @@ class EISApplication:
     def apply_parameters_to_selected(
         self,
         fields: set[str] | None = None,
+        parameter_names: set[str] | None = None,
     ) -> None:
         if self.busy or self.state is None:
             return
@@ -7474,7 +7456,14 @@ class EISApplication:
             self._update_status("select one or more spectra in the explorer first")
             return
         try:
-            source_parameters = self.parameter_table.values()
+            source_parameters = [
+                parameter
+                for parameter in self.parameter_table.values()
+                if parameter_names is None or parameter.name in parameter_names
+            ]
+            if not source_parameters:
+                self._update_status("select at least one circuit parameter")
+                return
             for parameter in source_parameters:
                 if parameter.lower > parameter.upper:
                     raise ValueError(
@@ -11251,17 +11240,147 @@ class EISApplication:
         cycle.invalidate_drt_cache()
         return True
 
-    def restore_parameter_limits(self) -> None:
+    def open_parameter_limits_window(self) -> None:
+        if self.state is None:
+            return
+        existing = getattr(self, "parameter_limits_popup", None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+
+        popup = tk.Toplevel(self.root)
+        self.parameter_limits_popup = popup
+        popup.title("Parameters limits")
+        popup.geometry("430x560")
+        popup.minsize(360, 420)
+        popup.transient(self.root)
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            popup,
+            text=(
+                "Select the circuit parameters affected by the actions below. "
+                "Apply actions update the selected spectra in the Spectra explorer."
+            ),
+            wraplength=390,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, padx=10, pady=(10, 6), sticky="w")
+
+        selection_frame = ttk.Frame(popup)
+        selection_frame.grid(row=1, column=0, padx=10, sticky="nsew")
+        selection_frame.columnconfigure(0, weight=1)
+        selection_frame.rowconfigure(0, weight=1)
+        selection_canvas = tk.Canvas(selection_frame, highlightthickness=0)
+        selection_canvas.grid(row=0, column=0, sticky="nsew")
+        selection_scrollbar = ttk.Scrollbar(
+            selection_frame, orient=tk.VERTICAL, command=selection_canvas.yview
+        )
+        selection_scrollbar.grid(row=0, column=1, sticky="ns")
+        selection_canvas.configure(yscrollcommand=selection_scrollbar.set)
+        checks_frame = ttk.Frame(selection_canvas)
+        checks_window = selection_canvas.create_window(
+            (0, 0), window=checks_frame, anchor="nw"
+        )
+        checks_frame.bind(
+            "<Configure>",
+            lambda _event: selection_canvas.configure(
+                scrollregion=selection_canvas.bbox("all")
+            ),
+        )
+        selection_canvas.bind(
+            "<Configure>",
+            lambda event: selection_canvas.itemconfigure(
+                checks_window, width=event.width
+            ),
+        )
+
+        parameter_names = [parameter.name for parameter in self.parameter_table.values()]
+        selected_vars = {
+            name: tk.BooleanVar(value=True) for name in parameter_names
+        }
+        for row, name in enumerate(parameter_names):
+            ttk.Checkbutton(
+                checks_frame,
+                text=name,
+                variable=selected_vars[name],
+            ).grid(row=row, column=0, padx=4, pady=2, sticky="w")
+
+        def selected_parameter_names() -> set[str]:
+            return {
+                name for name, variable in selected_vars.items() if variable.get()
+            }
+
+        def select_all() -> None:
+            for variable in selected_vars.values():
+                variable.set(True)
+
+        def deselect_all() -> None:
+            for variable in selected_vars.values():
+                variable.set(False)
+
+        selection_buttons = ttk.Frame(popup)
+        selection_buttons.grid(row=2, column=0, padx=10, pady=(6, 0), sticky="ew")
+        selection_buttons.columnconfigure(0, weight=1)
+        selection_buttons.columnconfigure(1, weight=1)
+        ttk.Button(
+            selection_buttons, text="Select all", command=select_all
+        ).grid(row=0, column=0, padx=(0, 3), sticky="ew")
+        ttk.Button(
+            selection_buttons, text="Deselect all", command=deselect_all
+        ).grid(row=0, column=1, padx=(3, 0), sticky="ew")
+
+        actions = ttk.Frame(popup)
+        actions.grid(row=3, column=0, padx=10, pady=(8, 10), sticky="ew")
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+
+        def apply_field(field: str) -> None:
+            self.apply_parameters_to_selected(
+                {field}, selected_parameter_names()
+            )
+
+        ttk.Button(
+            actions, text="Apply Fix", command=lambda: apply_field("fixed")
+        ).grid(row=0, column=0, padx=(0, 3), pady=2, sticky="ew")
+        ttk.Button(
+            actions, text="Apply Initial", command=lambda: apply_field("initial")
+        ).grid(row=0, column=1, padx=(3, 0), pady=2, sticky="ew")
+        ttk.Button(
+            actions, text="Apply Lower", command=lambda: apply_field("lower")
+        ).grid(row=1, column=0, padx=(0, 3), pady=2, sticky="ew")
+        ttk.Button(
+            actions, text="Apply Upper", command=lambda: apply_field("upper")
+        ).grid(row=1, column=1, padx=(3, 0), pady=2, sticky="ew")
+        ttk.Button(
+            actions,
+            text="Restore Default",
+            command=lambda: self.restore_parameter_limits(selected_parameter_names()),
+        ).grid(row=2, column=0, columnspan=2, pady=(2, 0), sticky="ew")
+
+        def close_popup() -> None:
+            self.parameter_limits_popup = None
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", close_popup)
+        popup.grab_set()
+        popup.focus_force()
+
+    def restore_parameter_limits(self, parameter_names: set[str] | None = None) -> None:
         if self.busy or self.state is None:
             return
         if not self._capture_controls():
             return
         circuit = self.state.active.model(self.state.circuit)
         defaults = circuit_parameters(circuit, self._eec_parameter_bounds)
-        self.parameter_table.restore_limits(defaults)
+        self.parameter_table.restore_limits(defaults, parameter_names)
         parameters = self.parameter_table.values()
         default_by_name = {parameter.name: parameter for parameter in defaults}
         for parameter in parameters:
+            if parameter_names is not None and parameter.name not in parameter_names:
+                continue
             default = default_by_name.get(parameter.name)
             if default is None:
                 continue
