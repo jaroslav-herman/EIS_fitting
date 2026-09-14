@@ -79,7 +79,7 @@ from eis_services import (
     load_projects,
     select_eec_model_from_hybrid_drt,
 )
-from load_and_label_eis import find_pattern_length, label_project_catalog
+from load_and_label_eis import find_pattern_length
 from ml.gui_results import MLResult, load_ml_results, load_ml_results_payload, suggested_eec
 from ml.results_schema import spectrum_identifier, write_ml_results
 from ml.point_validity import detect_outliers_in_active_points
@@ -15542,27 +15542,8 @@ class EISApplication:
         return selected_kinds
 
     def _finish_imports(self, report: ProjectImportReport) -> None:
-        # Compute the continuation point before registering raw imported
-        # dataframes; their ``Time`` column can be measurement timestamps.
-        time_offset = self._existing_time_label_max()
         for dataset_id, loaded in report.loaded:
             self._register_dataset(dataset_id, loaded)
-        labeling_messages: list[str] = []
-        for _dataset_id, loaded in report.loaded:
-            try:
-                loop_count, pattern_length = label_project_catalog(
-                    loaded,
-                    time_offset=time_offset,
-                )
-                time_offset += loop_count
-                labeling_messages.append(
-                    f"{loaded.dataset_label}: labeled {loop_count} loop(s) "
-                    f"with Cycle mod {pattern_length}"
-                )
-            except (TypeError, ValueError) as error:
-                labeling_messages.append(
-                    f"{loaded.dataset_label}: Time/Cycle mod labeling skipped ({error})"
-                )
         skipped_messages = [
             f"{loaded.dataset_label}: skipped cycles without impedance data: "
             f"{', '.join(str(cycle) for cycle in loaded.skipped_cycles)}"
@@ -15582,9 +15563,6 @@ class EISApplication:
             f"{path.name}: {error}" for path, error in report.errors
         ]
         warning_details.extend(skipped_messages)
-        warning_details.extend(
-            message for message in labeling_messages if "skipped" in message
-        )
         if warning_details:
             details = "\n".join(warning_details)
             messagebox.showwarning(
