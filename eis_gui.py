@@ -1313,6 +1313,16 @@ class EISApplication:
             return self.path.stem
         return "eis_project"
 
+    def _project_stem(self) -> str:
+        project_path = self.project_path
+        if project_path is None:
+            return self._current_stem()
+        name = project_path.name
+        for suffix in (".eisfit.json.gz", ".eisfit.json"):
+            if name.casefold().endswith(suffix):
+                return name[: -len(suffix)] or "eis_project"
+        return project_path.stem
+
     def _current_name(self) -> str:
         if self.path is not None:
             return self.path.name
@@ -16543,7 +16553,7 @@ class EISApplication:
             parent=self.root,
             title="Export fitted parameters",
             initialdir=str(self._current_directory()),
-            initialfile=f"{self._current_stem()}_fit_parameters.csv",
+            initialfile=f"{self._project_stem()}_fit_export.csv",
             defaultextension=".csv",
             filetypes=[("CSV", "*.csv")],
         )
@@ -16574,7 +16584,7 @@ class EISApplication:
             parent=self.root,
             title="Export fitted parameters for selected spectra",
             initialdir=str(self._current_directory()),
-            initialfile=f"{self._current_stem()}_selected_fit_parameters.csv",
+            initialfile=f"{self._project_stem()}_fit_export.csv",
             defaultextension=".csv",
             filetypes=[("CSV", "*.csv")],
         )
