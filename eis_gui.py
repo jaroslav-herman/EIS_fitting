@@ -11393,7 +11393,12 @@ class EISApplication:
             )
         self.state.remember_parameters(parameters)
         self.parameter_table.set_parameters(parameters)
-        self._update_status("restored default circuit parameter limits")
+        if parameter_names is not None and self._selected_spectrum_rows():
+            self.apply_parameters_to_selected(
+                {"lower", "upper"}, parameter_names
+            )
+        else:
+            self._update_status("restored default circuit parameter limits")
 
     def _choose_parameter_blocks(self, group_ids: tuple[str, ...]) -> tuple[str, str] | None:
         popup = tk.Toplevel(self.root)
