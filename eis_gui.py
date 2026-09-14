@@ -616,6 +616,15 @@ class ParameterTable(ttk.Frame):
             )
         return parameters
 
+    def restore_limits(self, parameters: list[ParameterValue]) -> None:
+        defaults = {parameter.name: parameter for parameter in parameters}
+        for name, _unit, _error_percent, _fixed, _initial, lower, upper in self._rows:
+            default = defaults.get(name)
+            if default is None:
+                continue
+            lower.set(f"{default.lower:g}")
+            upper.set(f"{default.upper:g}")
+
 
 class MetadataColumnDialog(tk.Toplevel):
     def __init__(self, parent: tk.Tk, spectrum_count: int) -> None:
@@ -6152,6 +6161,14 @@ class EISApplication:
             command=lambda: self.apply_parameters_to_selected({"upper"}),
         )
         self.apply_upper_selected_button.grid(row=2, column=1, padx=(3, 0), pady=(4, 0), sticky="ew")
+        self.restore_parameter_limits_button = ttk.Button(
+            parameter_actions,
+            text="Restore parameter limits",
+            command=self.restore_parameter_limits,
+        )
+        self.restore_parameter_limits_button.grid(
+            row=3, column=0, columnspan=2, pady=(4, 0), sticky="ew"
+        )
         self.root.bind_all("<MouseWheel>", self._parameter_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self._parameter_mousewheel, add="+")
         self.root.bind_all("<Button-5>", self._parameter_mousewheel, add="+")
@@ -11233,6 +11250,31 @@ class EISApplication:
             )
         cycle.invalidate_drt_cache()
         return True
+
+    def restore_parameter_limits(self) -> None:
+        if self.busy or self.state is None:
+            return
+        if not self._capture_controls():
+            return
+        circuit = self.state.active.model(self.state.circuit)
+        defaults = circuit_parameters(circuit, self._eec_parameter_bounds)
+        self.parameter_table.restore_limits(defaults)
+        parameters = self.parameter_table.values()
+        default_by_name = {parameter.name: parameter for parameter in defaults}
+        for parameter in parameters:
+            default = default_by_name.get(parameter.name)
+            if default is None:
+                continue
+            parameter.lower = default.lower
+            parameter.upper = default.upper
+            parameter.initial = self._clamp_parameter_value(
+                parameter.initial,
+                parameter.lower,
+                parameter.upper,
+            )
+        self.state.remember_parameters(parameters)
+        self.parameter_table.set_parameters(parameters)
+        self._update_status("restored default circuit parameter limits")
 
     def _choose_parameter_blocks(self, group_ids: tuple[str, ...]) -> tuple[str, str] | None:
         popup = tk.Toplevel(self.root)
