@@ -13411,6 +13411,7 @@ class EISApplication:
         self._last_eec_anomaly_records = {
             record.identity: record for record in target_records
         }
+        self._last_eec_anomaly_candidate_records = candidate_records
         calibration_path = ML_TRAINED_MODELS["Sputtered cathode"]
         self.status_var.set(
             f"Detecting EEC parameter anomalies in {len(target_records)} selected spectra…"
@@ -13438,7 +13439,7 @@ class EISApplication:
             text=(
                 f"Calibration: {report.calibration_source}\n"
                 f"Detected {report.anomalous_count} anomalous spectrum(s); "
-                "this report does not modify fits or point selection."
+                "select rows to apply to them, or leave the table unselected to use all anomalous spectra."
             ),
             padding=8,
             wraplength=960,
@@ -13546,8 +13547,116 @@ class EISApplication:
         details_table.column("status", width=110, anchor="w")
         details_table.tag_configure("anomalous", foreground="#a00000")
         details_table.grid(row=1, column=0, columnspan=2, pady=(8, 0), sticky="nsew")
+        user_selected = {"value": False}
+
+        def apply_anomaly_suggestions(and_fit: bool = False) -> None:
+            selected_items = table.selection() if user_selected["value"] else ()
+            if selected_items:
+                selected_results = [result_by_item[item] for item in selected_items]
+                scope = "selected"
+            else:
+                selected_results = [
+                    result for result in report.results if result.status == "anomalous"
+                ]
+                scope = "all anomalous"
+            if not selected_results:
+                messagebox.showinfo(
+                    "No spectra to apply",
+                    "Select spectra in the table, or leave the table unselected to use all anomalous spectra.",
+                    parent=popup,
+                )
+                return
+            action = "apply suggested parameters and fit" if and_fit else "apply suggested parameters"
+            if not messagebox.askyesno(
+                "Apply EEC suggestions",
+                f"{action.capitalize()} to {len(selected_results)} {scope} spectrum"
+                f"{'s' if len(selected_results) != 1 else ''}?",
+                parent=popup,
+            ):
+                return
+            records_by_identity = getattr(self, "_last_eec_anomaly_records", {})
+            candidate_records = getattr(self, "_last_eec_anomaly_candidate_records", ())
+            targets = []
+            applied = 0
+            skipped = []
+            for result in selected_results:
+                target = records_by_identity.get(result.identity)
+                if target is None:
+                    skipped.append(result.identity)
+                    continue
+                project_candidates = [
+                    candidate
+                    for candidate in candidate_records
+                    if candidate.project_id == target.project_id
+                ]
+                suggestion = suggest_eec_parameters(
+                    target, project_candidates
+                )
+                loaded = self.loaded_projects.get(target.project_id)
+                if loaded is None or not suggestion.values:
+                    skipped.append(result.identity)
+                    continue
+                cycle = self._loaded_cycle_for_popup(loaded, target.cycle)
+                parameters = loaded.state.parameters_for(target.cycle)
+                values_by_name = suggestion.values
+                for parameter in parameters:
+                    value = values_by_name.get(parameter.name)
+                    if value is None:
+                        continue
+                    parameter.initial = float(
+                        self._clamp_parameter_value(
+                            value, parameter.lower, parameter.upper
+                        )
+                    )
+                cycle.parameters = parameters
+                cycle.clear_fit()
+                loaded.state.cycles[target.cycle] = cycle
+                applied += 1
+                if and_fit:
+                    targets.append(
+                        SpectrumFitTarget(
+                            loaded=loaded,
+                            cycle=target.cycle,
+                            label=f"{loaded.dataset_label}, cycle {target.cycle}",
+                        )
+                    )
+            if not applied:
+                messagebox.showwarning(
+                    "EEC suggestions unavailable",
+                    "No selected spectra had usable compatible suggestions.",
+                    parent=popup,
+                )
+                return
+            popup.destroy()
+            if and_fit:
+                try:
+                    fit_options = self._fit_options_from_controls()
+                except (TypeError, ValueError) as error:
+                    messagebox.showerror("Invalid optimizer settings", str(error), parent=self.root)
+                    return
+                self.status_var.set(f"Fitting {len(targets)} spectra with suggested initials…")
+                self._submit(
+                    lambda: batch_fit_spectra(
+                        targets,
+                        self.state.parameters_for(self.state.active_cycle),
+                        use_target_initial_parameters=True,
+                        stop_event=self._stop_event,
+                        fit_timeout_seconds=self._fit_timeout_seconds,
+                        fit_options=fit_options,
+                    ),
+                    self._finish_explorer_batch_fit,
+                    "Suggested EEC fit failed",
+                    operation_labels=[target.label for target in targets],
+                    operation_name="Suggested EEC fit",
+                )
+            else:
+                self._refresh_plot(rescale=True)
+                self._refresh_open_parameter_explorers()
+                self._update_status(f"suggested EEC parameters applied to {applied} spectra")
 
         def show_details(_event=None) -> None:
+            if _event is not None:
+                user_selected["value"] = True
             selection = table.selection()
             if not selection:
                 for item in details_table.get_children():
@@ -13578,9 +13687,22 @@ class EISApplication:
             table.selection_set(first)
             table.focus(first)
             show_details()
-        ttk.Button(popup, text="Close", command=popup.destroy).grid(
-            row=2, column=0, padx=8, pady=(0, 8), sticky="e"
+            popup.after_idle(lambda: user_selected.__setitem__("value", False))
+        buttons = ttk.Frame(popup, padding=(8, 0, 8, 8))
+        buttons.grid(row=2, column=0, sticky="e")
+        ttk.Button(buttons, text="Close", command=popup.destroy).pack(
+            side=tk.RIGHT, padx=(6, 0)
         )
+        ttk.Button(
+            buttons,
+            text="Apply suggested parameters and fit",
+            command=lambda: apply_anomaly_suggestions(True),
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(
+            buttons,
+            text="Apply suggested parameters",
+            command=apply_anomaly_suggestions,
+        ).pack(side=tk.RIGHT)
         popup.geometry("1500x760")
         popup.minsize(1200, 620)
         self._update_status(
