@@ -19,6 +19,7 @@ def record(
     potential=0.0,
     current=0.0,
     metadata=None,
+    project_id="",
 ):
     return FittedEECRecord(
         identity=identity,
@@ -29,6 +30,7 @@ def record(
         parameter_names=tuple(names),
         fitted_parameters=tuple(value),
         custom_metadata=dict(metadata or {}),
+        project_id=project_id,
     )
 
 
@@ -176,6 +178,28 @@ class EECSuggestionTests(unittest.TestCase):
         )
         report = detect_eec_parameter_anomalies([target], calibration)
         self.assertEqual(report.results[0].status, "invalid_fit")
+
+    def test_selected_targets_use_only_same_project_candidates(self):
+        target = record("a::cycle-10", 10, (10.0,), current=10.0, project_id="a")
+        same_project = [
+            record(f"a::cycle-{cycle}", cycle, (1.0,), current=float(cycle), project_id="a")
+            for cycle in (8, 9, 11)
+        ]
+        other_project = [
+            record(f"b::cycle-{cycle}", cycle, (100.0,), current=float(cycle), project_id="b")
+            for cycle in (8, 9, 11, 12)
+        ]
+        calibration = EECAnomalyCalibration(
+            parameter_limits={"R0::R0": {"lower_residual": -0.2, "upper_residual": 0.2}},
+            parameter_stats={}, circuit_classes=("R0",), source="synthetic",
+        )
+        report = detect_eec_parameter_anomalies(
+            [target], calibration,
+            candidate_records=[target, *same_project, *other_project],
+        )
+        result = report.results[0]
+        self.assertEqual(result.neighbor_count, 3)
+        self.assertEqual(result.status, "anomalous")
 
 
 if __name__ == "__main__":

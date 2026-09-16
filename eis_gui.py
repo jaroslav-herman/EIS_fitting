@@ -13170,9 +13170,13 @@ class EISApplication:
             f"initial parameters copied from spectrum {source_spectrum.cycle}"
         )
 
-    def _collect_eec_suggestion_records(self) -> list[FittedEECRecord]:
+    def _collect_eec_suggestion_records(
+        self, project_id: str | None = None
+    ) -> list[FittedEECRecord]:
         records: list[FittedEECRecord] = []
         for dataset_id in self._dataset_order:
+            if project_id is not None and dataset_id != project_id:
+                continue
             loaded = self.loaded_projects[dataset_id]
             for spectrum in loaded.spectra:
                 cycle = loaded.state.cycles.get(spectrum.cycle)
@@ -13194,6 +13198,7 @@ class EISApplication:
                         parameter_names=tuple(parameter.name for parameter in cycle.parameters),
                         fitted_parameters=tuple(float(value) for value in values),
                         custom_metadata=metadata,
+                        project_id=dataset_id,
                     )
                 )
         return records
@@ -13215,8 +13220,12 @@ class EISApplication:
                 **dict(cycle.custom_metadata),
                 "Cycle mod 15": int(cycle.cycle) % 15,
             },
+            project_id=str(self.current_dataset_id),
         )
-        suggestion = suggest_eec_parameters(target, self._collect_eec_suggestion_records())
+        suggestion = suggest_eec_parameters(
+            target,
+            self._collect_eec_suggestion_records(str(self.current_dataset_id)),
+        )
         if not suggestion.values:
             message = "No compatible fitted spectra are available for this spectrum."
             if suggestion.warnings:
@@ -13282,7 +13291,7 @@ class EISApplication:
         buttons = ttk.Frame(popup, padding=(8, 0, 8, 8))
         buttons.grid(row=2, column=0, sticky="e")
 
-        def apply_suggestion() -> None:
+        def apply_suggestion(and_fit: bool = False) -> None:
             if self.state is None or self.current_dataset_id is None:
                 popup.destroy()
                 return
@@ -13309,29 +13318,61 @@ class EISApplication:
             current_cycle.clear_fit()
             self.parameter_table.set_parameters(parameters)
             self._refresh_plot(rescale=True)
-            self._update_status("suggested EEC initials applied")
             popup.destroy()
+            if and_fit:
+                self.fit()
+            else:
+                self._update_status("suggested EEC parameters applied")
 
-        ttk.Button(buttons, text="Cancel", command=popup.destroy).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(buttons, text="Apply initials", command=apply_suggestion).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Cancel", command=popup.destroy).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+        ttk.Button(
+            buttons,
+            text="Apply suggested parameters and fit",
+            command=lambda: apply_suggestion(True),
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(
+            buttons,
+            text="Apply suggested parameters",
+            command=apply_suggestion,
+        ).pack(side=tk.RIGHT)
         popup.protocol("WM_DELETE_WINDOW", popup.destroy)
         popup.minsize(620, 360)
 
     def detect_eec_anomalies(self) -> None:
         if self.state is None or self.busy or not self._capture_controls():
             return
-        records = self._collect_eec_suggestion_records()
-        if not records:
-            self._update_status("no fitted spectra are available for EEC anomaly detection")
+        selected_rows = self._selected_spectrum_rows()
+        if not selected_rows:
+            self._update_status(
+                "select one or more spectra in the explorer first"
+            )
+            return
+        candidate_records = self._collect_eec_suggestion_records()
+        selected_keys = {
+            (dataset_id, int(spectrum.cycle))
+            for dataset_id, _loaded, spectrum in selected_rows
+        }
+        target_records = [
+            record
+            for record in candidate_records
+            if (record.project_id, record.cycle) in selected_keys
+        ]
+        if not target_records:
+            self._update_status(
+                "none of the selected spectra has a fitted EEC parameter vector"
+            )
             return
         calibration_path = ML_TRAINED_MODELS["Sputtered cathode"]
         self.status_var.set(
-            f"Detecting EEC parameter anomalies in {len(records)} fitted spectra…"
+            f"Detecting EEC parameter anomalies in {len(target_records)} selected spectra…"
         )
         self._submit(
             lambda: detect_eec_parameter_anomalies(
-                records,
+                target_records,
                 load_eec_anomaly_calibration(calibration_path),
+                candidate_records=candidate_records,
             ),
             self._finish_eec_anomaly_detection,
             "EEC anomaly detection failed",

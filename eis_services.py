@@ -63,6 +63,7 @@ class FittedEECRecord:
     parameter_names: tuple[str, ...]
     fitted_parameters: tuple[float, ...]
     custom_metadata: dict[str, object] = field(default_factory=dict)
+    project_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -186,22 +187,32 @@ def _anomaly_score(residual: float, lower: float, upper: float) -> tuple[float, 
     return 0.0, False
 
 
+def _eec_record_project_id(record: FittedEECRecord) -> str:
+    if record.project_id:
+        return record.project_id
+    if "::cycle-" in record.identity:
+        return record.identity.rsplit("::cycle-", 1)[0]
+    return ""
+
+
 def detect_eec_parameter_anomalies(
     records: Iterable[FittedEECRecord],
     calibration: EECAnomalyCalibration,
     *,
+    candidate_records: Iterable[FittedEECRecord] | None = None,
     max_neighbors: int = 5,
     minimum_neighbors: int = 3,
 ) -> EECAnomalyReport:
-    """Detect fitted EEC parameters that exceed learned local residual limits."""
+    """Detect selected fitted EEC parameters against same-project neighbors."""
     if int(max_neighbors) < 1:
         raise ValueError("max_neighbors must be positive")
     if int(minimum_neighbors) < 1 or int(minimum_neighbors) > int(max_neighbors):
         raise ValueError("minimum_neighbors must be between 1 and max_neighbors")
-    records = tuple(records)
+    targets = tuple(records)
+    candidates = tuple(candidate_records) if candidate_records is not None else targets
     results: list[EECAnomalyResult] = []
     report_warnings: list[str] = []
-    for target in records:
+    for target in targets:
         if len(target.parameter_names) != len(target.fitted_parameters):
             results.append(
                 EECAnomalyResult(
@@ -215,7 +226,15 @@ def detect_eec_parameter_anomalies(
                 )
             )
             continue
-        suggestion = suggest_eec_parameters(target, records, max_neighbors=max_neighbors)
+        project_id = _eec_record_project_id(target)
+        same_project_candidates = tuple(
+            candidate
+            for candidate in candidates
+            if _eec_record_project_id(candidate) == project_id
+        )
+        suggestion = suggest_eec_parameters(
+            target, same_project_candidates, max_neighbors=max_neighbors
+        )
         neighbor_count = len(suggestion.contributors)
         maximum_distance = (
             max(item.distance for item in suggestion.contributors)
