@@ -51,6 +51,195 @@ class SpectrumMetadata:
     custom_metadata: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class FittedEECRecord:
+    """Immutable fitted-spectrum data used for local EEC initialization."""
+
+    identity: str
+    cycle: int
+    potential_v: float
+    current_ma: float
+    circuit: str
+    parameter_names: tuple[str, ...]
+    fitted_parameters: tuple[float, ...]
+    custom_metadata: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class EECSuggestionContributor:
+    identity: str
+    cycle: int
+    distance: float
+
+
+@dataclass(frozen=True)
+class EECParameterSuggestion:
+    values: dict[str, float]
+    contributors: tuple[EECSuggestionContributor, ...]
+    coordinate_names: tuple[str, ...]
+    candidate_count: int
+    usable_candidate_count: int
+    warnings: tuple[str, ...] = ()
+
+
+def _suggestion_coordinate_value(record: FittedEECRecord, name: str) -> float | None:
+    if name == "cycle":
+        value = record.cycle
+    elif name == "potential_v":
+        value = record.potential_v
+    elif name == "current_ma":
+        value = record.current_ma
+    else:
+        value = record.custom_metadata.get(name)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _suggestion_coordinate_names(
+    target: FittedEECRecord,
+    candidates: list[FittedEECRecord],
+) -> tuple[str, ...]:
+    names = ["cycle", "potential_v", "current_ma"]
+    cycle_mod_names = sorted(
+        {
+            name
+            for record in [target, *candidates]
+            for name in record.custom_metadata
+            if re.fullmatch(r"Cycle mod(?: \d+)?", str(name), flags=re.IGNORECASE)
+        }
+    )
+    names.extend(cycle_mod_names)
+    return tuple(
+        name
+        for name in names
+        if _suggestion_coordinate_value(target, name) is not None
+        and any(_suggestion_coordinate_value(record, name) is not None for record in candidates)
+    )
+
+
+def suggest_eec_parameters(
+    target: FittedEECRecord,
+    records: Iterable[FittedEECRecord],
+    *,
+    max_neighbors: int = 5,
+) -> EECParameterSuggestion:
+    """Suggest target initials from nearby, structurally compatible fits.
+
+    Coordinates are independently range-normalized. Positive parameters use a
+    weighted geometric mean so values spanning decades remain smooth; other
+    values use a weighted arithmetic mean.
+    """
+    if int(max_neighbors) < 1:
+        raise ValueError("max_neighbors must be positive")
+    candidates = [record for record in records if record.identity != target.identity]
+    warnings: list[str] = []
+    compatible: list[tuple[FittedEECRecord, dict[str, float]]] = []
+    target_names = tuple(target.parameter_names)
+    target_name_set = set(target_names)
+    for record in candidates:
+        mapping = parameter_name_mapping(record.circuit, target.circuit)
+        if mapping is None:
+            warnings.append(f"{record.identity}: incompatible circuit")
+            continue
+        fitted = np.asarray(record.fitted_parameters, dtype=float).reshape(-1)
+        if fitted.size != len(record.parameter_names):
+            warnings.append(f"{record.identity}: incompatible parameter vector")
+            continue
+        mapped: dict[str, float] = {}
+        for name, value in zip(record.parameter_names, fitted):
+            target_name = map_parameter_name(name, mapping)
+            if target_name is None or target_name in mapped:
+                continue
+            mapped[target_name] = float(value)
+        if set(mapped) != target_name_set or not np.isfinite(
+            np.asarray([mapped[name] for name in target_names], dtype=float)
+        ).all():
+            warnings.append(f"{record.identity}: missing or invalid parameters")
+            continue
+        compatible.append((record, mapped))
+
+    coordinate_names = _suggestion_coordinate_names(
+        target, [record for record, _mapped in compatible]
+    )
+    if not coordinate_names:
+        return EECParameterSuggestion(
+            {}, (), (), len(candidates), 0,
+            tuple(warnings + ["no finite suggestion coordinates are available"]),
+        )
+    target_coordinates = np.asarray(
+        [_suggestion_coordinate_value(target, name) for name in coordinate_names],
+        dtype=float,
+    )
+    usable: list[tuple[FittedEECRecord, dict[str, float], float]] = []
+    scales = []
+    for name in coordinate_names:
+        values = [
+            value
+            for value in [_suggestion_coordinate_value(target, name)]
+            + [
+                _suggestion_coordinate_value(record, name)
+                for record, _mapped in compatible
+            ]
+            if value is not None
+        ]
+        scale = max(values) - min(values) if values else 0.0
+        scales.append(float(scale))
+    active_dimensions = [index for index, scale in enumerate(scales) if scale > 0]
+    if not active_dimensions:
+        return EECParameterSuggestion(
+            {}, (), (), len(candidates), 0,
+            tuple(warnings + ["all suggestion coordinates are constant"]),
+        )
+    used_coordinate_names = tuple(coordinate_names[index] for index in active_dimensions)
+    for record, mapped in compatible:
+        values = [_suggestion_coordinate_value(record, name) for name in coordinate_names]
+        if any(value is None for value in values):
+            warnings.append(f"{record.identity}: missing suggestion coordinate")
+            continue
+        distance = float(
+            np.linalg.norm(
+                (np.asarray(values, dtype=float)[active_dimensions] - target_coordinates[active_dimensions])
+                / np.asarray(scales, dtype=float)[active_dimensions]
+            )
+        )
+        usable.append((record, mapped, distance))
+    usable.sort(key=lambda item: (item[2], item[0].identity))
+    usable_candidate_count = len(usable)
+    usable = usable[: int(max_neighbors)]
+    if not usable:
+        return EECParameterSuggestion(
+            {}, (), used_coordinate_names, len(candidates), 0,
+            tuple(warnings + ["no fitted spectra have complete suggestion coordinates"]),
+        )
+    exact = [item for item in usable if item[2] <= np.finfo(float).eps]
+    selected = exact or usable
+    distances = np.asarray([item[2] for item in selected], dtype=float)
+    weights = np.ones(distances.size, dtype=float) if exact else 1.0 / np.maximum(distances, 1e-12) ** 2
+    weights /= weights.sum()
+    values: dict[str, float] = {}
+    for name in target_names:
+        parameter_values = np.asarray([item[1][name] for item in selected], dtype=float)
+        if np.all(parameter_values > 0):
+            values[name] = float(np.exp(np.sum(weights * np.log(parameter_values))))
+        else:
+            values[name] = float(np.sum(weights * parameter_values))
+    contributors = tuple(
+        EECSuggestionContributor(item[0].identity, item[0].cycle, item[2])
+        for item in selected
+    )
+    return EECParameterSuggestion(
+        values,
+        contributors,
+        used_coordinate_names,
+        len(candidates),
+        usable_candidate_count,
+        tuple(warnings),
+    )
+
+
 @dataclass
 class LoadedProject:
     dataframe: object

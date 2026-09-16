@@ -48,6 +48,7 @@ from eis_services import (
     AutomaticEECModel,
     BatchFitReport,
     DRTComputation,
+    FittedEECRecord,
     FitTimeoutError,
     FitOptions,
     KKResiduals,
@@ -78,6 +79,7 @@ from eis_services import (
     load_project,
     load_projects,
     select_eec_model_from_hybrid_drt,
+    suggest_eec_parameters,
 )
 from load_and_label_eis import find_pattern_length
 from ml.gui_results import MLResult, load_ml_results, load_ml_results_payload, suggested_eec
@@ -1374,6 +1376,10 @@ class EISApplication:
             accelerator="Alt+S",
             command=self.fit,
         )
+        self.fit_menu.add_command(
+            label="Suggest EEC initials…",
+            command=self.suggest_eec_initials,
+        )
         self.fit_menu.add_separator()
         self.fit_menu.add_command(
             label="Batch down",
@@ -1449,6 +1455,7 @@ class EISApplication:
         self.root.configure(menu=menu_bar)
         self._fit_menu_actions = (
             "Fit selected spectrum",
+            "Suggest EEC initials…",
             "Batch down",
             "Batch fit selected down",
             "Batch fit selected up",
@@ -6259,23 +6266,29 @@ class EISApplication:
         self.initial_values_button.grid(
             row=1, column=0, columnspan=2, pady=3, sticky="ew"
         )
+        self.suggest_eec_button = ttk.Button(
+            actions, text="Suggest EEC initials…", command=self.suggest_eec_initials
+        )
+        self.suggest_eec_button.grid(
+            row=2, column=0, columnspan=2, pady=3, sticky="ew"
+        )
         ttk.Label(actions, text="Robust z threshold").grid(
-            row=2, column=0, padx=(0, 4), pady=3, sticky="w"
-        )
-        ttk.Entry(actions, textvariable=self.refine_z_threshold_var).grid(
-            row=2, column=1, padx=(4, 0), pady=3, sticky="ew"
-        )
-        ttk.Label(actions, text="Maximum refine iterations").grid(
             row=3, column=0, padx=(0, 4), pady=3, sticky="w"
         )
-        ttk.Entry(actions, textvariable=self.refine_max_iterations_var).grid(
+        ttk.Entry(actions, textvariable=self.refine_z_threshold_var).grid(
             row=3, column=1, padx=(4, 0), pady=3, sticky="ew"
+        )
+        ttk.Label(actions, text="Maximum refine iterations").grid(
+            row=4, column=0, padx=(0, 4), pady=3, sticky="w"
+        )
+        ttk.Entry(actions, textvariable=self.refine_max_iterations_var).grid(
+            row=4, column=1, padx=(4, 0), pady=3, sticky="ew"
         )
         self.refine_fit_button = ttk.Button(
             actions, text="Refine fit", command=self.refine_fit_selected
         )
         self.refine_fit_button.grid(
-            row=4, column=0, columnspan=2, pady=3, sticky="ew"
+            row=5, column=0, columnspan=2, pady=3, sticky="ew"
         )
         self.stop_fit_button = ttk.Button(
             actions, text="Stop", command=self._cancel_fit, state="disabled"
@@ -6445,6 +6458,7 @@ class EISApplication:
             self.drt_apply_lower_selected_button,
             self.drt_apply_upper_selected_button,
             self.initial_values_button,
+            self.suggest_eec_button,
             self.outlier_selected_button,
             self.deterministic_outlier_button,
             self.reset_button,
@@ -13138,6 +13152,153 @@ class EISApplication:
         self._update_status(
             f"initial parameters copied from spectrum {source_spectrum.cycle}"
         )
+
+    def _collect_eec_suggestion_records(self) -> list[FittedEECRecord]:
+        records: list[FittedEECRecord] = []
+        for dataset_id in self._dataset_order:
+            loaded = self.loaded_projects[dataset_id]
+            for spectrum in loaded.spectra:
+                cycle = loaded.state.cycles.get(spectrum.cycle)
+                if cycle is None or cycle.fit_parameters is None:
+                    continue
+                values = np.asarray(cycle.fit_parameters, dtype=float).reshape(-1)
+                if values.size != len(cycle.parameters):
+                    continue
+                metadata = dict(cycle.custom_metadata)
+                metadata.update(spectrum.custom_metadata)
+                metadata.setdefault("Cycle mod 15", int(spectrum.cycle) % 15)
+                records.append(
+                    FittedEECRecord(
+                        identity=f"{dataset_id}::cycle-{spectrum.cycle}",
+                        cycle=int(spectrum.cycle),
+                        potential_v=float(cycle.potential_v),
+                        current_ma=float(cycle.current_ma),
+                        circuit=cycle.model(loaded.state.circuit),
+                        parameter_names=tuple(parameter.name for parameter in cycle.parameters),
+                        fitted_parameters=tuple(float(value) for value in values),
+                        custom_metadata=metadata,
+                    )
+                )
+        return records
+
+    def suggest_eec_initials(self) -> None:
+        if self.state is None or self.busy or not self._capture_controls():
+            return
+        cycle = self.state.active
+        target_identity = f"{self.current_dataset_id}::cycle-{cycle.cycle}"
+        target = FittedEECRecord(
+            identity=target_identity,
+            cycle=int(cycle.cycle),
+            potential_v=float(cycle.potential_v),
+            current_ma=float(cycle.current_ma),
+            circuit=cycle.model(self.state.circuit),
+            parameter_names=tuple(parameter.name for parameter in cycle.parameters),
+            fitted_parameters=(),
+            custom_metadata={
+                **dict(cycle.custom_metadata),
+                "Cycle mod 15": int(cycle.cycle) % 15,
+            },
+        )
+        suggestion = suggest_eec_parameters(target, self._collect_eec_suggestion_records())
+        if not suggestion.values:
+            message = "No compatible fitted spectra are available for this spectrum."
+            if suggestion.warnings:
+                message += "\n\n" + "\n".join(suggestion.warnings[:8])
+            messagebox.showwarning("EEC suggestion unavailable", message, parent=self.root)
+            return
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Suggested EEC initials")
+        popup.transient(self.root)
+        popup.grab_set()
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+        ttk.Label(
+            popup,
+            text=(
+                f"Used {suggestion.usable_candidate_count} of {suggestion.candidate_count} "
+                f"fitted spectra; coordinates: {', '.join(suggestion.coordinate_names)}"
+            ),
+            padding=8,
+            wraplength=720,
+        ).grid(row=0, column=0, sticky="ew")
+        content = ttk.Frame(popup, padding=(8, 0, 8, 8))
+        content.grid(row=1, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(0, weight=1)
+        table = ttk.Treeview(
+            content,
+            columns=("current", "suggested", "change"),
+            show="tree headings",
+            height=max(4, min(14, len(suggestion.values))),
+        )
+        table.heading("#0", text="Parameter")
+        table.heading("current", text="Current initial")
+        table.heading("suggested", text="Suggested")
+        table.heading("change", text="Change")
+        table.column("#0", width=150, anchor="w")
+        for column in ("current", "suggested", "change"):
+            table.column(column, width=120, anchor="e")
+        current_by_name = {parameter.name: parameter for parameter in cycle.parameters}
+        for name, value in suggestion.values.items():
+            current = current_by_name[name].initial
+            table.insert(
+                "",
+                "end",
+                text=name,
+                values=(f"{current:.6g}", f"{value:.6g}", f"{value - current:+.6g}"),
+            )
+        table.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(content, orient="vertical", command=table.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        table.configure(yscrollcommand=scrollbar.set)
+        contributors = "\n".join(
+            f"{item.identity} (distance {item.distance:.4g})"
+            for item in suggestion.contributors
+        )
+        details = f"Contributing spectra:\n{contributors}"
+        if suggestion.warnings:
+            details += "\n\nWarnings:\n" + "\n".join(suggestion.warnings[:8])
+        ttk.Label(content, text=details, justify="left", wraplength=720).grid(
+            row=1, column=0, columnspan=2, pady=(8, 0), sticky="w"
+        )
+        buttons = ttk.Frame(popup, padding=(8, 0, 8, 8))
+        buttons.grid(row=2, column=0, sticky="e")
+
+        def apply_suggestion() -> None:
+            if self.state is None or self.current_dataset_id is None:
+                popup.destroy()
+                return
+            current_cycle = self.state.active
+            current_identity = f"{self.current_dataset_id}::cycle-{current_cycle.cycle}"
+            if current_identity != target_identity or current_cycle.model(self.state.circuit) != target.circuit:
+                messagebox.showwarning(
+                    "Suggestion expired",
+                    "The active spectrum or fitting model changed; calculate a new suggestion.",
+                    parent=popup,
+                )
+                popup.destroy()
+                return
+            if not self._capture_controls():
+                return
+            parameters = self.state.parameters_for(self.state.active_cycle)
+            for parameter in parameters:
+                parameter.initial = float(
+                    self._clamp_parameter_value(
+                        suggestion.values[parameter.name], parameter.lower, parameter.upper
+                    )
+                )
+            current_cycle.parameters = parameters
+            current_cycle.clear_fit()
+            self.parameter_table.set_parameters(parameters)
+            self._refresh_plot(rescale=True)
+            self._update_status("suggested EEC initials applied")
+            popup.destroy()
+
+        ttk.Button(buttons, text="Cancel", command=popup.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(buttons, text="Apply initials", command=apply_suggestion).pack(side=tk.RIGHT)
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+        popup.minsize(620, 360)
 
     def copy_neighbor_fit_settings(self, direction: int) -> None:
         if self.state is None or self.busy or not self._capture_controls():
