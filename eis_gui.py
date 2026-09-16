@@ -13237,63 +13237,88 @@ class EISApplication:
         popup.title("Suggested EEC initials")
         popup.transient(self.root)
         popup.grab_set()
-        popup.geometry("760x620")
+        popup.geometry("1000x620")
         popup.columnconfigure(0, weight=1)
         popup.rowconfigure(1, weight=1)
-        warning_text = ""
-        if suggestion.warnings:
-            warning_text = "\nWarnings: " + " | ".join(suggestion.warnings[:4])
         ttk.Label(
             popup,
             text=(
                 f"Used {suggestion.usable_candidate_count} of {suggestion.candidate_count} "
                 f"fitted spectra; coordinates: {', '.join(suggestion.coordinate_names)}"
-                f"{warning_text}"
             ),
             padding=8,
-            wraplength=740,
+            wraplength=960,
             justify="left",
         ).grid(row=0, column=0, sticky="ew")
         content = ttk.Frame(popup, padding=(8, 0, 8, 8))
         content.grid(row=1, column=0, sticky="nsew")
         content.columnconfigure(0, weight=1)
-        content.rowconfigure(0, weight=1)
+        content.rowconfigure(1, weight=1)
+        metadata = dict(cycle.custom_metadata)
+        time_value = cycle.time_s
+        if time_value is None:
+            for key in ("Time", "time/s", "time_s"):
+                if metadata.get(key) not in (None, ""):
+                    try:
+                        time_value = float(metadata[key])
+                    except (TypeError, ValueError):
+                        pass
+                    break
+        cycle_mod_value = ""
+        for key, value in metadata.items():
+            if str(key).lower().startswith("cycle mod"):
+                cycle_mod_value = value
+                break
+        metadata_table = ttk.Treeview(
+            content,
+            columns=("cycle", "cycle_mod", "voltage", "current", "time", "project", "circuit"),
+            show="headings",
+            height=1,
+        )
+        for column, heading in (
+            ("cycle", "Cycle"),
+            ("cycle_mod", "Cycle mod"),
+            ("voltage", "Voltage (V)"),
+            ("current", "Current (mA)"),
+            ("time", "Time (s)"),
+            ("project", "Project"),
+            ("circuit", "Circuit"),
+        ):
+            metadata_table.heading(column, text=heading)
+        metadata_table.column("cycle", width=70, anchor="e")
+        metadata_table.column("cycle_mod", width=90, anchor="e")
+        metadata_table.column("voltage", width=100, anchor="e")
+        metadata_table.column("current", width=110, anchor="e")
+        metadata_table.column("time", width=100, anchor="e")
+        metadata_table.column("project", width=150, anchor="w")
+        metadata_table.column("circuit", width=230, anchor="w")
+        metadata_table.insert(
+            "",
+            "end",
+            values=(
+                cycle.cycle,
+                cycle_mod_value,
+                f"{cycle.potential_v:.6g}",
+                f"{cycle.current_ma:.6g}",
+                "" if time_value is None else f"{time_value:.6g}",
+                str(self.loaded.dataset_label if self.loaded is not None else self.current_dataset_id),
+                target.circuit,
+            ),
+        )
+        metadata_table.grid(row=0, column=0, columnspan=2, pady=(0, 8), sticky="ew")
         table = ttk.Treeview(
             content,
             columns=("current", "suggested", "change"),
             show="tree headings",
-            height=max(8, min(20, len(suggestion.values) + 8)),
+            height=max(6, min(16, len(suggestion.values))),
         )
-        table.heading("#0", text="Spectrum metadata / parameter")
-        table.heading("current", text="Value / current initial")
+        table.heading("#0", text="Parameter")
+        table.heading("current", text="Current initial")
         table.heading("suggested", text="Suggested")
         table.heading("change", text="Change")
-        table.column("#0", width=260, anchor="w")
+        table.column("#0", width=220, anchor="w")
         for column in ("current", "suggested", "change"):
             table.column(column, width=120, anchor="e")
-        metadata = [
-            ("Cycle", f"{cycle.cycle}"),
-            ("Voltage (V)", f"{cycle.potential_v:.6g}"),
-            ("Current (mA)", f"{cycle.current_ma:.6g}"),
-        ]
-        if cycle.time_s is not None:
-            metadata.append(("Time (s)", f"{cycle.time_s:.6g}"))
-        for key, value in cycle.custom_metadata.items():
-            if key in {"Time", "time/s"} or key.startswith("_ml_"):
-                continue
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError):
-                if value is None:
-                    continue
-                display_value = str(value)
-            else:
-                display_value = f"{numeric:.6g}" if np.isfinite(numeric) else str(value)
-            metadata.append((str(key), display_value))
-        metadata.append(("Circuit", target.circuit))
-        for name, value in metadata:
-            table.insert("", "end", text=name, values=(value, "", ""), tags=("metadata",))
-        table.insert("", "end", text="Parameters", values=("", "", ""), tags=("section",))
         current_by_name = {parameter.name: parameter for parameter in cycle.parameters}
         for name, value in suggestion.values.items():
             current = current_by_name[name].initial
@@ -13303,11 +13328,9 @@ class EISApplication:
                 text=name,
                 values=(f"{current:.6g}", f"{value:.6g}", f"{value - current:+.6g}"),
             )
-        table.tag_configure("metadata", foreground="#555555")
-        table.tag_configure("section", foreground="#004b76", font=("TkDefaultFont", 9, "bold"))
-        table.grid(row=0, column=0, sticky="nsew")
+        table.grid(row=1, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(content, orient="vertical", command=table.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar.grid(row=1, column=1, sticky="ns")
         table.configure(yscrollcommand=scrollbar.set)
         buttons = ttk.Frame(popup, padding=(8, 0, 8, 8))
         buttons.grid(row=2, column=0, sticky="e")
