@@ -6212,13 +6212,21 @@ class EISApplication:
             variable=self.auto_max_frequency_var,
             command=self._toggle_auto_max_frequency,
         ).grid(row=0, column=4, padx=(8, 0), pady=2, sticky="w")
-        self.frequency_selected_button = ttk.Button(
+        self.frequency_lower_selected_button = ttk.Button(
             options_group,
-            text="Apply to selected spectra",
-            command=self.apply_frequency_window_to_selected,
+            text="Apply lower to selected spectra",
+            command=lambda: self.apply_frequency_window_to_selected("lower"),
         )
-        self.frequency_selected_button.grid(
-            row=1, column=0, columnspan=5, padx=0, pady=(6, 0), sticky="ew"
+        self.frequency_lower_selected_button.grid(
+            row=1, column=0, columnspan=2, padx=(0, 3), pady=(6, 0), sticky="ew"
+        )
+        self.frequency_upper_selected_button = ttk.Button(
+            options_group,
+            text="Apply upper to selected spectra",
+            command=lambda: self.apply_frequency_window_to_selected("upper"),
+        )
+        self.frequency_upper_selected_button.grid(
+            row=1, column=2, columnspan=3, padx=(3, 0), pady=(6, 0), sticky="ew"
         )
         self.minimum_frequency_var.trace_add("write", self._schedule_frequency_application)
         self.maximum_frequency_var.trace_add("write", self._schedule_frequency_application)
@@ -6489,7 +6497,8 @@ class EISApplication:
             self.plot_fit_parameters_button,
             self.plot_drt_parameters_button,
             self.edit_metadata_button,
-            self.frequency_selected_button,
+            self.frequency_lower_selected_button,
+            self.frequency_upper_selected_button,
             self.model_button,
             self.model_selected_button,
             self.sort_tau_selected_button,
@@ -10926,7 +10935,9 @@ class EISApplication:
             self._refresh_plot(rescale=True)
             self._update_status("frequency range applied")
 
-    def apply_frequency_window_to_selected(self) -> None:
+    def apply_frequency_window_to_selected(self, limit: str | None = None) -> None:
+        if limit not in {None, "lower", "upper"}:
+            raise ValueError(f"unknown frequency limit: {limit}")
         if self.state is None or not self._capture_controls():
             return
         selected_rows = self._selected_spectrum_rows()
@@ -10939,23 +10950,43 @@ class EISApplication:
         updated = 0
         for _dataset_id, loaded, spectrum in selected_rows:
             cycle = self._loaded_cycle_for_popup(loaded, spectrum.cycle)
-            cycle.auto_max_frequency = self.auto_max_frequency_var.get()
-            selected_window = window
-            if self.auto_max_frequency_var.get():
+            if cycle.frequency_window is not None:
+                current_minimum, current_maximum = cycle.frequency_window
+            else:
+                valid_frequencies = np.asarray(cycle.frequency_hz, dtype=float)
+                valid_frequencies = valid_frequencies[
+                    np.isfinite(valid_frequencies) & (valid_frequencies > 0)
+                ]
+                if valid_frequencies.size == 0:
+                    continue
+                current_minimum = float(np.min(valid_frequencies))
+                current_maximum = float(np.max(valid_frequencies))
+
+            selected_minimum = current_minimum if limit == "upper" else minimum
+            selected_maximum = current_maximum if limit == "lower" else maximum
+            if limit in {None, "upper"} and self.auto_max_frequency_var.get():
                 detected_maximum = self._automatic_max_frequency(cycle)
                 if detected_maximum is not None:
-                    selected_window = (
-                        min(minimum, detected_maximum),
-                        detected_maximum,
-                    )
-            cycle.frequency_window = selected_window
+                    selected_maximum = detected_maximum
+            if selected_minimum > selected_maximum:
+                if limit == "lower":
+                    selected_minimum = selected_maximum
+                else:
+                    selected_maximum = selected_minimum
+            if limit in {None, "upper"}:
+                cycle.auto_max_frequency = self.auto_max_frequency_var.get()
+            cycle.frequency_window = (selected_minimum, selected_maximum)
             cycle.invalidate_drt_cache()
             cycle.clear_fit()
             updated += 1
         self._refresh_plot(rescale=True)
-        self._update_status(
-            f"frequency range applied to {updated} selected spectra"
-        )
+        if limit == "lower":
+            action = "lower frequency limit applied"
+        elif limit == "upper":
+            action = "upper frequency limit applied"
+        else:
+            action = "frequency range applied"
+        self._update_status(f"{action} to {updated} selected spectra")
 
     def _configure_cycle_model(
         self,
