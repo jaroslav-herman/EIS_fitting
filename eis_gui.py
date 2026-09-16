@@ -13408,6 +13408,9 @@ class EISApplication:
                 "none of the selected spectra has a fitted EEC parameter vector"
             )
             return
+        self._last_eec_anomaly_records = {
+            record.identity: record for record in target_records
+        }
         calibration_path = ML_TRAINED_MODELS["Sputtered cathode"]
         self.status_var.set(
             f"Detecting EEC parameter anomalies in {len(target_records)} selected spectra…"
@@ -13445,13 +13448,23 @@ class EISApplication:
         content.grid(row=1, column=0, sticky="nsew")
         content.columnconfigure(0, weight=1)
         content.rowconfigure(0, weight=1)
+        content.rowconfigure(1, weight=1)
         table = ttk.Treeview(
             content,
-            columns=("status", "score", "neighbors", "distance", "parameters"),
+            columns=(
+                "identity", "cycle", "cycle_mod", "voltage", "current", "time",
+                "status", "score", "neighbors", "distance", "parameters",
+            ),
             show="headings",
-            height=max(8, min(24, len(report.results))),
+            height=max(6, min(12, len(report.results))),
         )
         headings = {
+            "identity": "Spectrum",
+            "cycle": "Cycle",
+            "cycle_mod": "Cycle mod",
+            "voltage": "Voltage (V)",
+            "current": "Current (mA)",
+            "time": "Time (s)",
             "status": "Status",
             "score": "Aggregate score",
             "neighbors": "Neighbors",
@@ -13460,6 +13473,12 @@ class EISApplication:
         }
         for column, heading in headings.items():
             table.heading(column, text=heading)
+        table.column("identity", width=210, anchor="w")
+        table.column("cycle", width=65, anchor="e")
+        table.column("cycle_mod", width=80, anchor="e")
+        table.column("voltage", width=95, anchor="e")
+        table.column("current", width=105, anchor="e")
+        table.column("time", width=90, anchor="e")
         table.column("status", width=150, anchor="w")
         table.column("score", width=110, anchor="e")
         table.column("neighbors", width=85, anchor="e")
@@ -13467,10 +13486,26 @@ class EISApplication:
         table.column("parameters", width=260, anchor="w")
         result_by_item: dict[str, object] = {}
         for index, result in enumerate(report.results):
+            record = getattr(self, "_last_eec_anomaly_records", {}).get(result.identity)
+            metadata = dict(record.custom_metadata) if record is not None else {}
+            cycle_mod = next(
+                (value for key, value in metadata.items()
+                 if str(key).lower().startswith("cycle mod")),
+                "",
+            )
+            time_value = record.custom_metadata.get("Time") if record is not None else None
+            if time_value in (None, "") and record is not None:
+                time_value = record.custom_metadata.get("time/s")
             item = table.insert(
                 "",
                 "end",
                 values=(
+                    result.identity,
+                    result.cycle,
+                    cycle_mod,
+                    "" if record is None else f"{record.potential_v:.6g}",
+                    "" if record is None else f"{record.current_ma:.6g}",
+                    "" if time_value in (None, "") else str(time_value),
                     result.status,
                     "—" if result.aggregate_score is None else f"{result.aggregate_score:.4g}",
                     result.neighbor_count,
@@ -13493,38 +13528,49 @@ class EISApplication:
         scrollbar = ttk.Scrollbar(content, orient="vertical", command=table.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         table.configure(yscrollcommand=scrollbar.set)
-        details_var = tk.StringVar()
-        ttk.Label(
+        details_table = ttk.Treeview(
             content,
-            textvariable=details_var,
-            justify="left",
-            wraplength=960,
-        ).grid(row=1, column=0, columnspan=2, pady=(8, 0), sticky="w")
+            columns=("actual", "expected", "residual", "interval", "score", "status"),
+            show="tree headings",
+        )
+        details_table.heading("#0", text="Parameter")
+        details_table.heading("actual", text="Actual")
+        details_table.heading("expected", text="Local expected")
+        details_table.heading("residual", text="Residual")
+        details_table.heading("interval", text="Learned interval")
+        details_table.heading("score", text="Score")
+        details_table.heading("status", text="Status")
+        details_table.column("#0", width=180, anchor="w")
+        for column in ("actual", "expected", "residual", "interval", "score"):
+            details_table.column(column, width=125, anchor="e")
+        details_table.column("status", width=110, anchor="w")
+        details_table.tag_configure("anomalous", foreground="#a00000")
+        details_table.grid(row=1, column=0, columnspan=2, pady=(8, 0), sticky="nsew")
 
         def show_details(_event=None) -> None:
             selection = table.selection()
             if not selection:
-                details_var.set("")
+                for item in details_table.get_children():
+                    details_table.delete(item)
                 return
             result = result_by_item[selection[0]]
-            lines = [f"{result.identity} · cycle {result.cycle}"]
+            for item in details_table.get_children():
+                details_table.delete(item)
             for parameter in result.parameters:
-                state = "ANOMALOUS" if parameter.anomalous else "normal"
-                reliability = parameter.reliability or "unknown reliability"
-                training = (
-                    f", {parameter.training_spectra} training spectra"
-                    if parameter.training_spectra is not None
-                    else ""
+                details_table.insert(
+                    "",
+                    "end",
+                    text=parameter.parameter_name,
+                    values=(
+                        f"{parameter.actual_value:.6g}",
+                        f"{parameter.expected_value:.6g}",
+                        f"{parameter.transformed_residual:.6g}",
+                        f"[{parameter.lower_residual:.6g}, {parameter.upper_residual:.6g}]",
+                        f"{parameter.normalized_score:.4g}",
+                        "ANOMALOUS" if parameter.anomalous else "normal",
+                    ),
+                    tags=("anomalous",) if parameter.anomalous else (),
                 )
-                lines.append(
-                    f"{parameter.parameter_name}: {state}; actual={parameter.actual_value:.6g}, "
-                    f"local={parameter.expected_value:.6g}, residual={parameter.transformed_residual:.6g}, "
-                    f"interval=[{parameter.lower_residual:.6g}, {parameter.upper_residual:.6g}], "
-                    f"score={parameter.normalized_score:.4g}, {reliability}{training}"
-                )
-            if result.warnings:
-                lines.append("Warnings: " + " | ".join(result.warnings))
-            details_var.set("\n".join(lines))
 
         table.bind("<<TreeviewSelect>>", show_details)
         if report.results:
@@ -13535,7 +13581,8 @@ class EISApplication:
         ttk.Button(popup, text="Close", command=popup.destroy).grid(
             row=2, column=0, padx=8, pady=(0, 8), sticky="e"
         )
-        popup.minsize(900, 500)
+        popup.geometry("1500x760")
+        popup.minsize(1200, 620)
         self._update_status(
             f"EEC anomaly detection complete: {report.anomalous_count} anomalous spectra"
         )
