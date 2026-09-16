@@ -82,6 +82,231 @@ class EECParameterSuggestion:
     warnings: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class EECAnomalyCalibration:
+    """Learned transformed-space thresholds for fitted EEC parameters."""
+
+    parameter_limits: dict[str, dict[str, object]]
+    parameter_stats: dict[str, dict[str, object]]
+    circuit_classes: tuple[str, ...]
+    source: str
+
+    @classmethod
+    def from_bundle(cls, bundle, *, source: str = "ML bundle") -> "EECAnomalyCalibration":
+        return cls(
+            parameter_limits=dict(getattr(bundle, "parameter_limits", {}) or {}),
+            parameter_stats=dict(getattr(bundle, "parameter_stats", {}) or {}),
+            circuit_classes=tuple(str(value) for value in getattr(bundle, "circuit_classes", ()) or ()),
+            source=str(source),
+        )
+
+    def lookup(self, circuit: str, parameter_name: str) -> dict[str, object] | None:
+        for known_circuit in self.circuit_classes:
+            mapping = parameter_name_mapping(circuit, known_circuit)
+            if mapping is None:
+                continue
+            known_name = map_parameter_name(parameter_name, mapping)
+            if known_name is None:
+                continue
+            key = f"{known_circuit}::{known_name}"
+            limits = self.parameter_limits.get(key)
+            if limits is None:
+                continue
+            result = dict(limits)
+            result["calibration_key"] = key
+            result["parameter_name"] = known_name
+            result["training_stats"] = dict(self.parameter_stats.get(key, {}))
+            return result
+        return None
+
+
+def load_eec_anomaly_calibration(path) -> EECAnomalyCalibration:
+    """Load anomaly thresholds from an existing serialized ML pipeline."""
+    from ml.number_aware_pipeline import load_pipeline_bundle
+
+    path = str(path)
+    bundle = load_pipeline_bundle(path)
+    return EECAnomalyCalibration.from_bundle(bundle, source=path)
+
+
+@dataclass(frozen=True)
+class EECParameterAnomaly:
+    parameter_name: str
+    actual_value: float
+    expected_value: float
+    transformed_residual: float
+    lower_residual: float
+    upper_residual: float
+    normalized_score: float
+    anomalous: bool
+    reliability: str | None
+    training_spectra: int | None
+    threshold_source: str
+
+
+@dataclass(frozen=True)
+class EECAnomalyResult:
+    identity: str
+    cycle: int
+    neighbor_count: int
+    maximum_neighbor_distance: float | None
+    aggregate_score: float | None
+    status: str
+    parameters: tuple[EECParameterAnomaly, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class EECAnomalyReport:
+    results: tuple[EECAnomalyResult, ...]
+    calibration_source: str
+    anomalous_count: int
+    warnings: tuple[str, ...] = ()
+
+
+def _anomaly_parameter_transform(name: str, value: float) -> float | None:
+    value = float(value)
+    if not np.isfinite(value):
+        return None
+    if name.startswith(("R", "L")) or (name.startswith("CPE") and not name.endswith("_1")):
+        return float(np.log10(value)) if value > 0 else None
+    if name.startswith("CPE") and name.endswith("_1"):
+        clipped = float(np.clip(value, 1.0e-6, 1.0 - 1.0e-6))
+        return float(np.log(clipped / (1.0 - clipped)))
+    return value
+
+
+def _anomaly_score(residual: float, lower: float, upper: float) -> tuple[float, bool]:
+    if residual < lower:
+        denominator = max(abs(lower), np.finfo(float).eps)
+        return float(abs(residual) / denominator), True
+    if residual > upper:
+        denominator = max(abs(upper), np.finfo(float).eps)
+        return float(abs(residual) / denominator), True
+    return 0.0, False
+
+
+def detect_eec_parameter_anomalies(
+    records: Iterable[FittedEECRecord],
+    calibration: EECAnomalyCalibration,
+    *,
+    max_neighbors: int = 5,
+    minimum_neighbors: int = 3,
+) -> EECAnomalyReport:
+    """Detect fitted EEC parameters that exceed learned local residual limits."""
+    if int(max_neighbors) < 1:
+        raise ValueError("max_neighbors must be positive")
+    if int(minimum_neighbors) < 1 or int(minimum_neighbors) > int(max_neighbors):
+        raise ValueError("minimum_neighbors must be between 1 and max_neighbors")
+    records = tuple(records)
+    results: list[EECAnomalyResult] = []
+    report_warnings: list[str] = []
+    for target in records:
+        if len(target.parameter_names) != len(target.fitted_parameters):
+            results.append(
+                EECAnomalyResult(
+                    target.identity,
+                    target.cycle,
+                    0,
+                    None,
+                    None,
+                    "invalid_fit",
+                    warnings=("fitted parameter vector does not match parameter names",),
+                )
+            )
+            continue
+        suggestion = suggest_eec_parameters(target, records, max_neighbors=max_neighbors)
+        neighbor_count = len(suggestion.contributors)
+        maximum_distance = (
+            max(item.distance for item in suggestion.contributors)
+            if suggestion.contributors
+            else None
+        )
+        warnings = list(suggestion.warnings)
+        if neighbor_count < int(minimum_neighbors):
+            results.append(
+                EECAnomalyResult(
+                    target.identity,
+                    target.cycle,
+                    neighbor_count,
+                    maximum_distance,
+                    None,
+                    "insufficient_neighbors",
+                    warnings=tuple(warnings + [
+                        f"at least {int(minimum_neighbors)} compatible neighbors are required"
+                    ]),
+                )
+            )
+            continue
+        anomalies: list[EECParameterAnomaly] = []
+        uncalibrated: list[str] = []
+        for name, expected_value in suggestion.values.items():
+            actual_index = target.parameter_names.index(name)
+            actual_value = float(target.fitted_parameters[actual_index])
+            actual_transformed = _anomaly_parameter_transform(name, actual_value)
+            expected_transformed = _anomaly_parameter_transform(name, expected_value)
+            threshold = calibration.lookup(target.circuit, name)
+            if actual_transformed is None or expected_transformed is None:
+                warnings.append(f"{name}: value cannot be transformed for comparison")
+                continue
+            if threshold is None:
+                uncalibrated.append(name)
+                continue
+            try:
+                lower = float(threshold["lower_residual"])
+                upper = float(threshold["upper_residual"])
+            except (KeyError, TypeError, ValueError):
+                uncalibrated.append(name)
+                continue
+            if not np.isfinite(lower) or not np.isfinite(upper) or upper < lower:
+                uncalibrated.append(name)
+                continue
+            residual = actual_transformed - expected_transformed
+            score, anomalous = _anomaly_score(residual, lower, upper)
+            stats = threshold.get("training_stats", {})
+            reliability = threshold.get("reliability") or stats.get("reliability")
+            training_spectra = threshold.get("training_spectra") or stats.get("training_spectra")
+            anomalies.append(
+                EECParameterAnomaly(
+                    name,
+                    actual_value,
+                    float(expected_value),
+                    float(residual),
+                    lower,
+                    upper,
+                    score,
+                    anomalous,
+                    str(reliability) if reliability is not None else None,
+                    int(training_spectra) if training_spectra is not None else None,
+                    calibration.source,
+                )
+            )
+        if uncalibrated:
+            warnings.append("uncalibrated parameters: " + ", ".join(uncalibrated))
+        if not anomalies:
+            status = "uncalibrated"
+            aggregate_score = None
+        else:
+            aggregate_score = max(item.normalized_score for item in anomalies)
+            status = "anomalous" if any(item.anomalous for item in anomalies) else "normal"
+        results.append(
+            EECAnomalyResult(
+                target.identity,
+                target.cycle,
+                neighbor_count,
+                maximum_distance,
+                aggregate_score,
+                status,
+                tuple(anomalies),
+                tuple(warnings),
+            )
+        )
+    anomalous_count = sum(result.status == "anomalous" for result in results)
+    return EECAnomalyReport(
+        tuple(results), calibration.source, anomalous_count, tuple(report_warnings)
+    )
+
+
 def _suggestion_coordinate_value(record: FittedEECRecord, name: str) -> float | None:
     if name == "cycle":
         value = record.cycle

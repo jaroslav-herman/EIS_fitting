@@ -1,6 +1,12 @@
 import unittest
+from types import SimpleNamespace
 
-from eis_services import FittedEECRecord, suggest_eec_parameters
+from eis_services import (
+    EECAnomalyCalibration,
+    detect_eec_parameter_anomalies,
+    FittedEECRecord,
+    suggest_eec_parameters,
+)
 
 
 def record(
@@ -96,6 +102,80 @@ class EECSuggestionTests(unittest.TestCase):
         result = suggest_eec_parameters(target, [record("source", 3, (2.0,), current=1.0)])
         self.assertFalse(result.values)
         self.assertIn("constant", " ".join(result.warnings))
+
+    def test_anomaly_uses_learned_log_threshold_and_preserves_records(self):
+        circuit = "R0-p(R1,CPE1)"
+        names = ("R0", "R1", "CPE1_0", "CPE1_1")
+        target = record(
+            "target", 10, (10.0, 1.0, 1.0, 0.99), circuit=circuit,
+            names=names, current=10.0,
+        )
+        neighbors = [
+            record(f"neighbor-{cycle}", cycle, (1.0, 1.0, 1.0, 0.8), circuit=circuit,
+                   names=names, current=float(cycle))
+            for cycle in (8, 9, 11, 12)
+        ]
+        calibration = EECAnomalyCalibration.from_bundle(
+            SimpleNamespace(
+                circuit_classes=(circuit,),
+                parameter_limits={
+                    f"{circuit}::R0": {"lower_residual": -0.2, "upper_residual": 0.2, "reliability": "high", "training_spectra": 40},
+                    f"{circuit}::R1": {"lower_residual": -0.2, "upper_residual": 0.2, "reliability": "high", "training_spectra": 40},
+                    f"{circuit}::CPE1_0": {"lower_residual": -0.2, "upper_residual": 0.2, "reliability": "high", "training_spectra": 40},
+                    f"{circuit}::CPE1_1": {"lower_residual": -0.2, "upper_residual": 0.2, "reliability": "high", "training_spectra": 40},
+                },
+                parameter_stats={},
+            ),
+            source="synthetic ML bundle",
+        )
+        before = target.fitted_parameters
+        report = detect_eec_parameter_anomalies([target, *neighbors], calibration)
+        result = report.results[0]
+        self.assertEqual(result.status, "anomalous")
+        self.assertGreater(result.aggregate_score, 1.0)
+        self.assertEqual({item.parameter_name for item in result.parameters if item.anomalous}, {"R0", "CPE1_1"})
+        self.assertEqual(target.fitted_parameters, before)
+
+    def test_anomaly_reports_insufficient_neighbors_and_structural_lookup(self):
+        target = record(
+            "target", 3, (2.0, 3.0, 4.0, 5.0, 0.8), circuit="R0-p(CPE3,R2)-L5",
+            names=("R0", "L5", "R2", "CPE3_0", "CPE3_1"), current=3.0,
+        )
+        source = record(
+            "source", 2, (2.0, 3.0, 4.0, 5.0, 0.8),
+            circuit="R0-L0-p(R1,CPE1)",
+            names=("R0", "L0", "R1", "CPE1_0", "CPE1_1"), current=2.0,
+        )
+        calibration = EECAnomalyCalibration.from_bundle(
+            SimpleNamespace(
+                circuit_classes=("R0-L0-p(R1,CPE1)",),
+                parameter_limits={
+                    "R0-L0-p(R1,CPE1)::R0": {"lower_residual": -1.0, "upper_residual": 1.0},
+                },
+                parameter_stats={},
+            )
+        )
+        report = detect_eec_parameter_anomalies([target, source], calibration)
+        self.assertEqual(report.results[0].status, "insufficient_neighbors")
+        self.assertEqual(report.results[1].status, "insufficient_neighbors")
+
+    def test_uncalibrated_parameters_are_not_marked_anomalous(self):
+        target = record("target", 3, (2.0,), current=3.0)
+        neighbors = [record(str(cycle), cycle, (1.0,), current=float(cycle)) for cycle in (1, 2, 4)]
+        calibration = EECAnomalyCalibration(
+            parameter_limits={}, parameter_stats={}, circuit_classes=("R0",), source="empty"
+        )
+        report = detect_eec_parameter_anomalies([target, *neighbors], calibration)
+        self.assertEqual(report.results[0].status, "uncalibrated")
+        self.assertFalse(any(item.anomalous for item in report.results[0].parameters))
+
+    def test_invalid_target_fit_is_reported_without_mutation(self):
+        target = record("target", 1, (1.0,), names=("R0", "R1"))
+        calibration = EECAnomalyCalibration(
+            parameter_limits={}, parameter_stats={}, circuit_classes=("R0",), source="empty"
+        )
+        report = detect_eec_parameter_anomalies([target], calibration)
+        self.assertEqual(report.results[0].status, "invalid_fit")
 
 
 if __name__ == "__main__":

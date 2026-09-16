@@ -48,6 +48,7 @@ from eis_services import (
     AutomaticEECModel,
     BatchFitReport,
     DRTComputation,
+    EECAnomalyReport,
     FittedEECRecord,
     FitTimeoutError,
     FitOptions,
@@ -75,10 +76,12 @@ from eis_services import (
     inspect_eis_file_spectrum_kinds,
     refine_fit_cycle,
     load_cycle,
+    load_eec_anomaly_calibration,
     load_project_from_dataframe,
     load_project,
     load_projects,
     select_eec_model_from_hybrid_drt,
+    detect_eec_parameter_anomalies,
     suggest_eec_parameters,
 )
 from load_and_label_eis import find_pattern_length
@@ -1380,6 +1383,10 @@ class EISApplication:
             label="Suggest EEC initials…",
             command=self.suggest_eec_initials,
         )
+        self.fit_menu.add_command(
+            label="Detect EEC parameter anomalies…",
+            command=self.detect_eec_anomalies,
+        )
         self.fit_menu.add_separator()
         self.fit_menu.add_command(
             label="Batch down",
@@ -1456,6 +1463,7 @@ class EISApplication:
         self._fit_menu_actions = (
             "Fit selected spectrum",
             "Suggest EEC initials…",
+            "Detect EEC parameter anomalies…",
             "Batch down",
             "Batch fit selected down",
             "Batch fit selected up",
@@ -6272,28 +6280,36 @@ class EISApplication:
         self.suggest_eec_button.grid(
             row=2, column=0, columnspan=2, pady=3, sticky="ew"
         )
+        self.detect_eec_anomalies_button = ttk.Button(
+            actions,
+            text="Detect EEC parameter anomalies…",
+            command=self.detect_eec_anomalies,
+        )
+        self.detect_eec_anomalies_button.grid(
+            row=3, column=0, columnspan=2, pady=3, sticky="ew"
+        )
         ttk.Label(actions, text="Robust z threshold").grid(
-            row=3, column=0, padx=(0, 4), pady=3, sticky="w"
-        )
-        ttk.Entry(actions, textvariable=self.refine_z_threshold_var).grid(
-            row=3, column=1, padx=(4, 0), pady=3, sticky="ew"
-        )
-        ttk.Label(actions, text="Maximum refine iterations").grid(
             row=4, column=0, padx=(0, 4), pady=3, sticky="w"
         )
-        ttk.Entry(actions, textvariable=self.refine_max_iterations_var).grid(
+        ttk.Entry(actions, textvariable=self.refine_z_threshold_var).grid(
             row=4, column=1, padx=(4, 0), pady=3, sticky="ew"
+        )
+        ttk.Label(actions, text="Maximum refine iterations").grid(
+            row=5, column=0, padx=(0, 4), pady=3, sticky="w"
+        )
+        ttk.Entry(actions, textvariable=self.refine_max_iterations_var).grid(
+            row=5, column=1, padx=(4, 0), pady=3, sticky="ew"
         )
         self.refine_fit_button = ttk.Button(
             actions, text="Refine fit", command=self.refine_fit_selected
         )
         self.refine_fit_button.grid(
-            row=5, column=0, columnspan=2, pady=3, sticky="ew"
+            row=6, column=0, columnspan=2, pady=3, sticky="ew"
         )
         self.stop_fit_button = ttk.Button(
             actions, text="Stop", command=self._cancel_fit, state="disabled"
         )
-        self.stop_fit_button.grid(row=6, column=0, columnspan=2, pady=3, sticky="ew")
+        self.stop_fit_button.grid(row=7, column=0, columnspan=2, pady=3, sticky="ew")
         self.drt_tools_group = ttk.LabelFrame(parent, text="DRT analysis", padding=8)
         self.drt_tools_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self.drt_tools_group.columnconfigure(1, weight=1)
@@ -6459,6 +6475,7 @@ class EISApplication:
             self.drt_apply_upper_selected_button,
             self.initial_values_button,
             self.suggest_eec_button,
+            self.detect_eec_anomalies_button,
             self.outlier_selected_button,
             self.deterministic_outlier_button,
             self.reset_button,
@@ -13299,6 +13316,144 @@ class EISApplication:
         ttk.Button(buttons, text="Apply initials", command=apply_suggestion).pack(side=tk.RIGHT)
         popup.protocol("WM_DELETE_WINDOW", popup.destroy)
         popup.minsize(620, 360)
+
+    def detect_eec_anomalies(self) -> None:
+        if self.state is None or self.busy or not self._capture_controls():
+            return
+        records = self._collect_eec_suggestion_records()
+        if not records:
+            self._update_status("no fitted spectra are available for EEC anomaly detection")
+            return
+        calibration_path = ML_TRAINED_MODELS["Sputtered cathode"]
+        self.status_var.set(
+            f"Detecting EEC parameter anomalies in {len(records)} fitted spectra…"
+        )
+        self._submit(
+            lambda: detect_eec_parameter_anomalies(
+                records,
+                load_eec_anomaly_calibration(calibration_path),
+            ),
+            self._finish_eec_anomaly_detection,
+            "EEC anomaly detection failed",
+            operation_name="EEC parameter anomaly detection",
+        )
+
+    def _finish_eec_anomaly_detection(self, report: EECAnomalyReport) -> None:
+        self._last_eec_anomaly_report = report
+        popup = tk.Toplevel(self.root)
+        popup.title("EEC parameter anomalies")
+        popup.transient(self.root)
+        popup.columnconfigure(0, weight=1)
+        popup.rowconfigure(1, weight=1)
+        ttk.Label(
+            popup,
+            text=(
+                f"Calibration: {report.calibration_source}\n"
+                f"Detected {report.anomalous_count} anomalous spectrum(s); "
+                "this report does not modify fits or point selection."
+            ),
+            padding=8,
+            wraplength=960,
+            justify="left",
+        ).grid(row=0, column=0, sticky="ew")
+        content = ttk.Frame(popup, padding=(8, 0, 8, 8))
+        content.grid(row=1, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(0, weight=1)
+        table = ttk.Treeview(
+            content,
+            columns=("status", "score", "neighbors", "distance", "parameters"),
+            show="headings",
+            height=max(8, min(24, len(report.results))),
+        )
+        headings = {
+            "status": "Status",
+            "score": "Aggregate score",
+            "neighbors": "Neighbors",
+            "distance": "Max distance",
+            "parameters": "Anomalous parameters",
+        }
+        for column, heading in headings.items():
+            table.heading(column, text=heading)
+        table.column("status", width=150, anchor="w")
+        table.column("score", width=110, anchor="e")
+        table.column("neighbors", width=85, anchor="e")
+        table.column("distance", width=100, anchor="e")
+        table.column("parameters", width=260, anchor="w")
+        result_by_item: dict[str, object] = {}
+        for index, result in enumerate(report.results):
+            item = table.insert(
+                "",
+                "end",
+                values=(
+                    result.status,
+                    "—" if result.aggregate_score is None else f"{result.aggregate_score:.4g}",
+                    result.neighbor_count,
+                    "—"
+                    if result.maximum_neighbor_distance is None
+                    else f"{result.maximum_neighbor_distance:.4g}",
+                    ", ".join(
+                        parameter.parameter_name
+                        for parameter in result.parameters
+                        if parameter.anomalous
+                    ),
+                ),
+                tags=(result.status,),
+            )
+            result_by_item[item] = result
+        table.tag_configure("anomalous", foreground="#a00000")
+        table.tag_configure("insufficient_neighbors", foreground="#806000")
+        table.tag_configure("uncalibrated", foreground="#806000")
+        table.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(content, orient="vertical", command=table.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        table.configure(yscrollcommand=scrollbar.set)
+        details_var = tk.StringVar()
+        ttk.Label(
+            content,
+            textvariable=details_var,
+            justify="left",
+            wraplength=960,
+        ).grid(row=1, column=0, columnspan=2, pady=(8, 0), sticky="w")
+
+        def show_details(_event=None) -> None:
+            selection = table.selection()
+            if not selection:
+                details_var.set("")
+                return
+            result = result_by_item[selection[0]]
+            lines = [f"{result.identity} · cycle {result.cycle}"]
+            for parameter in result.parameters:
+                state = "ANOMALOUS" if parameter.anomalous else "normal"
+                reliability = parameter.reliability or "unknown reliability"
+                training = (
+                    f", {parameter.training_spectra} training spectra"
+                    if parameter.training_spectra is not None
+                    else ""
+                )
+                lines.append(
+                    f"{parameter.parameter_name}: {state}; actual={parameter.actual_value:.6g}, "
+                    f"local={parameter.expected_value:.6g}, residual={parameter.transformed_residual:.6g}, "
+                    f"interval=[{parameter.lower_residual:.6g}, {parameter.upper_residual:.6g}], "
+                    f"score={parameter.normalized_score:.4g}, {reliability}{training}"
+                )
+            if result.warnings:
+                lines.append("Warnings: " + " | ".join(result.warnings))
+            details_var.set("\n".join(lines))
+
+        table.bind("<<TreeviewSelect>>", show_details)
+        if report.results:
+            first = table.get_children()[0]
+            table.selection_set(first)
+            table.focus(first)
+            show_details()
+        ttk.Button(popup, text="Close", command=popup.destroy).grid(
+            row=2, column=0, padx=8, pady=(0, 8), sticky="e"
+        )
+        popup.minsize(900, 500)
+        self._update_status(
+            f"EEC anomaly detection complete: {report.anomalous_count} anomalous spectra"
+        )
 
     def copy_neighbor_fit_settings(self, direction: int) -> None:
         if self.state is None or self.busy or not self._capture_controls():
