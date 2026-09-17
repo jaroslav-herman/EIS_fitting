@@ -1211,6 +1211,7 @@ class EISApplication:
         self.fit_weight_modulus_var = tk.BooleanVar(value=self._fit_weight_modulus_preference)
         self.fit_jacobian_mode_var = tk.StringVar(value=self._fit_jacobian_mode_preference)
         self._last_fit_result = None
+        self._pending_edit_view_limits = None
         self.model_var = tk.StringVar(value=circuit)
         self.show_drt_var = tk.BooleanVar(value=False)
         self.show_kk_var = tk.BooleanVar(value=False)
@@ -2714,13 +2715,15 @@ class EISApplication:
         axes.set_ylim(*new_y)
 
     @staticmethod
-    def _create_zoom_rectangle(axes, xdata: float, ydata: float):
+    def _create_zoom_rectangle(
+        axes, xdata: float, ydata: float, color: str = "#1565c0"
+    ):
         rectangle = Rectangle(
             (xdata, ydata),
             0.0,
             0.0,
             fill=False,
-            edgecolor="#1565c0",
+            edgecolor=color,
             linestyle="--",
             linewidth=1.2,
             alpha=0.9,
@@ -2814,6 +2817,7 @@ class EISApplication:
                         event.inaxes, event.xdata, event.ydata
                     ),
                 }
+            canvas.draw_idle()
 
         def on_motion(event) -> None:
             state = canvas._eis_plot_navigation_state
@@ -10566,10 +10570,27 @@ class EISApplication:
         index = int(np.argmin(distances))
         if distances[index] > 10:
             return
+        view_limits = self._capture_plot_view_limits()
         cycle.toggle_point(index)
         self._refresh_plot(rescale=True)
+        self._restore_plot_view_limits(view_limits)
+        self._pending_edit_view_limits = (
+            view_limits if self.point_auto_fit else None
+        )
         self._update_status()
         self._fit_after_point_edit()
+
+    def _capture_plot_view_limits(self):
+        return {
+            axis: (axis.get_xlim(), axis.get_ylim())
+            for axis in self._active_plot_axes()
+        }
+
+    @staticmethod
+    def _restore_plot_view_limits(view_limits) -> None:
+        for axis, (x_limits, y_limits) in view_limits.items():
+            axis.set_xlim(*x_limits)
+            axis.set_ylim(*y_limits)
 
     def _on_plot_button_press(self, event) -> None:
         if (
@@ -10616,12 +10637,16 @@ class EISApplication:
                 "ydata": event.ydata,
             }
             if self._event_has_control(event):
+                state["rectangle"] = self._create_zoom_rectangle(
+                    axes, event.xdata, event.ydata, color="#ef6c00"
+                )
                 self._edit_state = state
             else:
                 state["rectangle"] = self._create_zoom_rectangle(
                     axes, event.xdata, event.ydata
                 )
                 self._zoom_state = state
+            self.canvas.draw_idle()
 
     def _on_plot_button_release(self, event) -> None:
         if event.button == 1 and self._drt_peak_drag is not None:
@@ -10661,6 +10686,7 @@ class EISApplication:
         self._edit_state = None
         if state is None:
             return
+        self._remove_zoom_rectangle(state.get("rectangle"))
         press_event = type("PressEvent", (), state)()
         if (
             event.x is not None
@@ -10709,6 +10735,16 @@ class EISApplication:
                 ):
                     self._update_zoom_rectangle(
                         self._zoom_state["rectangle"], event.xdata, event.ydata
+                    )
+                    self.canvas.draw_idle()
+            if self._edit_state is not None:
+                if (
+                    event.inaxes is self._edit_state["axes"]
+                    and event.xdata is not None
+                    and event.ydata is not None
+                ):
+                    self._update_zoom_rectangle(
+                        self._edit_state["rectangle"], event.xdata, event.ydata
                     )
                     self.canvas.draw_idle()
             self._update_point_hover(event)
@@ -10792,7 +10828,12 @@ class EISApplication:
         cycle.outliers[indices[cycle.manually_included[indices]]] = False
         cycle.invalidate_drt_cache()
         cycle.clear_fit()
+        view_limits = self._capture_plot_view_limits()
         self._refresh_plot(rescale=True)
+        self._restore_plot_view_limits(view_limits)
+        self._pending_edit_view_limits = (
+            view_limits if self.point_auto_fit else None
+        )
         self._update_status(f"toggled {indices.size} points in selected area")
         self._fit_after_point_edit()
 
@@ -12458,6 +12499,9 @@ class EISApplication:
         if self.state.active_cycle == cycle_number:
             self.parameter_table.set_parameters(parameters)
             self._refresh_plot(rescale=True)
+            if self._pending_edit_view_limits is not None:
+                self._restore_plot_view_limits(self._pending_edit_view_limits)
+                self._pending_edit_view_limits = None
             self._update_status("fit complete")
         self._refresh_open_parameter_explorers()
 
