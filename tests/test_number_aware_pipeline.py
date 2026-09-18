@@ -10,7 +10,7 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from ml.dataset import SpectrumRecord, load_eisfit_projects
+from ml.dataset import SpectrumRecord, canonical_electrochemical_topology, load_eisfit_projects
 from ml.frequency_range import active_frequency_bounds, _targets
 from ml.number_aware_pipeline import _learned_residual_interval, deterministic_masks, infer_bundle_records, train_bundle, _candidate_topologies, _is_positive_parameter, _physical_initial_cap, _parameter_features, _usable_fit_parameter
 from ml.preprocessing import SpectrumPreprocessor
@@ -51,6 +51,10 @@ class NumberAwarePipelineTests(unittest.TestCase):
         self.assertEqual(len(report.records), 1)
         self.assertEqual(report.records[0].original_eec_topology, "R0-L0-p(R1,CPE1)-p(R3,CPE3)")
         self.assertEqual(report.records[0].control, "cell")
+
+    def test_loader_topology_schema_accepts_four_rcpe_blocks(self):
+        topology = "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)-p(R4,CPE4)"
+        self.assertEqual(canonical_electrochemical_topology(topology), "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)-p(R4,CPE4)")
 
     def test_raw_validation_can_omit_frequency_window(self):
         with tempfile.TemporaryDirectory() as temporary:

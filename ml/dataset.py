@@ -18,6 +18,7 @@ KNOWN_EEC_TOPOLOGIES = {
     "R0-L0-p(R1,CPE1)",
     "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
     "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)-p(R4,CPE4)",
     "R0-L0-p(R1,CPE1)-p(R3,CPE3)",
     "R0-p(R1,CPE1)",
     "R0-p(R1,CPE1)-p(R2,CPE2)",
@@ -36,6 +37,8 @@ def canonical_electrochemical_topology(original: str) -> str | None:
         "R0-p(R1,CPE1)-p(R3,CPE3)": "R0-p(R1,CPE1)-p(R3,CPE3)",
         "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)": "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
         "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)": "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+        "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)-p(R4,CPE4)": "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)-p(R4,CPE4)",
+        "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)-p(R4,CPE4)": "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)-p(R4,CPE4)",
     }
     return mapping.get(original.strip())
 
