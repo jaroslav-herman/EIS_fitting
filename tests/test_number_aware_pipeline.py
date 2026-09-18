@@ -12,7 +12,7 @@ import pandas as pd
 
 from ml.dataset import SpectrumRecord, load_eisfit_projects
 from ml.frequency_range import active_frequency_bounds, _targets
-from ml.number_aware_pipeline import _learned_residual_interval, deterministic_masks, infer_bundle_records, _candidate_topologies, _is_positive_parameter, _physical_initial_cap, _parameter_features, _usable_fit_parameter
+from ml.number_aware_pipeline import _learned_residual_interval, deterministic_masks, infer_bundle_records, train_bundle, _candidate_topologies, _is_positive_parameter, _physical_initial_cap, _parameter_features, _usable_fit_parameter
 from ml.preprocessing import SpectrumPreprocessor
 
 
@@ -176,6 +176,17 @@ class NumberAwarePipelineTests(unittest.TestCase):
                                 cleaned_z_real=np.ones(2), cleaned_z_imag=np.ones(2))
         self.assertEqual(active_frequency_bounds(record), (10.0, 100.0))
         np.testing.assert_allclose(_targets([record])[0], [1.5, np.log(1.0)])
+
+    def test_single_sample_training_keeps_learned_limits_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sample.eisfit.json"
+            _project(path, "R0-L0-p(R1,CPE1)-p(R2,CPE2)")
+            bundle, extraction = train_bundle([path], {str(path): "sample"}, allow_single_sample=True)
+        self.assertEqual(bundle.training_samples, ("sample",))
+        self.assertEqual(len(extraction.records), 1)
+        self.assertTrue(bundle.parameter_limits)
+        self.assertTrue(all(item["reliability"] == "low_single_sample" for item in bundle.parameter_limits.values()))
+        self.assertTrue(all(item["lower_residual"] < item["upper_residual"] for item in bundle.parameter_limits.values()))
 
 
 if __name__ == "__main__":

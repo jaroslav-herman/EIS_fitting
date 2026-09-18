@@ -372,25 +372,27 @@ def _fit_parameters(records: list[SpectrumRecord], projects: list[Path], samples
         indices = np.asarray([item[0] for item in group], dtype=int)
         values = np.asarray([item[2] for item in group], dtype=float)
         y = _transform_parameter(values, name)
+        single_sample = len(samples) < 2
         candidate_modes = ["current_aware"]
         currents = np.asarray([float(item[1].current or 0.0) for item in group], dtype=float)
         valid_currents = currents[np.isfinite(currents) & (np.abs(currents) > 1.0e-9)]
-        if _is_positive_parameter(name) and valid_currents.size >= 30 and np.ptp(np.log10(np.abs(valid_currents))) >= 0.5:
+        if not single_sample and _is_positive_parameter(name) and valid_currents.size >= 30 and np.ptp(np.log10(np.abs(valid_currents))) >= 0.5:
             candidate_modes.append("inverse_current")
         scores = {mode: [] for mode in candidate_modes}
         oof_by_mode = {mode: [] for mode in candidate_modes}
-        for held_out in samples:
-            train_mask = np.asarray([item[1].sample_id != held_out for item in group], dtype=bool)
-            test_mask = ~train_mask
-            if train_mask.sum() < 10 or not test_mask.any():
-                continue
-            train_indices, test_indices = indices[train_mask], indices[test_mask]
-            for mode in candidate_modes:
-                model = _fit_parameter_candidate(x[train_indices], y[train_mask], mode, records, train_indices)
-                prediction = _predict_parameter_candidate(model, x[test_indices], mode, records, test_indices)
-                residual = prediction - y[test_mask]
-                scores[mode].extend(np.abs(residual).tolist())
-                oof_by_mode[mode].extend(zip(test_indices.tolist(), residual.tolist()))
+        if not single_sample:
+            for held_out in samples:
+                train_mask = np.asarray([item[1].sample_id != held_out for item in group], dtype=bool)
+                test_mask = ~train_mask
+                if train_mask.sum() < 10 or not test_mask.any():
+                    continue
+                train_indices, test_indices = indices[train_mask], indices[test_mask]
+                for mode in candidate_modes:
+                    model = _fit_parameter_candidate(x[train_indices], y[train_mask], mode, records, train_indices)
+                    prediction = _predict_parameter_candidate(model, x[test_indices], mode, records, test_indices)
+                    residual = prediction - y[test_mask]
+                    scores[mode].extend(np.abs(residual).tolist())
+                    oof_by_mode[mode].extend(zip(test_indices.tolist(), residual.tolist()))
         mean_scores = {mode: float(np.mean(values_)) if values_ else float("inf") for mode, values_ in scores.items()}
         selected_mode = "current_aware"
         best_mode = min(mean_scores, key=mean_scores.get)
@@ -403,23 +405,35 @@ def _fit_parameters(records: list[SpectrumRecord], projects: list[Path], samples
         if selected_mode in oof_by_mode:
             entries = oof_by_mode[selected_mode]
             residuals.extend(float(entry[1]) for entry in entries)
+        if single_sample:
+            # There is no independent physical sample for LOSO validation.
+            # Use in-sample residuals only as a scale estimate and mark the
+            # resulting bounds low-reliability below; never turn this into a
+            # zero-width interval that prevents the conventional fit.
+            fitted = _predict_parameter_candidate(model, x[indices], selected_mode, records, indices)
+            residuals = (fitted - y).tolist()
         if not residuals:
             residuals = [0.0]
         residuals = np.asarray(residuals, dtype=float)
         voltage = np.asarray([float(item[1].voltage) for item in group if item[1].voltage is not None and np.isfinite(item[1].voltage)], dtype=float)
         current = np.asarray([abs(float(item[1].current)) for item in group if item[1].current is not None and np.isfinite(item[1].current)], dtype=float)
         lower_residual, upper_residual = _learned_residual_interval(residuals)
+        if single_sample:
+            center = float(np.median(residuals))
+            minimum_half_width = 0.5
+            lower_residual = min(lower_residual, center - minimum_half_width)
+            upper_residual = max(upper_residual, center + minimum_half_width)
         limits[key] = {
             "level": 0.99, "lower_residual": lower_residual,
             "upper_residual": upper_residual,
-            "method": "LOSO_transformed_residual_interval_expanded",
+            "method": "single_sample_in_sample_interval_expanded" if single_sample else "LOSO_transformed_residual_interval_expanded",
             "interval_quantiles": [0.01, 0.99], "interval_expansion": 1.5,
             "training_spectra": int(len(group)), "topology": topology, "parameter": name,
             "voltage_min": float(np.min(voltage)) if voltage.size else None,
             "voltage_max": float(np.max(voltage)) if voltage.size else None,
             "current_min": float(np.min(current)) if current.size else None,
             "current_max": float(np.max(current)) if current.size else None,
-            "reliability": "high" if len(group) >= 100 else "medium" if len(group) >= 30 else "low_sparse",
+            "reliability": "low_single_sample" if single_sample else "high" if len(group) >= 100 else "medium" if len(group) >= 30 else "low_sparse",
             "candidate_scores": mean_scores, "selected_mode": selected_mode,
         }
         specs[key] = {"topology": topology, "parameter": name, "mode": selected_mode, "training_spectra": int(len(group)), "candidate_scores": mean_scores}

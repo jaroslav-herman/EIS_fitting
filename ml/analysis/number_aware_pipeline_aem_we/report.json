@@ -1,0 +1,779 @@
+{
+  "model_name": "AEM-WE",
+  "pipeline": "number_aware_staged_eis",
+  "version": "3",
+  "training_projects": [
+    "C:\\Users\\Herman\\OneDrive - Univerzita Karlova\\400.eisfit.json.gz"
+  ],
+  "training_samples": [
+    "400"
+  ],
+  "training_records": 252,
+  "training_exclusion_counts": {
+    "invalid_topology": 168
+  },
+  "circuit_classes": [
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)"
+  ],
+  "parameter_training": {
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R0": {
+      "training_spectra": 250,
+      "target_transform": "log10",
+      "target_median": 0.015511904442719267,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::L0": {
+      "training_spectra": 250,
+      "target_transform": "log10",
+      "target_median": 4.1647815453357074e-08,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R1": {
+      "training_spectra": 250,
+      "target_transform": "log10",
+      "target_median": 2.148821601162169,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE1_0": {
+      "training_spectra": 250,
+      "target_transform": "log10",
+      "target_median": 0.15403743551205779,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE1_1": {
+      "training_spectra": 250,
+      "target_transform": "logit",
+      "target_median": 0.9075174629556562,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R2": {
+      "training_spectra": 250,
+      "target_transform": "log10",
+      "target_median": 0.07286170477027669,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE2_0": {
+      "training_spectra": 250,
+      "target_transform": "log10",
+      "target_median": 0.13240586433669815,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE2_1": {
+      "training_spectra": 250,
+      "target_transform": "logit",
+      "target_median": 0.7827674891307018,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R3": {
+      "training_spectra": 250,
+      "target_transform": "log10",
+      "target_median": 0.010457273213606396,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE3_0": {
+      "training_spectra": 250,
+      "target_transform": "log10",
+      "target_median": 0.13390820468327186,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE3_1": {
+      "training_spectra": 250,
+      "target_transform": "logit",
+      "target_median": 0.7000000002380184,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::R0": {
+      "training_spectra": 2,
+      "target_transform": "log10",
+      "target_median": 0.01129198658360594,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::L0": {
+      "training_spectra": 2,
+      "target_transform": "log10",
+      "target_median": 4.802085072946201e-08,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::R1": {
+      "training_spectra": 2,
+      "target_transform": "log10",
+      "target_median": 5.311313119929515,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE1_0": {
+      "training_spectra": 2,
+      "target_transform": "log10",
+      "target_median": 0.08458818769363194,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE1_1": {
+      "training_spectra": 2,
+      "target_transform": "logit",
+      "target_median": 0.9546194268804031,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::R2": {
+      "training_spectra": 2,
+      "target_transform": "log10",
+      "target_median": 0.18650176022436282,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE2_0": {
+      "training_spectra": 2,
+      "target_transform": "log10",
+      "target_median": 0.3248332911608597,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE2_1": {
+      "training_spectra": 2,
+      "target_transform": "logit",
+      "target_median": 0.5564693332676465,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "selected_mode": "current_aware"
+    }
+  },
+  "parameter_model_specs": {
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R0": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "R0",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::L0": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "L0",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R1": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "R1",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE1_0": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE1_0",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE1_1": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE1_1",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R2": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "R2",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE2_0": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE2_0",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE2_1": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE2_1",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R3": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "R3",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE3_0": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE3_0",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE3_1": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE3_1",
+      "mode": "current_aware",
+      "training_spectra": 250,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::R0": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "R0",
+      "mode": "current_aware",
+      "training_spectra": 2,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::L0": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "L0",
+      "mode": "current_aware",
+      "training_spectra": 2,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::R1": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "R1",
+      "mode": "current_aware",
+      "training_spectra": 2,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE1_0": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "CPE1_0",
+      "mode": "current_aware",
+      "training_spectra": 2,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE1_1": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "CPE1_1",
+      "mode": "current_aware",
+      "training_spectra": 2,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::R2": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "R2",
+      "mode": "current_aware",
+      "training_spectra": 2,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE2_0": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "CPE2_0",
+      "mode": "current_aware",
+      "training_spectra": 2,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE2_1": {
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "CPE2_1",
+      "mode": "current_aware",
+      "training_spectra": 2,
+      "candidate_scores": {
+        "current_aware": Infinity
+      }
+    }
+  },
+  "parameter_limits": {
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R0": {
+      "level": 0.99,
+      "lower_residual": -0.5001103506948814,
+      "upper_residual": 0.4998896493051186,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "R0",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::L0": {
+      "level": 0.99,
+      "lower_residual": -0.5011275294036079,
+      "upper_residual": 0.49887247059639206,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "L0",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R1": {
+      "level": 0.99,
+      "lower_residual": -0.4991909355788818,
+      "upper_residual": 0.5008090644211182,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "R1",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE1_0": {
+      "level": 0.99,
+      "lower_residual": -0.4981840401048441,
+      "upper_residual": 0.5018159598951559,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE1_0",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE1_1": {
+      "level": 0.99,
+      "lower_residual": -0.6581028909288945,
+      "upper_residual": 0.5121544348742688,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE1_1",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R2": {
+      "level": 0.99,
+      "lower_residual": -0.49705731419732513,
+      "upper_residual": 0.5029426858026749,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "R2",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE2_0": {
+      "level": 0.99,
+      "lower_residual": -0.49468093498782695,
+      "upper_residual": 0.505319065012173,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE2_0",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE2_1": {
+      "level": 0.99,
+      "lower_residual": -6.588837701035584,
+      "upper_residual": 4.042538313606651,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE2_1",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::R3": {
+      "level": 0.99,
+      "lower_residual": -0.6524695267668444,
+      "upper_residual": 0.698956921954566,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "R3",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE3_0": {
+      "level": 0.99,
+      "lower_residual": -1.0775141780463993,
+      "upper_residual": 0.8194144099368955,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE3_0",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)::CPE3_1": {
+      "level": 0.99,
+      "lower_residual": -14.125259113413604,
+      "upper_residual": 6.865604934206134,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 250,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)",
+      "parameter": "CPE3_1",
+      "voltage_min": 1.3589827846035294,
+      "voltage_max": 1.5991232226858823,
+      "current_min": 7.095959298748235,
+      "current_max": 315.62591085995183,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::R0": {
+      "level": 0.99,
+      "lower_residual": -0.5,
+      "upper_residual": 0.5,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 2,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "R0",
+      "voltage_min": 1.3991237149552942,
+      "voltage_max": 1.4191228782447058,
+      "current_min": 6.986110513342354,
+      "current_max": 7.392090455218824,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::L0": {
+      "level": 0.99,
+      "lower_residual": -0.5,
+      "upper_residual": 0.5,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 2,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "L0",
+      "voltage_min": 1.3991237149552942,
+      "voltage_max": 1.4191228782447058,
+      "current_min": 6.986110513342354,
+      "current_max": 7.392090455218824,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::R1": {
+      "level": 0.99,
+      "lower_residual": -0.5,
+      "upper_residual": 0.49999999999999994,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 2,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "R1",
+      "voltage_min": 1.3991237149552942,
+      "voltage_max": 1.4191228782447058,
+      "current_min": 6.986110513342354,
+      "current_max": 7.392090455218824,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE1_0": {
+      "level": 0.99,
+      "lower_residual": -0.4999999999999999,
+      "upper_residual": 0.5000000000000001,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 2,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "CPE1_0",
+      "voltage_min": 1.3991237149552942,
+      "voltage_max": 1.4191228782447058,
+      "current_min": 6.986110513342354,
+      "current_max": 7.392090455218824,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE1_1": {
+      "level": 0.99,
+      "lower_residual": -0.4999999999999998,
+      "upper_residual": 0.5000000000000002,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 2,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "CPE1_1",
+      "voltage_min": 1.3991237149552942,
+      "voltage_max": 1.4191228782447058,
+      "current_min": 6.986110513342354,
+      "current_max": 7.392090455218824,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::R2": {
+      "level": 0.99,
+      "lower_residual": -0.49999999999999994,
+      "upper_residual": 0.5,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 2,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "R2",
+      "voltage_min": 1.3991237149552942,
+      "voltage_max": 1.4191228782447058,
+      "current_min": 6.986110513342354,
+      "current_max": 7.392090455218824,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE2_0": {
+      "level": 0.99,
+      "lower_residual": -0.5,
+      "upper_residual": 0.5,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 2,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "CPE2_0",
+      "voltage_min": 1.3991237149552942,
+      "voltage_max": 1.4191228782447058,
+      "current_min": 6.986110513342354,
+      "current_max": 7.392090455218824,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    },
+    "R0-L0-p(R1,CPE1)-p(R2,CPE2)::CPE2_1": {
+      "level": 0.99,
+      "lower_residual": -0.5,
+      "upper_residual": 0.49999999999999994,
+      "method": "single_sample_in_sample_interval_expanded",
+      "interval_quantiles": [
+        0.01,
+        0.99
+      ],
+      "interval_expansion": 1.5,
+      "training_spectra": 2,
+      "topology": "R0-L0-p(R1,CPE1)-p(R2,CPE2)",
+      "parameter": "CPE2_1",
+      "voltage_min": 1.3991237149552942,
+      "voltage_max": 1.4191228782447058,
+      "current_min": 6.986110513342354,
+      "current_max": 7.392090455218824,
+      "reliability": "low_single_sample",
+      "candidate_scores": {
+        "current_aware": Infinity
+      },
+      "selected_mode": "current_aware"
+    }
+  },
+  "frequency_target_source": "active_points",
+  "frequency_active_point_records": 252,
+  "frequency_active_bounds_min_hz": 0.5003522635000001,
+  "frequency_active_bounds_max_hz": 19985.89453125,
+  "frequency_target_center_min_decades": 1.99999973001596,
+  "frequency_target_center_max_decades": 2.70009442887074,
+  "validation": {
+    "mode": "single_physical_sample_in_sample_scale_check",
+    "loso_available": false,
+    "warning": "A single physical sample cannot provide independent sample-level validation; use this model for AEM-WE spectra within the represented experiment and retrain with additional physical samples for generalization."
+  },
+  "gui_model_key": "AEM-WE",
+  "artifact": "ml\\analysis\\number_aware_pipeline_aem_we\\pipeline.joblib"
+}
