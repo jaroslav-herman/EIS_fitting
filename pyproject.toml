@@ -1,6 +1,6 @@
 [project]
 name = "eisyfit"
-version = "0.1.6"
+version = "0.1.7"
 description = "Interactive desktop application for exploring, cleaning, and fitting BioLogic electrochemical impedance spectra."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -57,6 +57,7 @@ py-modules = [
     "explorer_filter",
     "extract_relaxis",
     "main",
+    "load_and_label_eis",
     "plot_export",
     "spectrum_simulator",
 ]
