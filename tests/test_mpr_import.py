@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from eis_services import _read_eis_dataframe, load_projects_for_file
+from eis_services import DelimitedImportOptions, _read_eis_dataframe, load_projects_for_file
 from eis_gui import EISApplication, _compatible_spectrum_selection
 
 
@@ -210,6 +210,46 @@ class MprImportTests(unittest.TestCase):
         self.assertEqual(list(dataframe["cycle_number"]), [1, 1])
         self.assertEqual(metadata, {})
         self.assertEqual(technique, "PEIS")
+
+    def test_delimited_text_import_maps_optional_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "custom.csv"
+            path.write_text(
+                "f;zr;zi;amps;seconds;potential;loop\n"
+                "1000;2.5;-0.4;1.2;10;0.7;3\n"
+                "100;3.0;-1.2;1.4;11;0.8;3\n",
+                encoding="utf-8",
+            )
+            options = DelimitedImportOptions(
+                delimiter=";",
+                frequency_column="f",
+                real_column="zr",
+                imaginary_column="zi",
+                current_column="amps",
+                time_column="seconds",
+                voltage_column="potential",
+                cycle_column="loop",
+            )
+            dataframe, _metadata, _technique = _read_eis_dataframe(
+                path,
+                delimiter=options.delimiter,
+                skiprows=options.skiprows,
+                column_names={
+                    "frequency": options.frequency_column,
+                    "real": options.real_column,
+                    "imaginary": options.imaginary_column,
+                    "current": options.current_column,
+                    "time": options.time_column,
+                    "voltage": options.voltage_column,
+                    "cycle": options.cycle_column,
+                },
+            )
+        self.assertEqual(list(dataframe["freq_hz"]), [1000.0, 100.0])
+        self.assertEqual(list(dataframe["minus_im_zwe_ce_ohm"]), [0.4, 1.2])
+        self.assertEqual(list(dataframe["i_ma"]), [1.2, 1.4])
+        self.assertEqual(list(dataframe["time_s"]), [10.0, 11.0])
+        self.assertEqual(list(dataframe["ewe_ece_v"]), [0.7, 0.8])
+        self.assertEqual(list(dataframe["cycle_number"]), [3.0, 3.0])
 
 
 if __name__ == "__main__":

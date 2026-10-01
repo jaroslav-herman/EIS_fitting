@@ -52,6 +52,19 @@ class SpectrumMetadata:
 
 
 @dataclass(frozen=True)
+class DelimitedImportOptions:
+    delimiter: str = ","
+    skiprows: int = 0
+    frequency_column: str = "Frequency (Hz)"
+    real_column: str = "Re(Z)"
+    imaginary_column: str = "-Im(Z)"
+    current_column: str = ""
+    time_column: str = ""
+    voltage_column: str = ""
+    cycle_column: str = ""
+
+
+@dataclass(frozen=True)
 class FittedEECRecord:
     """Immutable fitted-spectrum data used for local EEC initialization."""
 
@@ -969,7 +982,10 @@ def _normalise_import_column(name: object) -> str:
 
 
 def _read_delimited_eis_dataframe(
-    path: Path, delimiter: str = ",", skiprows: int = 0
+    path: Path,
+    delimiter: str = ",",
+    skiprows: int = 0,
+    column_names: dict[str, str] | None = None,
 ):
     """Read a user-selected delimited text file into the internal EIS schema."""
     import pandas as pd
@@ -1003,10 +1019,23 @@ def _read_delimited_eis_dataframe(
                 return column
         return None
 
-    frequency = find(
-        "freq_hz", "frequency_hz", "frequency", "freq", "frequency (hz)", "f/Hz"
+    requested = column_names or {}
+
+    def requested_or_find(key: str, *fallbacks: str):
+        name = str(requested.get(key, "")).strip()
+        return find(name) if name else find(*fallbacks)
+
+    frequency = requested_or_find(
+        "frequency",
+        "freq_hz",
+        "frequency_hz",
+        "frequency",
+        "freq",
+        "frequency (hz)",
+        "f/Hz",
     )
-    real = find(
+    real = requested_or_find(
+        "real",
         "re_z_ohm",
         "re_zwe_ce_ohm",
         "rezohm",
@@ -1016,16 +1045,24 @@ def _read_delimited_eis_dataframe(
         "real",
         "z'",
     )
-    minus_imaginary = find(
-        "minus_im_z_ohm",
-        "minus_im_zwe_ce_ohm",
-        "-im(z)/ohm",
-        "-im(z)",
-        "minusimaginary",
-        "zimagminus",
+    imaginary_requested = str(requested.get("imaginary", "")).strip()
+    minus_imaginary = (
+        find(imaginary_requested)
+        if imaginary_requested.startswith("-")
+        else requested_or_find(
+            "minus_imaginary",
+            "minus_im_z_ohm",
+            "minus_im_zwe_ce_ohm",
+            "-im(z)/ohm",
+            "-im(z)",
+            "minusimaginary",
+            "zimagminus",
+        )
     )
-    imaginary = find(
-        "im_z_ohm", "imaginary(z)", "imaginary", "imag(z)", "zimag", "z''"
+    imaginary = (
+        find(imaginary_requested)
+        if imaginary_requested and not imaginary_requested.startswith("-")
+        else find("im_z_ohm", "imaginary(z)", "imaginary", "imag(z)", "zimag", "z''")
     )
     missing = []
     if frequency is None:
@@ -1052,18 +1089,41 @@ def _read_delimited_eis_dataframe(
         )
     for column in ("freq_hz", "re_zwe_ce_ohm", "minus_im_zwe_ce_ohm"):
         dataframe[column] = pd.to_numeric(dataframe[column], errors="coerce")
+    optional_columns = {
+        "current": "i_ma",
+        "time": "time_s",
+        "voltage": "ewe_ece_v",
+        "cycle": "cycle_number",
+    }
+    for option_name, target_name in optional_columns.items():
+        requested_name = str(requested.get(option_name, "")).strip()
+        if not requested_name:
+            continue
+        source_name = find(requested_name)
+        if source_name is None:
+            raise KeyError(
+                f"The configured {option_name} column '{requested_name}' was not found"
+            )
+        if source_name != target_name:
+            dataframe = dataframe.rename(columns={source_name: target_name})
+        dataframe[target_name] = pd.to_numeric(dataframe[target_name], errors="coerce")
     dataframe = dataframe.dropna(
         subset=["freq_hz", "re_zwe_ce_ohm", "minus_im_zwe_ce_ohm"]
     ).reset_index(drop=True)
     if dataframe.empty:
         raise ValueError(f"No numeric impedance rows were found in {path.name}")
-    dataframe["ewe_ece_v"] = 0.0
-    dataframe["cycle_number"] = 1
+    if "ewe_ece_v" not in dataframe:
+        dataframe["ewe_ece_v"] = 0.0
+    if "cycle_number" not in dataframe:
+        dataframe["cycle_number"] = 1
     return dataframe, {}, "PEIS"
 
 
 def _read_eis_dataframe(
-    path: Path, delimiter: str | None = None, skiprows: int = 0
+    path: Path,
+    delimiter: str | None = None,
+    skiprows: int = 0,
+    column_names: dict[str, str] | None = None,
 ):
     if path.suffix.casefold() == ".mpr":
         import pandas as pd
@@ -1139,7 +1199,10 @@ def _read_eis_dataframe(
 
     if path.suffix.casefold() != ".mpt" or delimiter is not None or skiprows:
         return _read_delimited_eis_dataframe(
-            path, delimiter=delimiter or ",", skiprows=skiprows
+            path,
+            delimiter=delimiter or ",",
+            skiprows=skiprows,
+            column_names=column_names,
         )
 
     from wepy import read_mpt_dataframe
@@ -1153,11 +1216,27 @@ def load_projects_for_file(
     control: str,
     circuit: str,
     spectrum_kinds: list[str] | None = None,
-    import_options: tuple[str, int] | None = None,
+    import_options: DelimitedImportOptions | tuple[str, int] | None = None,
 ) -> list[LoadedProject]:
-    delimiter, skiprows = import_options or (None, 0)
+    if isinstance(import_options, DelimitedImportOptions):
+        delimiter, skiprows = import_options.delimiter, import_options.skiprows
+        column_names = {
+            "frequency": import_options.frequency_column,
+            "real": import_options.real_column,
+            "imaginary": import_options.imaginary_column,
+            "current": import_options.current_column,
+            "time": import_options.time_column,
+            "voltage": import_options.voltage_column,
+            "cycle": import_options.cycle_column,
+        }
+    else:
+        delimiter, skiprows = import_options or (None, 0)
+        column_names = None
     dataframe, header_meta, technique = _read_eis_dataframe(
-        path, delimiter=delimiter, skiprows=skiprows
+        path,
+        delimiter=delimiter,
+        skiprows=skiprows,
+        column_names=column_names,
     )
     cycles = (
         _safe_unique_ints(dataframe["cycle_number"].values)
@@ -1270,7 +1349,9 @@ def load_projects(
     circuit: str,
     cycle: int = 1,
     spectrum_kinds_by_path: dict[Path, list[str]] | None = None,
-    import_options_by_path: dict[Path, tuple[str, int]] | None = None,
+    import_options_by_path: dict[
+        Path, DelimitedImportOptions | tuple[str, int]
+    ] | None = None,
 ) -> ProjectImportReport:
     loaded: list[tuple[str, LoadedProject]] = []
     errors: list[tuple[Path, str]] = []
@@ -1297,12 +1378,28 @@ def load_projects(
 
 
 def inspect_eis_file_spectrum_kinds(
-    path: Path, import_options: tuple[str, int] | None = None
+    path: Path, import_options: DelimitedImportOptions | tuple[str, int] | None = None
 ) -> list[str]:
     """Return the electrode-pair spectra available in an EIS data file."""
-    delimiter, skiprows = import_options or (None, 0)
+    if isinstance(import_options, DelimitedImportOptions):
+        delimiter, skiprows = import_options.delimiter, import_options.skiprows
+        column_names = {
+            "frequency": import_options.frequency_column,
+            "real": import_options.real_column,
+            "imaginary": import_options.imaginary_column,
+            "current": import_options.current_column,
+            "time": import_options.time_column,
+            "voltage": import_options.voltage_column,
+            "cycle": import_options.cycle_column,
+        }
+    else:
+        delimiter, skiprows = import_options or (None, 0)
+        column_names = None
     _dataframe, header_meta, _technique = _read_eis_dataframe(
-        path, delimiter=delimiter, skiprows=skiprows
+        path,
+        delimiter=delimiter,
+        skiprows=skiprows,
+        column_names=column_names,
     )
     return _available_spectrum_kinds(_dataframe, header_meta)
 

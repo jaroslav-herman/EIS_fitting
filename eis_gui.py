@@ -48,6 +48,7 @@ from eis_services import (
     AutomaticEECModel,
     BatchFitReport,
     DRTComputation,
+    DelimitedImportOptions,
     EECAnomalyReport,
     FittedEECRecord,
     FitTimeoutError,
@@ -1120,7 +1121,7 @@ class DelimitedImportDialog(tk.Toplevel):
 
     def __init__(self, parent: tk.Tk, path: Path) -> None:
         super().__init__(parent)
-        self.result: tuple[str, int] | None = None
+        self.result: DelimitedImportOptions | None = None
         self.title(f"Import text file — {path.name}")
         self.transient(parent)
         self.resizable(False, False)
@@ -1147,8 +1148,35 @@ class DelimitedImportDialog(tk.Toplevel):
         ttk.Entry(body, textvariable=self.skiprows_var, width=12).grid(
             row=3, column=1, sticky="ew", padx=(12, 0), pady=(8, 0)
         )
+        self.column_vars = {
+            "frequency_column": tk.StringVar(value="Frequency (Hz)"),
+            "real_column": tk.StringVar(value="Re(Z)"),
+            "imaginary_column": tk.StringVar(value="-Im(Z)"),
+            "current_column": tk.StringVar(value=""),
+            "time_column": tk.StringVar(value=""),
+            "voltage_column": tk.StringVar(value=""),
+            "cycle_column": tk.StringVar(value=""),
+        }
+        ttk.Label(
+            body,
+            text="Column names (leave optional fields blank):",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        column_labels = (
+            ("frequency_column", "Frequency"),
+            ("real_column", "Re"),
+            ("imaginary_column", "Im"),
+            ("current_column", "Current"),
+            ("time_column", "Time"),
+            ("voltage_column", "Voltage"),
+            ("cycle_column", "Cycle number"),
+        )
+        for row, (key, label) in enumerate(column_labels, start=5):
+            ttk.Label(body, text=f"{label}:").grid(row=row, column=0, sticky="w")
+            ttk.Entry(body, textvariable=self.column_vars[key], width=28).grid(
+                row=row, column=1, sticky="ew", padx=(12, 0)
+            )
         buttons = ttk.Frame(body)
-        buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        buttons.grid(row=12, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Import", command=self._accept).pack(
             side=tk.RIGHT, padx=(0, 6)
@@ -1177,7 +1205,11 @@ class DelimitedImportDialog(tk.Toplevel):
                 parent=self,
             )
             return
-        self.result = (delimiter, skiprows)
+        self.result = DelimitedImportOptions(
+            delimiter=delimiter,
+            skiprows=skiprows,
+            **{key: variable.get().strip() for key, variable in self.column_vars.items()},
+        )
         self.destroy()
 
 
@@ -16343,7 +16375,7 @@ class EISApplication:
         selected_paths = list(
             dict.fromkeys(Path(value).resolve() for value in selected)
         )
-        import_options: dict[Path, tuple[str, int]] = {}
+        import_options: dict[Path, DelimitedImportOptions] = {}
         for path in selected_paths:
             if path.suffix.casefold() in {".mpt", ".mpr"}:
                 continue
@@ -16401,7 +16433,7 @@ class EISApplication:
         paths: list[Path],
         control: str,
         circuit: str,
-        import_options: dict[Path, tuple[str, int]] | None = None,
+        import_options: dict[Path, DelimitedImportOptions] | None = None,
     ) -> None:
         selected_kinds = self._select_import_spectrum_kinds(inspections)
         if selected_kinds is None:
