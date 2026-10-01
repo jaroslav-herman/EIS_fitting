@@ -964,7 +964,107 @@ def load_project(
     return projects[0]
 
 
-def _read_eis_dataframe(path: Path):
+def _normalise_import_column(name: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).strip().casefold())
+
+
+def _read_delimited_eis_dataframe(
+    path: Path, delimiter: str = ",", skiprows: int = 0
+):
+    """Read a user-selected delimited text file into the internal EIS schema."""
+    import pandas as pd
+
+    delimiter = str(delimiter)
+    if delimiter == r"\t":
+        delimiter = "\t"
+    if not delimiter:
+        raise ValueError("The delimiter cannot be empty")
+    try:
+        skiprows = int(skiprows)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Rows to skip must be a non-negative integer") from error
+    if skiprows < 0:
+        raise ValueError("Rows to skip must be a non-negative integer")
+
+    dataframe = pd.read_csv(
+        path,
+        sep=delimiter,
+        skiprows=skiprows,
+        engine="python",
+    )
+    columns = {
+        _normalise_import_column(column): column for column in dataframe.columns
+    }
+
+    def find(*names: str):
+        for name in names:
+            column = columns.get(_normalise_import_column(name))
+            if column is not None:
+                return column
+        return None
+
+    frequency = find(
+        "freq_hz", "frequency_hz", "frequency", "freq", "frequency (hz)", "f/Hz"
+    )
+    real = find(
+        "re_z_ohm",
+        "re_zwe_ce_ohm",
+        "rezohm",
+        "rez",
+        "zreal",
+        "real(z)",
+        "real",
+        "z'",
+    )
+    minus_imaginary = find(
+        "minus_im_z_ohm",
+        "minus_im_zwe_ce_ohm",
+        "-im(z)/ohm",
+        "-im(z)",
+        "minusimaginary",
+        "zimagminus",
+    )
+    imaginary = find(
+        "im_z_ohm", "imaginary(z)", "imaginary", "imag(z)", "zimag", "z''"
+    )
+    missing = []
+    if frequency is None:
+        missing.append("frequency")
+    if real is None:
+        missing.append("real impedance")
+    if minus_imaginary is None and imaginary is None:
+        missing.append("imaginary impedance")
+    if missing:
+        raise KeyError(
+            "Could not identify "
+            + ", ".join(missing)
+            + ". Expected columns such as frequency, Re(Z), and -Im(Z)."
+        )
+
+    rename = {frequency: "freq_hz", real: "re_zwe_ce_ohm"}
+    dataframe = dataframe.rename(columns=rename)
+    if minus_imaginary is not None:
+        dataframe = dataframe.rename(columns={minus_imaginary: "minus_im_zwe_ce_ohm"})
+    else:
+        dataframe = dataframe.rename(columns={imaginary: "minus_im_zwe_ce_ohm"})
+        dataframe["minus_im_zwe_ce_ohm"] = -pd.to_numeric(
+            dataframe["minus_im_zwe_ce_ohm"], errors="coerce"
+        )
+    for column in ("freq_hz", "re_zwe_ce_ohm", "minus_im_zwe_ce_ohm"):
+        dataframe[column] = pd.to_numeric(dataframe[column], errors="coerce")
+    dataframe = dataframe.dropna(
+        subset=["freq_hz", "re_zwe_ce_ohm", "minus_im_zwe_ce_ohm"]
+    ).reset_index(drop=True)
+    if dataframe.empty:
+        raise ValueError(f"No numeric impedance rows were found in {path.name}")
+    dataframe["ewe_ece_v"] = 0.0
+    dataframe["cycle_number"] = 1
+    return dataframe, {}, "PEIS"
+
+
+def _read_eis_dataframe(
+    path: Path, delimiter: str | None = None, skiprows: int = 0
+):
     if path.suffix.casefold() == ".mpr":
         import pandas as pd
         from galvani.BioLogic import MPRfile, MPR_MAGIC
@@ -1037,6 +1137,11 @@ def _read_eis_dataframe(path: Path):
         header_meta = {"Potential control": "Ewe-Ece"}
         return dataframe, header_meta, "PEIS"
 
+    if path.suffix.casefold() != ".mpt" or delimiter is not None or skiprows:
+        return _read_delimited_eis_dataframe(
+            path, delimiter=delimiter or ",", skiprows=skiprows
+        )
+
     from wepy import read_mpt_dataframe
 
     return read_mpt_dataframe(path)
@@ -1048,8 +1153,12 @@ def load_projects_for_file(
     control: str,
     circuit: str,
     spectrum_kinds: list[str] | None = None,
+    import_options: tuple[str, int] | None = None,
 ) -> list[LoadedProject]:
-    dataframe, header_meta, technique = _read_eis_dataframe(path)
+    delimiter, skiprows = import_options or (None, 0)
+    dataframe, header_meta, technique = _read_eis_dataframe(
+        path, delimiter=delimiter, skiprows=skiprows
+    )
     cycles = (
         _safe_unique_ints(dataframe["cycle_number"].values)
         if "cycle_number" in dataframe.columns
@@ -1161,6 +1270,7 @@ def load_projects(
     circuit: str,
     cycle: int = 1,
     spectrum_kinds_by_path: dict[Path, list[str]] | None = None,
+    import_options_by_path: dict[Path, tuple[str, int]] | None = None,
 ) -> ProjectImportReport:
     loaded: list[tuple[str, LoadedProject]] = []
     errors: list[tuple[Path, str]] = []
@@ -1172,7 +1282,12 @@ def load_projects(
                 else None
             )
             projects = load_projects_for_file(
-                path, cycle, control, circuit, selected_kinds
+                path,
+                cycle,
+                control,
+                circuit,
+                selected_kinds,
+                (import_options_by_path or {}).get(path.resolve()),
             )
         except Exception as error:
             errors.append((path, f"{type(error).__name__}: {error}"))
@@ -1181,9 +1296,14 @@ def load_projects(
     return ProjectImportReport(loaded, errors)
 
 
-def inspect_eis_file_spectrum_kinds(path: Path) -> list[str]:
+def inspect_eis_file_spectrum_kinds(
+    path: Path, import_options: tuple[str, int] | None = None
+) -> list[str]:
     """Return the electrode-pair spectra available in an EIS data file."""
-    _dataframe, header_meta, _technique = _read_eis_dataframe(path)
+    delimiter, skiprows = import_options or (None, 0)
+    _dataframe, header_meta, _technique = _read_eis_dataframe(
+        path, delimiter=delimiter, skiprows=skiprows
+    )
     return _available_spectrum_kinds(_dataframe, header_meta)
 
 

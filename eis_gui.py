@@ -1115,6 +1115,72 @@ class ElectrodeSelectionDialog(tk.Toplevel):
         self.destroy()
 
 
+class DelimitedImportDialog(tk.Toplevel):
+    """Collect parsing options for a non-BioLogic text file."""
+
+    def __init__(self, parent: tk.Tk, path: Path) -> None:
+        super().__init__(parent)
+        self.result: tuple[str, int] | None = None
+        self.title(f"Import text file — {path.name}")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            body,
+            text=(
+                "This is not a BioLogic .mpt or .mpr file.\n"
+                "Enter the delimiter and the number of rows before the header."
+            ),
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Label(body, text="Delimiter:").grid(row=1, column=0, sticky="w")
+        self.delimiter_var = tk.StringVar(value=",")
+        delimiter_entry = ttk.Entry(body, textvariable=self.delimiter_var, width=12)
+        delimiter_entry.grid(row=1, column=1, sticky="ew", padx=(12, 0))
+        ttk.Label(body, text="(use \\t for tab)").grid(
+            row=2, column=1, sticky="w", padx=(12, 0)
+        )
+        ttk.Label(body, text="Rows to skip:").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.skiprows_var = tk.StringVar(value="0")
+        ttk.Entry(body, textvariable=self.skiprows_var, width=12).grid(
+            row=3, column=1, sticky="ew", padx=(12, 0), pady=(8, 0)
+        )
+        buttons = ttk.Frame(body)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Import", command=self._accept).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+        self.bind("<Return>", lambda _event: self._accept())
+        delimiter_entry.focus_set()
+        self.grab_set()
+
+    def _accept(self) -> None:
+        delimiter = self.delimiter_var.get()
+        try:
+            skiprows = int(self.skiprows_var.get())
+        except ValueError:
+            skiprows = -1
+        if not delimiter or len(delimiter) > 1 and delimiter != r"\t":
+            messagebox.showerror(
+                "Invalid delimiter",
+                "Enter one delimiter character, or \\t for a tab.",
+                parent=self,
+            )
+            return
+        if skiprows < 0:
+            messagebox.showerror(
+                "Invalid rows to skip",
+                "Rows to skip must be a non-negative integer.",
+                parent=self,
+            )
+            return
+        self.result = (delimiter, skiprows)
+        self.destroy()
+
+
 def _compatible_spectrum_selection(
     selection: list[str], available: list[str]
 ) -> list[str] | None:
@@ -16263,7 +16329,7 @@ class EISApplication:
             return
         selected = filedialog.askopenfilenames(
             parent=self.root,
-            title="Add BioLogic impedance data",
+            title="Add impedance data",
             initialdir=str(self._dialog_directory("last_import_directory")),
             filetypes=[
                 ("BioLogic MPT", "*.mpt"),
@@ -16277,6 +16343,16 @@ class EISApplication:
         selected_paths = list(
             dict.fromkeys(Path(value).resolve() for value in selected)
         )
+        import_options: dict[Path, tuple[str, int]] = {}
+        for path in selected_paths:
+            if path.suffix.casefold() in {".mpt", ".mpr"}:
+                continue
+            dialog = DelimitedImportDialog(self.root, path)
+            self.root.wait_window(dialog)
+            if dialog.result is None:
+                self._update_status("data import cancelled")
+                return
+            import_options[path] = dialog.result
         imported_paths = {
             loaded.state.source_path.resolve()
             for loaded in self.loaded_projects.values()
@@ -16307,10 +16383,14 @@ class EISApplication:
         self.status_var.set(f"Importing {len(new_paths)} data files…")
         self._submit(
             lambda: [
-                (path, inspect_eis_file_spectrum_kinds(path)) for path in new_paths
+                (
+                    path,
+                    inspect_eis_file_spectrum_kinds(path, import_options.get(path)),
+                )
+                for path in new_paths
             ],
             lambda inspections: self._finish_import_inspection(
-                inspections, new_paths, control, circuit
+                inspections, new_paths, control, circuit, import_options
             ),
             "Data import failed",
         )
@@ -16321,6 +16401,7 @@ class EISApplication:
         paths: list[Path],
         control: str,
         circuit: str,
+        import_options: dict[Path, tuple[str, int]] | None = None,
     ) -> None:
         selected_kinds = self._select_import_spectrum_kinds(inspections)
         if selected_kinds is None:
@@ -16333,6 +16414,7 @@ class EISApplication:
                 control,
                 circuit,
                 spectrum_kinds_by_path=selected_kinds,
+                import_options_by_path=import_options,
             ),
             self._finish_imports,
             "Data import failed",

@@ -193,6 +193,24 @@ class MprImportTests(unittest.TestCase):
         self.assertEqual(metadata, {})
         self.assertEqual(technique, "PEIS")
 
+    def test_delimited_text_import_honors_delimiter_and_skipped_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "export.txt"
+            path.write_text(
+                "instrument export\nmetadata\nFrequency (Hz)\tRe(Z)\t-Im(Z)\n"
+                "1000\t2.5\t0.4\n100\t3.0\t1.2\n",
+                encoding="utf-8",
+            )
+            dataframe, metadata, technique = _read_eis_dataframe(
+                path, delimiter=r"\t", skiprows=2
+            )
+        self.assertEqual(list(dataframe["freq_hz"]), [1000.0, 100.0])
+        self.assertEqual(list(dataframe["re_zwe_ce_ohm"]), [2.5, 3.0])
+        self.assertEqual(list(dataframe["minus_im_zwe_ce_ohm"]), [0.4, 1.2])
+        self.assertEqual(list(dataframe["cycle_number"]), [1, 1])
+        self.assertEqual(metadata, {})
+        self.assertEqual(technique, "PEIS")
+
 
 if __name__ == "__main__":
     unittest.main()
