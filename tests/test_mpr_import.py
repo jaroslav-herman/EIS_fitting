@@ -205,8 +205,8 @@ class MprImportTests(unittest.TestCase):
                 path, delimiter=r"\t", skiprows=2
             )
         self.assertEqual(list(dataframe["freq_hz"]), [1000.0, 100.0])
-        self.assertEqual(list(dataframe["re_zwe_ce_ohm"]), [2.5, 3.0])
-        self.assertEqual(list(dataframe["minus_im_zwe_ce_ohm"]), [0.4, 1.2])
+        self.assertEqual(list(dataframe["re_z_ohm"]), [2.5, 3.0])
+        self.assertEqual(list(dataframe["minus_im_z_ohm"]), [0.4, 1.2])
         self.assertEqual(list(dataframe["cycle_number"]), [1, 1])
         self.assertEqual(metadata, {})
         self.assertEqual(technique, "PEIS")
@@ -245,10 +245,10 @@ class MprImportTests(unittest.TestCase):
                 },
             )
         self.assertEqual(list(dataframe["freq_hz"]), [1000.0, 100.0])
-        self.assertEqual(list(dataframe["minus_im_zwe_ce_ohm"]), [0.4, 1.2])
+        self.assertEqual(list(dataframe["minus_im_z_ohm"]), [0.4, 1.2])
         self.assertEqual(list(dataframe["i_ma"]), [1.2, 1.4])
         self.assertEqual(list(dataframe["time_s"]), [10.0, 11.0])
-        self.assertEqual(list(dataframe["ewe_ece_v"]), [0.7, 0.8])
+        self.assertEqual(list(dataframe["ewe_v"]), [0.7, 0.8])
         self.assertEqual(list(dataframe["cycle_number"]), [3.0, 3.0])
 
 

@@ -1137,7 +1137,17 @@ class DelimitedImportDialog(tk.Toplevel):
             justify=tk.LEFT,
         ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         ttk.Label(body, text="Delimiter:").grid(row=1, column=0, sticky="w")
-        self.delimiter_var = tk.StringVar(value=",")
+        delimiter = ","
+        try:
+            preview = path.read_text(encoding="utf-8", errors="replace")[:4096]
+            header = next((line for line in preview.splitlines() if line.strip()), "")
+            candidates = ("\t", ";", ",")
+            detected = max(candidates, key=header.count)
+            if header.count(detected) > 0:
+                delimiter = r"\t" if detected == "\t" else detected
+        except OSError:
+            pass
+        self.delimiter_var = tk.StringVar(value=delimiter)
         delimiter_entry = ttk.Entry(body, textvariable=self.delimiter_var, width=12)
         delimiter_entry.grid(row=1, column=1, sticky="ew", padx=(12, 0))
         ttk.Label(body, text="(use \\t for tab)").grid(
@@ -1149,13 +1159,13 @@ class DelimitedImportDialog(tk.Toplevel):
             row=3, column=1, sticky="ew", padx=(12, 0), pady=(8, 0)
         )
         self.column_vars = {
-            "frequency_column": tk.StringVar(value="Frequency (Hz)"),
-            "real_column": tk.StringVar(value="Re(Z)"),
-            "imaginary_column": tk.StringVar(value="-Im(Z)"),
-            "current_column": tk.StringVar(value=""),
-            "time_column": tk.StringVar(value=""),
-            "voltage_column": tk.StringVar(value=""),
-            "cycle_column": tk.StringVar(value=""),
+            "frequency_column": tk.StringVar(value="freq/Hz"),
+            "real_column": tk.StringVar(value="Re(Z)/Ohm"),
+            "imaginary_column": tk.StringVar(value="-Im(Z)/Ohm"),
+            "current_column": tk.StringVar(value="<I>/mA"),
+            "time_column": tk.StringVar(value="time/s"),
+            "voltage_column": tk.StringVar(value="<Ewe>/V"),
+            "cycle_column": tk.StringVar(value="cycle number"),
         }
         ttk.Label(
             body,

@@ -55,13 +55,13 @@ class SpectrumMetadata:
 class DelimitedImportOptions:
     delimiter: str = ","
     skiprows: int = 0
-    frequency_column: str = "Frequency (Hz)"
-    real_column: str = "Re(Z)"
-    imaginary_column: str = "-Im(Z)"
-    current_column: str = ""
-    time_column: str = ""
-    voltage_column: str = ""
-    cycle_column: str = ""
+    frequency_column: str = "freq/Hz"
+    real_column: str = "Re(Z)/Ohm"
+    imaginary_column: str = "-Im(Z)/Ohm"
+    current_column: str = "<I>/mA"
+    time_column: str = "time/s"
+    voltage_column: str = "<Ewe>/V"
+    cycle_column: str = "cycle number"
 
 
 @dataclass(frozen=True)
@@ -1078,21 +1078,21 @@ def _read_delimited_eis_dataframe(
             + ". Expected columns such as frequency, Re(Z), and -Im(Z)."
         )
 
-    rename = {frequency: "freq_hz", real: "re_zwe_ce_ohm"}
+    rename = {frequency: "freq_hz", real: "re_z_ohm"}
     dataframe = dataframe.rename(columns=rename)
     if minus_imaginary is not None:
-        dataframe = dataframe.rename(columns={minus_imaginary: "minus_im_zwe_ce_ohm"})
+        dataframe = dataframe.rename(columns={minus_imaginary: "minus_im_z_ohm"})
     else:
-        dataframe = dataframe.rename(columns={imaginary: "minus_im_zwe_ce_ohm"})
-        dataframe["minus_im_zwe_ce_ohm"] = -pd.to_numeric(
-            dataframe["minus_im_zwe_ce_ohm"], errors="coerce"
+        dataframe = dataframe.rename(columns={imaginary: "minus_im_z_ohm"})
+        dataframe["minus_im_z_ohm"] = -pd.to_numeric(
+            dataframe["minus_im_z_ohm"], errors="coerce"
         )
-    for column in ("freq_hz", "re_zwe_ce_ohm", "minus_im_zwe_ce_ohm"):
+    for column in ("freq_hz", "re_z_ohm", "minus_im_z_ohm"):
         dataframe[column] = pd.to_numeric(dataframe[column], errors="coerce")
     optional_columns = {
         "current": "i_ma",
         "time": "time_s",
-        "voltage": "ewe_ece_v",
+        "voltage": "ewe_v",
         "cycle": "cycle_number",
     }
     for option_name, target_name in optional_columns.items():
@@ -1108,12 +1108,12 @@ def _read_delimited_eis_dataframe(
             dataframe = dataframe.rename(columns={source_name: target_name})
         dataframe[target_name] = pd.to_numeric(dataframe[target_name], errors="coerce")
     dataframe = dataframe.dropna(
-        subset=["freq_hz", "re_zwe_ce_ohm", "minus_im_zwe_ce_ohm"]
+        subset=["freq_hz", "re_z_ohm", "minus_im_z_ohm"]
     ).reset_index(drop=True)
     if dataframe.empty:
         raise ValueError(f"No numeric impedance rows were found in {path.name}")
-    if "ewe_ece_v" not in dataframe:
-        dataframe["ewe_ece_v"] = 0.0
+    if "ewe_v" not in dataframe:
+        dataframe["ewe_v"] = 0.0
     if "cycle_number" not in dataframe:
         dataframe["cycle_number"] = 1
     return dataframe, {}, "PEIS"
