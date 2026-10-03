@@ -1377,6 +1377,8 @@ class EISApplication:
         )
         self.root.bind("<Control-s>", self._on_control_s)
         self.root.bind("<Control-S>", self._on_control_s)
+        self.root.bind("<Control-n>", lambda _event: self.new_project())
+        self.root.bind("<Control-N>", lambda _event: self.new_project())
         self.root.bind("<Control-l>", lambda _event: self.load_project())
         self.root.bind("<Control-L>", lambda _event: self.load_project())
         self.root.bind("<Control-i>", lambda _event: self.import_data())
@@ -1456,6 +1458,11 @@ class EISApplication:
         menu_bar = tk.Menu(self.root)
         self.file_menu = tk.Menu(menu_bar, tearoff=False)
         self.file_menu.add_command(
+            label="New project",
+            accelerator="Ctrl+N",
+            command=self.new_project,
+        )
+        self.file_menu.add_command(
             label="Import data…",
             accelerator="Ctrl+I",
             command=self.import_data,
@@ -1479,6 +1486,7 @@ class EISApplication:
         self.file_menu.add_command(label="Exit", command=self.close)
         menu_bar.add_cascade(label="File", menu=self.file_menu)
         self._project_menu_actions = (
+            "New project",
             "Load RelaxIS 3 project",
             "Load project…",
             "Save project…",
@@ -16836,6 +16844,31 @@ class EISApplication:
             )
         finally:
             shutil.rmtree(temporary_directory, ignore_errors=True)
+
+    def new_project(self) -> None:
+        if self.busy:
+            return
+        if self._project_has_unsaved_changes():
+            decision = messagebox.askyesnocancel(
+                "Unsaved changes",
+                "The project has unsaved changes. Save before creating a new project?",
+                parent=self.root,
+            )
+            if decision is None:
+                return
+            if decision:
+                if self.project_path is not None:
+                    self.save_project(self.project_path)
+                else:
+                    self.save_project()
+                if self._project_has_unsaved_changes():
+                    return
+        self._clear_loaded_view("Creating new project")
+        self.project_path = None
+        self._saved_project_signature = None
+        self._update_window_title()
+        self._set_controls_enabled(True)
+        self.status_var.set("New project created")
 
     def load_project(self) -> None:
         if self.busy:
