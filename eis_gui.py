@@ -2757,8 +2757,20 @@ class EISApplication:
         ttk.Label(
             self.ml_controls, textvariable=self.ml_results_status_var
         ).pack(side=tk.LEFT, padx=(10, 0))
+        # Create horizontal paned window for main plot and DRT panel
+        self.plot_paned = ttk.Panedwindow(self.plot_frame, orient=tk.HORIZONTAL)
+        self.plot_paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        
+        # Left pane for main plot (Nyquist/Bode)
+        self.plot_pane = ttk.Frame(self.plot_paned)
+        self.plot_paned.add(self.plot_pane, weight=3)
+        
+        # Right pane for DRT plot
+        self.analysis_pane = ttk.Frame(self.plot_paned)
+        self.plot_paned.add(self.analysis_pane, weight=1)
+        
         self.figure = Figure(figsize=(7.5, 6.5), dpi=100, constrained_layout=True)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_pane)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.canvas.mpl_connect("button_press_event", self._on_plot_button_press)
@@ -2768,6 +2780,17 @@ class EISApplication:
         self._attach_plot_export_menu(
             self.canvas, self.plot_frame, reset_callback=self.reset_plot_view
         )
+        
+        # Create separate figure for DRT panel
+        self.analysis_figure = Figure(figsize=(4.0, 6.5), dpi=100, constrained_layout=True)
+        self.analysis_canvas = FigureCanvasTkAgg(self.analysis_figure, master=self.analysis_pane)
+        self.analysis_canvas.draw()
+        self.analysis_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.analysis_canvas.mpl_connect("button_press_event", self._on_plot_button_press)
+        self.analysis_canvas.mpl_connect("button_release_event", self._on_plot_button_release)
+        self.analysis_canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
+        self.analysis_canvas.mpl_connect("scroll_event", self._on_plot_scroll)
+        
         self._configure_plot_layout()
 
     @staticmethod
@@ -3860,6 +3883,7 @@ class EISApplication:
 
     def _configure_plot_layout(self) -> None:
         self.figure.clear()
+        self.analysis_figure.clear()
         self.phase_axes = None
         self.kk_axes = None
         self.drt_axes = None
@@ -3870,57 +3894,21 @@ class EISApplication:
         show_drt = self.show_drt_var.get()
         show_kk = self.show_kk_var.get()
         
-        # Use gridspec to create the layout
-        # Main plot extends to fill the area where analysis plots would be
-        if show_spectrum and show_drt and show_kk:
-            # 2x2 grid: main plot spans top-left, KK at bottom-left, DRT at full right
-            grid = self.figure.add_gridspec(
-                2,
-                2,
-                width_ratios=[2.0, 1.0],
-                height_ratios=[1.0, 0.42],
-            )
-            # Main plot spans top-left cell
-            self.axes = self.figure.add_subplot(grid[0, 0])
-            self.kk_axes = self.figure.add_subplot(grid[1, 0])
-            self.drt_axes = self.figure.add_subplot(grid[:, 1])
-        elif show_spectrum and show_drt:
-            # 1x2 grid: main plot spans left, DRT at right
-            grid = self.figure.add_gridspec(1, 2, width_ratios=[2.0, 1.0])
-            # Main plot extends to cover both cells (full width)
-            self.axes = self.figure.add_subplot(grid[0, :])
-            # DRT in right cell as inset
-            self.drt_axes = self.figure.add_subplot(grid[0, 1])
-        elif show_spectrum and show_kk:
-            # 2x1 grid: main plot spans top, KK at bottom
-            grid = self.figure.add_gridspec(2, 1, height_ratios=[1.0, 0.42])
-            # Main plot extends to cover both cells (full height)
-            self.axes = self.figure.add_subplot(grid[:, 0])
-            self.kk_axes = self.figure.add_subplot(grid[1, 0])
-            self.drt_axes = None
-        elif show_spectrum:
-            self.axes = self.figure.add_subplot(111)
-            self.drt_axes = None
-        elif show_drt and show_kk:
-            grid = self.figure.add_gridspec(2, 1, height_ratios=[0.42, 1.0])
-            self.kk_axes = self.figure.add_subplot(grid[0, 0])
-            self.drt_axes = self.figure.add_subplot(grid[1, 0])
-        elif show_drt:
-            self.drt_axes = self.figure.add_subplot(111)
-        elif show_kk:
-            self.kk_axes = self.figure.add_subplot(111)
+        # Configure main plot in left figure
+        if not show_spectrum:
+            self.axes = self.figure.add_axes([0.0, 0.0, 0.0, 0.0])
         else:
-            self.drt_axes = None
-            if not show_spectrum:
-                self.axes = self.figure.add_axes([0.0, 0.0, 0.0, 0.0])
+            self.axes = self.figure.add_subplot(111)
+        
         if self.plot_mode == "bode":
             self._configure_bode_plot()
         else:
             self._configure_nyquist_plot()
+        
         if not show_spectrum:
             self.axes.set_visible(False)
         
-        # Create artists for main spectrum plot
+        # Main plot artists
         (self.drt_fit_artist,) = self.axes.plot(
             [], [], "-", color="#00897b", linewidth=1.8, alpha=0.9, label="DRT fit"
         )
@@ -3983,6 +3971,37 @@ class EISApplication:
             self.phase_axes.axhline(
                 0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0
             )
+        
+        # Configure analysis figure (right pane) based on what's shown
+        if show_drt and show_kk:
+            # Both DRT and KK: DRT on top, KK on bottom
+            grid = self.analysis_figure.add_gridspec(2, 1, height_ratios=[1.0, 0.42])
+            self.drt_axes = self.analysis_figure.add_subplot(grid[0, 0])
+            self.kk_axes = self.analysis_figure.add_subplot(grid[1, 0])
+        elif show_drt:
+            # Only DRT
+            self.drt_axes = self.analysis_figure.add_subplot(111)
+        elif show_kk:
+            # Only KK
+            self.kk_axes = self.analysis_figure.add_subplot(111)
+        
+        # Configure DRT axes
+        if self.drt_axes is not None:
+            self.drt_axes.set_xscale("log")
+            self.drt_axes.set_xlabel("Tau / s")
+            self.drt_axes.set_ylabel("Gamma / Ohm")
+            self.drt_axes.grid(True, alpha=0.25)
+            self.drt_axes.axhline(
+                0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0
+            )
+            (self.drt_artist,) = self.drt_axes.plot(
+                [], [], "-", color="#6a1b9a", linewidth=1.8, alpha=0.9, label="Ridge DRT"
+            )
+            self.drt_axes.legend(loc="best")
+        else:
+            self.drt_artist = None
+        
+        # Configure KK axes
         if self.kk_axes is not None:
             self.kk_axes.axhline(0.0, color="#666666", linewidth=0.8, alpha=0.5)
             self.kk_axes.axhline(
@@ -4002,22 +4021,10 @@ class EISApplication:
         else:
             self.kk_real_artist = None
             self.kk_imag_artist = None
-        if self.drt_axes is not None:
-            self.drt_axes.set_xscale("log")
-            self.drt_axes.set_xlabel("Tau / s")
-            self.drt_axes.set_ylabel("Gamma / Ohm")
-            self.drt_axes.grid(True, alpha=0.25)
-            self.drt_axes.axhline(
-                0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0
-            )
-            (self.drt_artist,) = self.drt_axes.plot(
-                [], [], "-", color="#6a1b9a", linewidth=1.8, alpha=0.9, label="Ridge DRT"
-            )
-            self.drt_axes.legend(loc="best")
-        else:
-            self.drt_artist = None
+        
         self._update_legend_visibility()
         self.canvas.draw_idle()
+        self.analysis_canvas.draw_idle()
 
     def _build_explorer(self, parent: ttk.Frame) -> None:
         group = ttk.LabelFrame(parent, padding=6)
