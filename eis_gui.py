@@ -3862,50 +3862,65 @@ class EISApplication:
         self.figure.clear()
         self.phase_axes = None
         self.kk_axes = None
+        self.drt_axes = None
         self._drt_peak_artists = []
         self._drt_peak_sum_artist = None
         self._update_plot_mode_button()
         show_spectrum = self.show_spectrum_var.get()
-        if not show_spectrum:
-            self.axes = self.figure.add_axes([0.0, 0.0, 0.0, 0.0])
-        if show_spectrum and self.show_drt_var.get() and self.show_kk_var.get():
+        show_drt = self.show_drt_var.get()
+        show_kk = self.show_kk_var.get()
+        
+        # Use gridspec to create the layout
+        # Main plot extends to fill the area where analysis plots would be
+        if show_spectrum and show_drt and show_kk:
+            # 2x2 grid: main plot spans top-left, KK at bottom-left, DRT at full right
             grid = self.figure.add_gridspec(
                 2,
                 2,
-                width_ratios=[1.55, 1.0],
+                width_ratios=[2.0, 1.0],
                 height_ratios=[1.0, 0.42],
             )
+            # Main plot spans top-left cell
             self.axes = self.figure.add_subplot(grid[0, 0])
             self.kk_axes = self.figure.add_subplot(grid[1, 0])
             self.drt_axes = self.figure.add_subplot(grid[:, 1])
-        elif show_spectrum and self.show_drt_var.get():
-            grid = self.figure.add_gridspec(1, 2, width_ratios=[1.55, 1.0])
-            self.axes = self.figure.add_subplot(grid[0, 0])
+        elif show_spectrum and show_drt:
+            # 1x2 grid: main plot spans left, DRT at right
+            grid = self.figure.add_gridspec(1, 2, width_ratios=[2.0, 1.0])
+            # Main plot extends to cover both cells (full width)
+            self.axes = self.figure.add_subplot(grid[0, :])
+            # DRT in right cell as inset
             self.drt_axes = self.figure.add_subplot(grid[0, 1])
-        elif show_spectrum and self.show_kk_var.get():
+        elif show_spectrum and show_kk:
+            # 2x1 grid: main plot spans top, KK at bottom
             grid = self.figure.add_gridspec(2, 1, height_ratios=[1.0, 0.42])
-            self.axes = self.figure.add_subplot(grid[0, 0])
+            # Main plot extends to cover both cells (full height)
+            self.axes = self.figure.add_subplot(grid[:, 0])
             self.kk_axes = self.figure.add_subplot(grid[1, 0])
             self.drt_axes = None
         elif show_spectrum:
             self.axes = self.figure.add_subplot(111)
             self.drt_axes = None
-        elif self.show_drt_var.get() and self.show_kk_var.get():
+        elif show_drt and show_kk:
             grid = self.figure.add_gridspec(2, 1, height_ratios=[0.42, 1.0])
             self.kk_axes = self.figure.add_subplot(grid[0, 0])
             self.drt_axes = self.figure.add_subplot(grid[1, 0])
-        elif self.show_drt_var.get():
+        elif show_drt:
             self.drt_axes = self.figure.add_subplot(111)
-        elif self.show_kk_var.get():
+        elif show_kk:
             self.kk_axes = self.figure.add_subplot(111)
         else:
             self.drt_axes = None
+            if not show_spectrum:
+                self.axes = self.figure.add_axes([0.0, 0.0, 0.0, 0.0])
         if self.plot_mode == "bode":
             self._configure_bode_plot()
         else:
             self._configure_nyquist_plot()
         if not show_spectrum:
             self.axes.set_visible(False)
+        
+        # Create artists for main spectrum plot
         (self.drt_fit_artist,) = self.axes.plot(
             [], [], "-", color="#00897b", linewidth=1.8, alpha=0.9, label="DRT fit"
         )
