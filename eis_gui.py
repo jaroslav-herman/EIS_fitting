@@ -2769,6 +2769,9 @@ class EISApplication:
         self.analysis_pane = ttk.Frame(self.plot_paned)
         self.plot_paned.add(self.analysis_pane, weight=1)
         
+        # Bind to paned window sash movement for smooth resizing
+        self.plot_paned.bind("<B1-Motion>", self._on_paned_sash_moved)
+        
         self.figure = Figure(figsize=(7.5, 6.5), dpi=100, constrained_layout=True)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_pane)
         self.canvas.draw()
@@ -2900,6 +2903,13 @@ class EISApplication:
             axis.get_legend() is not None and axis.get_legend().get_visible()
             for axis in self._canvas_axes(canvas)
         )
+
+    def _on_paned_sash_moved(self, event=None) -> None:
+        """Callback for when paned window divider is moved - redraw both canvases."""
+        if hasattr(self, 'canvas') and self.canvas is not None:
+            self.canvas.draw_idle()
+        if hasattr(self, 'analysis_canvas') and self.analysis_canvas is not None:
+            self.analysis_canvas.draw_idle()
 
     def _toggle_canvas_grid(self, canvas) -> None:
         visible = not self._canvas_grid_state(canvas)
@@ -3711,7 +3721,7 @@ class EISApplication:
         self.phase_axes = None
         self.axes.set_xlabel("Re(Z) / Ohm")
         self.axes.set_ylabel("-Im(Z) / Ohm")
-        self.axes.set_aspect("equal", adjustable="box")
+        self.axes.set_aspect("equal", adjustable="datalim")
         self.axes.grid(True, alpha=0.25)
         self.axes.axhline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
         self.axes.axvline(0.0, color="#444444", linewidth=1.2, alpha=0.85, zorder=0)
@@ -9216,8 +9226,49 @@ class EISApplication:
         y_span = y_max - y_min
         x_padding = 0.06 * (x_span if x_span > 0 else max(abs(x_min), 1.0))
         y_padding = 0.06 * (y_span if y_span > 0 else max(abs(y_min), 1.0))
-        self.axes.set_xlim(x_min - x_padding, x_max + x_padding)
-        self.axes.set_ylim(y_min - y_padding, y_max + y_padding)
+        # For Nyquist plot, maintain equal aspect ratio while filling the area
+        if self.plot_mode == "nyquist":
+            desired_x_min = x_min - x_padding
+            desired_x_max = x_max + x_padding
+            desired_y_min = y_min - y_padding
+            desired_y_max = y_max + y_padding
+            fig_width = self.figure.get_size_inches()[0] * self.figure.dpi
+            fig_height = self.figure.get_size_inches()[1] * self.figure.dpi
+            ax_pos = self.axes.get_position()
+            ax_width = ax_pos.width * fig_width
+            ax_height = ax_pos.height * fig_height
+            if ax_width > 0 and ax_height > 0:
+                pixel_aspect = ax_width / ax_height
+                data_x_span = desired_x_max - desired_x_min
+                data_y_span = desired_y_max - desired_y_min
+                if data_x_span > 0 and data_y_span > 0:
+                    data_aspect = data_x_span / data_y_span
+                    if data_aspect < pixel_aspect:
+                        center_y = (desired_y_min + desired_y_max) / 2
+                        new_y_span = data_x_span / pixel_aspect
+                        new_y_min = center_y - new_y_span / 2
+                        new_y_max = center_y + new_y_span / 2
+                        self.axes.set_xlim(desired_x_min, desired_x_max)
+                        self.axes.set_ylim(new_y_min, new_y_max)
+                    elif data_aspect > pixel_aspect:
+                        center_x = (desired_x_min + desired_x_max) / 2
+                        new_x_span = data_y_span * pixel_aspect
+                        new_x_min = center_x - new_x_span / 2
+                        new_x_max = center_x + new_x_span / 2
+                        self.axes.set_xlim(new_x_min, new_x_max)
+                        self.axes.set_ylim(desired_y_min, desired_y_max)
+                    else:
+                        self.axes.set_xlim(desired_x_min, desired_x_max)
+                        self.axes.set_ylim(desired_y_min, desired_y_max)
+                else:
+                    self.axes.set_xlim(desired_x_min, desired_x_max)
+                    self.axes.set_ylim(desired_y_min, desired_y_max)
+            else:
+                self.axes.set_xlim(desired_x_min, desired_x_max)
+                self.axes.set_ylim(desired_y_min, desired_y_max)
+        else:
+            self.axes.set_xlim(x_min - x_padding, x_max + x_padding)
+            self.axes.set_ylim(y_min - y_padding, y_max + y_padding)
 
     def _autoscale_drt(self, cycle) -> None:
         if (
