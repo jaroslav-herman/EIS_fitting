@@ -3918,6 +3918,12 @@ class EISApplication:
         if not show_spectrum:
             self.axes.set_visible(False)
         
+        # Show/hide analysis pane based on whether DRT or KK is shown
+        if show_drt or show_kk:
+            self.analysis_pane.pack(fill=tk.BOTH, expand=True)
+        else:
+            self.analysis_pane.pack_forget()
+        
         # Main plot artists
         (self.drt_fit_artist,) = self.axes.plot(
             [], [], "-", color="#00897b", linewidth=1.8, alpha=0.9, label="DRT fit"
