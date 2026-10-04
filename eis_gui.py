@@ -16065,6 +16065,19 @@ class EISApplication:
         controls.pack(side=tk.TOP, fill=tk.X)
         toggle_button = ttk.Button(controls)
         toggle_button.pack(side=tk.LEFT)
+        legend_state = {"value": True}
+        legend_var = tk.BooleanVar(value=True)
+
+        def _toggle_popup_legend() -> None:
+            legend_state["value"] = legend_var.get()
+            _render_popup()
+
+        ttk.Checkbutton(
+            controls,
+            text="Show legend",
+            variable=legend_var,
+            command=_toggle_popup_legend,
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
         figure = Figure(figsize=(8.2, 6.2), dpi=100, constrained_layout=True)
         canvas = FigureCanvasTkAgg(figure, master=popup)
@@ -16136,13 +16149,14 @@ class EISApplication:
                     axes.set_xlim(x_min, x_max)
                     axes.set_ylim(y_min, y_max)
                     phase_axes.set_ylim(phase_min, phase_max)
-                magnitude_handles, magnitude_labels = axes.get_legend_handles_labels()
-                phase_handles, phase_labels = phase_axes.get_legend_handles_labels()
-                axes.legend(
-                    magnitude_handles + phase_handles,
-                    magnitude_labels + phase_labels,
-                    loc="best",
-                )
+                if legend_state["value"]:
+                    magnitude_handles, magnitude_labels = axes.get_legend_handles_labels()
+                    phase_handles, phase_labels = phase_axes.get_legend_handles_labels()
+                    axes.legend(
+                        magnitude_handles + phase_handles,
+                        magnitude_labels + phase_labels,
+                        loc="best",
+                    )
             else:
                 axes = figure.add_subplot(111)
                 phase_axes = None
@@ -16181,7 +16195,8 @@ class EISApplication:
                     x_min, x_max, y_min, y_max = limits
                     axes.set_xlim(x_min, x_max)
                     axes.set_ylim(y_min, y_max)
-                axes.legend(loc="best")
+                if legend_state["value"]:
+                    axes.legend(loc="best")
             popup_axes["main"] = axes
             popup_axes["phase"] = phase_axes
             toggle_button.configure(
@@ -16237,6 +16252,7 @@ class EISApplication:
         popup.minsize(640, 480)
 
         mode_state = {"value": self._selected_drt_mode()}
+        legend_state = {"value": True}
         controls = ttk.Frame(popup, padding=(8, 8, 8, 0))
         controls.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(controls, text="DRT mode").pack(side=tk.LEFT, padx=(0, 6))
@@ -16251,6 +16267,18 @@ class EISApplication:
             width=12,
         )
         mode_box.pack(side=tk.LEFT)
+        legend_var = tk.BooleanVar(value=True)
+
+        def _toggle_popup_legend() -> None:
+            legend_state["value"] = legend_var.get()
+            _render_popup()
+
+        ttk.Checkbutton(
+            controls,
+            text="Show legend",
+            variable=legend_var,
+            command=_toggle_popup_legend,
+        ).pack(side=tk.LEFT, padx=(10, 0))
 
         figure = Figure(figsize=(8.2, 6.2), dpi=100, constrained_layout=True)
         canvas = FigureCanvasTkAgg(figure, master=popup)
@@ -16328,7 +16356,8 @@ class EISApplication:
                 axes.set_xlim(x_min, x_max)
                 axes.set_ylim(y_min, y_max)
             axes.set_title("Ridge DRT" if mode_state["value"] == "ridge" else "Hybrid DRT")
-            axes.legend(loc="best")
+            if legend_state["value"]:
+                axes.legend(loc="best")
             canvas.draw_idle()
 
         def _reset_popup_view() -> None:
