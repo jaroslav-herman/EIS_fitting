@@ -5,6 +5,7 @@ import copy
 from io import BytesIO
 import json
 import joblib
+import logging
 import os
 from pathlib import Path
 import re
@@ -24,6 +25,20 @@ from natsort import natsort_keygen, ns
 from scipy.optimize import curve_fit
 from scipy.special import voigt_profile
 from wepy.eis import tau as cpe_tau
+
+
+class _IgnoreFixedAspectLimitsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not (
+            message.startswith("Ignoring fixed y limits")
+            or message.startswith("Ignoring fixed x limits")
+        )
+
+
+logging.getLogger("matplotlib.axes._base").addFilter(
+    _IgnoreFixedAspectLimitsFilter()
+)
 
 from eis_model import CycleState, ParameterValue, ProjectState
 from eis_project import (
@@ -3920,9 +3935,11 @@ class EISApplication:
         
         # Show/hide analysis pane based on whether DRT or KK is shown
         if show_drt or show_kk:
-            self.analysis_pane.pack(fill=tk.BOTH, expand=True)
+            if self.analysis_pane not in self.plot_paned.panes():
+                self.plot_paned.add(self.analysis_pane, weight=1)
         else:
-            self.analysis_pane.pack_forget()
+            if self.analysis_pane in self.plot_paned.panes():
+                self.plot_paned.forget(self.analysis_pane)
         
         # Main plot artists
         (self.drt_fit_artist,) = self.axes.plot(
@@ -9227,49 +9244,56 @@ class EISApplication:
         y_span = y_max - y_min
         x_padding = 0.06 * (x_span if x_span > 0 else max(abs(x_min), 1.0))
         y_padding = 0.06 * (y_span if y_span > 0 else max(abs(y_min), 1.0))
-        # For Nyquist plot, maintain equal aspect ratio while filling the area
+        # For Nyquist plot, maintain equal aspect ratio while filling the area.
+        # The tight limits are set first, then the axis with the smaller data
+        # span relative to the box is expanded so the equal-aspect constraint
+        # holds and every active point stays inside the view.
         if self.plot_mode == "nyquist":
-            desired_x_min = x_min - x_padding
-            desired_x_max = x_max + x_padding
-            desired_y_min = y_min - y_padding
-            desired_y_max = y_max + y_padding
-            fig_width = self.figure.get_size_inches()[0] * self.figure.dpi
-            fig_height = self.figure.get_size_inches()[1] * self.figure.dpi
-            ax_pos = self.axes.get_position()
-            ax_width = ax_pos.width * fig_width
-            ax_height = ax_pos.height * fig_height
-            if ax_width > 0 and ax_height > 0:
-                pixel_aspect = ax_width / ax_height
-                data_x_span = desired_x_max - desired_x_min
-                data_y_span = desired_y_max - desired_y_min
-                if data_x_span > 0 and data_y_span > 0:
-                    data_aspect = data_x_span / data_y_span
-                    if data_aspect < pixel_aspect:
-                        center_y = (desired_y_min + desired_y_max) / 2
-                        new_y_span = data_x_span / pixel_aspect
-                        new_y_min = center_y - new_y_span / 2
-                        new_y_max = center_y + new_y_span / 2
-                        self.axes.set_xlim(desired_x_min, desired_x_max)
-                        self.axes.set_ylim(new_y_min, new_y_max)
-                    elif data_aspect > pixel_aspect:
-                        center_x = (desired_x_min + desired_x_max) / 2
-                        new_x_span = data_y_span * pixel_aspect
-                        new_x_min = center_x - new_x_span / 2
-                        new_x_max = center_x + new_x_span / 2
-                        self.axes.set_xlim(new_x_min, new_x_max)
-                        self.axes.set_ylim(desired_y_min, desired_y_max)
-                    else:
-                        self.axes.set_xlim(desired_x_min, desired_x_max)
-                        self.axes.set_ylim(desired_y_min, desired_y_max)
-                else:
-                    self.axes.set_xlim(desired_x_min, desired_x_max)
-                    self.axes.set_ylim(desired_y_min, desired_y_max)
-            else:
-                self.axes.set_xlim(desired_x_min, desired_x_max)
-                self.axes.set_ylim(desired_y_min, desired_y_max)
+            self.axes.set_xlim(x_min - x_padding, x_max + x_padding)
+            self.axes.set_ylim(y_min - y_padding, y_max + y_padding)
+            self._expand_limits_for_equal_aspect(self.axes)
         else:
             self.axes.set_xlim(x_min - x_padding, x_max + x_padding)
             self.axes.set_ylim(y_min - y_padding, y_max + y_padding)
+
+    @staticmethod
+    def _axes_pixel_aspect(axes, figure) -> float | None:
+        limits = (axes.get_xlim(), axes.get_ylim())
+        try:
+            figure.draw_without_rendering()
+        except Exception:
+            pass
+        bbox = axes.bbox
+        aspect = (
+            float(bbox.width / bbox.height)
+            if bbox.width > 0 and bbox.height > 0
+            else None
+        )
+        axes.set_xlim(*limits[0])
+        axes.set_ylim(*limits[1])
+        return aspect
+
+    def _expand_limits_for_equal_aspect(self, axes) -> None:
+        if axes is None or axes.get_aspect() not in ("equal", 1, 1.0):
+            return
+        pixel_aspect = self._axes_pixel_aspect(axes, axes.figure)
+        if pixel_aspect is None:
+            return
+        x_min, x_max = axes.get_xlim()
+        y_min, y_max = axes.get_ylim()
+        x_span = x_max - x_min
+        y_span = y_max - y_min
+        if x_span <= 0 or y_span <= 0:
+            return
+        data_aspect = x_span / y_span
+        if data_aspect > pixel_aspect:
+            center_y = (y_min + y_max) / 2
+            new_y_span = x_span / pixel_aspect
+            axes.set_ylim(center_y - new_y_span / 2, center_y + new_y_span / 2)
+        elif data_aspect < pixel_aspect:
+            center_x = (x_min + x_max) / 2
+            new_x_span = y_span * pixel_aspect
+            axes.set_xlim(center_x - new_x_span / 2, center_x + new_x_span / 2)
 
     def _autoscale_drt(self, cycle) -> None:
         if (
