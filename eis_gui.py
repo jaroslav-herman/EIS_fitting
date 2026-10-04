@@ -9186,6 +9186,8 @@ class EISApplication:
         self._refresh_ml_visuals()
         self._refresh_explorer_values()
         self.canvas.draw_idle()
+        if self.drt_axes is not None or self.kk_axes is not None:
+            self.analysis_canvas.draw_idle()
 
     def _autoscale_to_included(self, cycle) -> None:
         if self.show_all_points_var.get():
