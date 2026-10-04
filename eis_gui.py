@@ -2661,7 +2661,7 @@ class EISApplication:
         self.auto_fit_points_button.pack(side=tk.LEFT, padx=(6, 0))
         self.reset_view_button = ttk.Button(
             self.plot_controls,
-            text="Active zoom",
+            text="Active points",
             command=self.reset_plot_view,
         )
         self.reset_view_button.pack(side=tk.LEFT, padx=(6, 0))
@@ -5840,7 +5840,7 @@ class EISApplication:
             f"6  Show DRT fit: {'On' if self.show_drt_fit_var.get() else 'Off'}\n"
             f"9  Show DRT recovered: {'On' if self.show_drt_recovered_var.get() else 'Off'}\n"
             f"b  Nyquist/Bode: {self.plot_mode.title()}\n"
-            "q  Active zoom"
+            "q  Active points"
         )
         ttk.Label(popup, text=status, justify="left", padding=(12, 4, 12, 12)).pack()
         popup.grab_set()
@@ -9142,12 +9142,7 @@ class EISApplication:
             else:
                 self.kk_real_artist.set_data([], [])
                 self.kk_imag_artist.set_data([], [])
-        self.axes.set_title(
-            (
-                f"{self.loaded.dataset_label if self.loaded is not None else self._current_name()}\n"
-                f"Cycle {cycle.cycle} · {cycle.model(self.state.circuit)}"
-            )
-        )
+        self.axes.set_title("")
         if self.drt_artist is not None and self.drt_axes is not None:
             drt_tau_s, drt_gamma_ohm, drt_label = self._apply_saved_drt_mode(cycle)
             if drt_tau_s is None or drt_gamma_ohm is None:
@@ -10272,7 +10267,7 @@ class EISApplication:
             self._update_status(f"{self.plot_mode.title()} view")
             return
         if self.state is None:
-            self.axes.set_title("No spectrum loaded")
+            self.axes.set_title("")
             if self.drt_axes is not None:
                 self.drt_axes.set_title("Ridge DRT")
             self.canvas.draw_idle()
@@ -10337,7 +10332,7 @@ class EISApplication:
             self.canvas.draw_idle()
             return
         if self.state is None:
-            self.axes.set_title("No spectrum loaded")
+            self.axes.set_title("")
             if self.drt_axes is not None:
                 self.drt_axes.set_title("Ridge DRT")
         else:
@@ -10351,7 +10346,7 @@ class EISApplication:
             self.canvas.draw_idle()
             return
         if self.state is None:
-            self.axes.set_title("No spectrum loaded")
+            self.axes.set_title("")
             if self.drt_axes is not None:
                 self.drt_axes.set_title("Ridge DRT")
         else:
@@ -10519,7 +10514,7 @@ class EISApplication:
     def toggle_kk_view(self) -> None:
         self._configure_plot_layout()
         if self.state is None:
-            self.axes.set_title("No spectrum loaded")
+            self.axes.set_title("")
         else:
             self._refresh_plot(rescale=True)
             if self.show_kk_var.get():
@@ -10697,7 +10692,7 @@ class EISApplication:
             self.drt_axes.set_title("Ridge DRT")
         if self.kk_axes is not None:
             self.kk_axes.set_title("Lin-KK residuals")
-        self.axes.set_title("No spectrum loaded")
+        self.axes.set_title("")
         self.canvas.draw_idle()
         self.status_var.set(message)
         self._update_window_title()
