@@ -2808,6 +2808,12 @@ class EISApplication:
         self.analysis_canvas.mpl_connect("button_release_event", self._on_plot_button_release)
         self.analysis_canvas.mpl_connect("motion_notify_event", self._on_plot_motion)
         self.analysis_canvas.mpl_connect("scroll_event", self._on_plot_scroll)
+        self._attach_plot_export_menu(
+            self.analysis_canvas,
+            self.plot_frame,
+            reset_callback=self.reset_analysis_view,
+            bind_navigation=False,
+        )
         
         self._configure_plot_layout()
 
@@ -3041,12 +3047,13 @@ class EISApplication:
         canvas,
         owner: tk.Misc | None = None,
         reset_callback: Callable[[], None] | None = None,
+        bind_navigation: bool = True,
     ) -> None:
         """Add the common displayed-data export menu to a Matplotlib canvas."""
         if getattr(canvas, "_eis_plot_export_bound", False):
             return
         canvas._eis_plot_export_bound = True
-        if canvas is not getattr(self, "canvas", None):
+        if bind_navigation and canvas is not getattr(self, "canvas", None):
             self._attach_plot_navigation(canvas, reset_callback)
         menu_owner = owner or self.root
         widget = canvas.get_tk_widget()
@@ -9531,7 +9538,7 @@ class EISApplication:
         if detached is not None:
             detached.set_highlighted_names(names)
         self._refresh_drt_peak_artists()
-        self.canvas.draw_idle()
+        self.analysis_canvas.draw_idle()
 
     def _on_drt_parameter_double_click(self, name: str) -> None:
         match = re.fullmatch(r"Peak(\d+)_.*", name)
@@ -10263,6 +10270,25 @@ class EISApplication:
             frequency = frequency[finite_frequency]
             self.kk_axes.set_xlim(float(np.min(frequency)), float(np.max(frequency)))
 
+    def _canvas_for_axes(self, axes):
+        if axes is None:
+            return None
+        if axes.figure is self.figure:
+            return self.canvas
+        if axes.figure is self.analysis_figure:
+            return self.analysis_canvas
+        return None
+
+    def reset_analysis_view(self) -> None:
+        if self.state is None:
+            self.analysis_canvas.draw_idle()
+            return
+        cycle = self.state.active
+        self._autoscale_drt(cycle)
+        self._autoscale_kk(cycle)
+        self.analysis_canvas.draw_idle()
+        self._update_status("analysis view reset")
+
     def reset_plot_view(self) -> None:
         if self.analysis_mode_var.get() == "Spectra Simulator":
             self._refresh_plot(rescale=True)
@@ -10863,7 +10889,7 @@ class EISApplication:
                     axes, event.xdata, event.ydata
                 )
                 self._zoom_state = state
-            self.canvas.draw_idle()
+            self._canvas_for_axes(axes).draw_idle()
 
     def _on_plot_button_release(self, event) -> None:
         if event.button == 1 and self._drt_peak_drag is not None:
@@ -10875,7 +10901,7 @@ class EISApplication:
             self._drt_peak_drag = None
             self._drt_peak_drag_moved = False
             self._update_drt_peak_table()
-            self.canvas.draw_idle()
+            self.analysis_canvas.draw_idle()
             return
         if event.button == 2:
             self._pan_state = None
@@ -10941,7 +10967,7 @@ class EISApplication:
                 )
             self._store_current_drt_peaks()
             self._refresh_drt_peak_artists()
-            self.canvas.draw_idle()
+            self.analysis_canvas.draw_idle()
             return
         if self._pan_state is None:
             if self._zoom_state is not None:
@@ -10953,7 +10979,7 @@ class EISApplication:
                     self._update_zoom_rectangle(
                         self._zoom_state["rectangle"], event.xdata, event.ydata
                     )
-                    self.canvas.draw_idle()
+                    self._canvas_for_axes(self._zoom_state["axes"]).draw_idle()
             if self._edit_state is not None:
                 if (
                     event.inaxes is self._edit_state["axes"]
@@ -10968,7 +10994,7 @@ class EISApplication:
             return
         self._hide_point_hover()
         self._pan_axes_from_state(self._pan_state, event)
-        self.canvas.draw_idle()
+        self._canvas_for_axes(self._pan_state["axes"]).draw_idle()
 
     def _on_plot_scroll(self, event) -> None:
         if self.busy or self.state is None or event.inaxes is None:
@@ -10980,7 +11006,7 @@ class EISApplication:
             return
         scale = 1 / 1.2 if event.button == "up" else 1.2
         self._zoom_axes_at_event(axes, event, scale)
-        self.canvas.draw_idle()
+        self._canvas_for_axes(axes).draw_idle()
 
     def _on_zoom_select(self, press_event, release_event) -> None:
         if (
@@ -11002,7 +11028,7 @@ class EISApplication:
             return
         press_event.inaxes.set_xlim(x0, x1)
         press_event.inaxes.set_ylim(y0, y1)
-        self.canvas.draw_idle()
+        self._canvas_for_axes(press_event.inaxes).draw_idle()
 
     def _on_edit_area_select(self, press_event, release_event) -> None:
         if (
