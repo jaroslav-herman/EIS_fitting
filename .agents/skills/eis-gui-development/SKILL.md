@@ -55,3 +55,7 @@ Run the narrow test first, then:
 ```
 
 For visible or event-driven changes, manually exercise the feature with the included small data after automated tests.
+
+## Chat output style
+
+Keep the final user-facing reply to a short result overview: what changed (commit hash), and one or two lines on the root cause/verification. Do not explain implementation details unless asked; the user will ask follow-up questions if needed.
