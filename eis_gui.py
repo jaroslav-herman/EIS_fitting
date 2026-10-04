@@ -1498,6 +1498,10 @@ class EISApplication:
             command=self.save_project,
         )
         self.file_menu.add_separator()
+        self.file_menu.add_command(
+            label="Load ML results file…",
+            command=self.load_ml_results_file,
+        )
         self.file_menu.add_command(label="Exit", command=self.close)
         menu_bar.add_cascade(label="File", menu=self.file_menu)
         self._project_menu_actions = (
@@ -1505,6 +1509,7 @@ class EISApplication:
             "Load RelaxIS 3 project",
             "Load project…",
             "Save project…",
+            "Load ML results file…",
         )
         self.fit_menu = tk.Menu(menu_bar, tearoff=False)
         self.fit_menu.add_command(
@@ -1557,6 +1562,10 @@ class EISApplication:
             command=self.open_procedure_builder,
         )
         menu_bar.add_cascade(label="Procedures", menu=self.procedure_menu)
+        menu_bar.add_command(
+            label="ML processing…",
+            command=self.open_ml_processing,
+        )
         menu_bar.add_command(
             label="Preferences",
             accelerator="Ctrl+P",
@@ -2735,43 +2744,6 @@ class EISApplication:
             variable=self.show_drt_recovered_var,
             command=self.toggle_drt_recovered_visibility,
         ).pack(side=tk.LEFT, padx=(8, 0))
-        self.ml_controls = ttk.LabelFrame(
-            self.plot_frame, text="ML results", padding=(6, 3)
-        )
-        self.ml_controls.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
-        ttk.Button(
-            self.ml_controls,
-            text="ML processing…",
-            command=self.open_ml_processing,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            self.ml_controls,
-            text="Load ML results file",
-            command=self.load_ml_results_file,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            self.ml_controls,
-            text="Apply ML EEC Model",
-            command=self.apply_ml_eec_to_selected,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            self.ml_controls,
-            text="Load ML Frequency Selection",
-            command=self.apply_ml_frequency_to_selected,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            self.ml_controls,
-            text="Apply ML Initial Parameters",
-            command=self.load_and_apply_ml_initial_parameters,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(
-            self.ml_controls,
-            text="Restore Original Selection",
-            command=self.restore_ml_original_selection,
-        ).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(
-            self.ml_controls, textvariable=self.ml_results_status_var
-        ).pack(side=tk.LEFT, padx=(10, 0))
         # Create horizontal paned window for main plot and DRT panel
         self.plot_paned = ttk.Panedwindow(self.plot_frame, orient=tk.HORIZONTAL)
         self.plot_paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
