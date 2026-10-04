@@ -3933,12 +3933,14 @@ class EISApplication:
         if not show_spectrum:
             self.axes.set_visible(False)
         
-        # Show/hide analysis pane based on whether DRT or KK is shown
+        # Show/hide analysis pane based on whether DRT or KK is shown.
+        # When neither is shown, the main plot pane fills the whole area.
+        pane_names = {str(pane) for pane in self.plot_paned.panes()}
         if show_drt or show_kk:
-            if self.analysis_pane not in self.plot_paned.panes():
+            if str(self.analysis_pane) not in pane_names:
                 self.plot_paned.add(self.analysis_pane, weight=1)
         else:
-            if self.analysis_pane in self.plot_paned.panes():
+            if str(self.analysis_pane) in pane_names:
                 self.plot_paned.forget(self.analysis_pane)
         
         # Main plot artists
