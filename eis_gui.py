@@ -6212,6 +6212,38 @@ class EISApplication:
 
     def _build_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        controls_shell = ttk.Frame(parent)
+        self.controls_shell = controls_shell
+        controls_shell.grid(row=0, column=0, sticky="nsew")
+        controls_shell.columnconfigure(0, weight=1)
+        controls_shell.rowconfigure(0, weight=1)
+        self.controls_canvas = tk.Canvas(controls_shell, highlightthickness=0)
+        self.controls_canvas.grid(row=0, column=0, sticky="nsew")
+        self.controls_scrollbar = ttk.Scrollbar(
+            controls_shell, orient=tk.VERTICAL, command=self.controls_canvas.yview
+        )
+        self.controls_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.controls_canvas.configure(yscrollcommand=self.controls_scrollbar.set)
+        controls_contents = ttk.Frame(self.controls_canvas)
+        self.controls_contents = controls_contents
+        controls_window = self.controls_canvas.create_window(
+            (0, 0), window=controls_contents, anchor="nw"
+        )
+        controls_contents.bind(
+            "<Configure>", lambda _event: self._update_controls_scroll_region()
+        )
+        self.controls_canvas.bind(
+            "<Configure>",
+            lambda event: self.controls_canvas.itemconfigure(
+                controls_window, width=event.width
+            ),
+        )
+        self.root.bind_all("<MouseWheel>", self._controls_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._controls_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self._controls_mousewheel, add="+")
+        parent = controls_contents
+        parent.columnconfigure(0, weight=1)
         mode_frame = ttk.Frame(parent)
         mode_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         mode_frame.columnconfigure(1, weight=1)
@@ -6732,6 +6764,42 @@ class EISApplication:
             self.parameter_scrollbar.grid_remove()
             self.parameter_canvas.yview_moveto(0)
 
+    def _update_controls_scroll_region(self) -> None:
+        if not hasattr(self, "controls_canvas"):
+            return
+        self.controls_canvas.configure(
+            scrollregion=self.controls_canvas.bbox("all") or (0, 0, 0, 0)
+        )
+        content_height = self.controls_contents.winfo_reqheight()
+        canvas_height = self.controls_canvas.winfo_height()
+        if content_height > canvas_height + 1:
+            self.controls_scrollbar.grid()
+        else:
+            self.controls_scrollbar.grid_remove()
+            self.controls_canvas.yview_moveto(0)
+
+    def _controls_mousewheel(self, event):
+        try:
+            widget = self.root.winfo_containing(event.x_root, event.y_root)
+        except (KeyError, tk.TclError):
+            return None
+        inside = False
+        while widget is not None:
+            if widget is self.controls_shell:
+                inside = True
+                break
+            widget = getattr(widget, "master", None)
+        if not inside:
+            return None
+        if getattr(event, "num", None) == 4:
+            direction = -1
+        elif getattr(event, "num", None) == 5:
+            direction = 1
+        else:
+            direction = -1 if event.delta > 0 else 1
+        self.controls_canvas.yview_scroll(direction, "units")
+        return "break"
+
     def _parameter_mousewheel(self, event):
         try:
             widget = self.root.winfo_containing(event.x_root, event.y_root)
@@ -6743,7 +6811,7 @@ class EISApplication:
                 inside = True
                 break
             widget = getattr(widget, "master", None)
-        if not inside:
+        if not inside or not self.parameter_scrollbar.winfo_ismapped():
             return None
         if getattr(event, "num", None) == 4:
             direction = -1
