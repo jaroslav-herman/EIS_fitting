@@ -6242,12 +6242,11 @@ class EISApplication:
         self.root.bind_all("<MouseWheel>", self._controls_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self._controls_mousewheel, add="+")
         self.root.bind_all("<Button-5>", self._controls_mousewheel, add="+")
-        mode_frame = ttk.Frame(controls_contents)
-        mode_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+        parent = controls_contents
+        parent.columnconfigure(0, weight=1)
+        mode_frame = ttk.Frame(parent)
+        mode_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         mode_frame.columnconfigure(1, weight=1)
-        parent = ttk.Panedwindow(controls_contents, orient=tk.VERTICAL)
-        self.controls_paned = parent
-        parent.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         ttk.Label(mode_frame, text="Analysis mode").grid(
             row=0, column=0, padx=(0, 8), sticky="w"
         )
@@ -6264,7 +6263,7 @@ class EISApplication:
         )
         model_group = ttk.LabelFrame(parent, text="Fitting model", padding=8)
         self.model_group = model_group
-        parent.add(model_group, weight=0)
+        model_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         model_group.columnconfigure(0, weight=1)
         model_group.columnconfigure(1, weight=1)
         model_group.columnconfigure(2, weight=1)
@@ -6318,7 +6317,7 @@ class EISApplication:
         )
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
         self.parameters_group = parameters_group
-        parent.add(parameters_group, weight=2)
+        parameters_group.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
         parameters_group.columnconfigure(0, weight=1)
         parameters_group.rowconfigure(0, weight=1)
         parent.rowconfigure(2, weight=1)
@@ -6374,7 +6373,7 @@ class EISApplication:
 
         options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
         self.options_group = options_group
-        parent.add(options_group, weight=0)
+        options_group.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         options_group.columnconfigure(1, weight=1)
         options_group.columnconfigure(3, weight=1)
         options_group.columnconfigure(4, weight=1)
@@ -6457,7 +6456,7 @@ class EISApplication:
 
         actions = ttk.LabelFrame(parent, text="Actions", padding=8)
         self.actions_group = actions
-        parent.add(actions, weight=0)
+        actions.grid(row=4, column=0, sticky="ew")
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         self.fit_button = ttk.Button(actions, text="Fit spectrum", command=self.fit)
@@ -6509,7 +6508,7 @@ class EISApplication:
         )
         self.stop_fit_button.grid(row=7, column=0, columnspan=2, pady=3, sticky="ew")
         self.drt_tools_group = ttk.LabelFrame(parent, text="DRT analysis", padding=8)
-        parent.add(self.drt_tools_group, weight=0)
+        self.drt_tools_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self.drt_tools_group.columnconfigure(1, weight=1)
         self.drt_tools_group.columnconfigure(2, weight=1)
         ttk.Label(self.drt_tools_group, text="Method").grid(
@@ -6652,9 +6651,8 @@ class EISApplication:
         self.drt_apply_upper_selected_button.grid(
             row=2, column=1, padx=(3, 0), pady=(4, 0), sticky="ew"
         )
-        self.controls_paned.forget(self.drt_tools_group)
+        self.drt_tools_group.grid_remove()
         self._build_simulator_controls(parent)
-        self.controls_paned.forget(self.simulator_group)
         self.action_buttons = (
             self.fit_button,
             self.fit_selected_button,
@@ -6705,7 +6703,7 @@ class EISApplication:
     def _build_simulator_controls(self, parent: ttk.Frame) -> None:
         group = ttk.LabelFrame(parent, text="Spectra Simulator", padding=8)
         self.simulator_group = group
-        self.controls_paned.add(group, weight=0)
+        group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         group.columnconfigure(1, weight=1)
         group.columnconfigure(3, weight=1)
         self.simulator_circuit_var = tk.StringVar(value=self.model_var.get())
@@ -6992,45 +6990,31 @@ class EISApplication:
             self.drt_fit_button.configure(
                 text="Calculate DRT" if drt_mode else "Fit selected"
             )
-        paned = self.controls_paned
-
-        def show_pane(pane, index: int, weight: int) -> None:
-            target = str(pane)
-            if target in (str(existing) for existing in paned.panes()):
-                paned.forget(pane)
-            paned.insert(index, pane)
-            paned.paneconfigure(pane, weight=weight)
-
-        def hide_pane(pane) -> None:
-            target = str(pane)
-            if target in (str(existing) for existing in paned.panes()):
-                paned.forget(pane)
-
         if simulator_mode:
-            hide_pane(self.model_group)
-            hide_pane(self.parameters_group)
+            self.model_group.grid_remove()
+            self.parameters_group.grid_remove()
             self.refine_fit_button.grid_remove()
-            hide_pane(self.drt_tools_group)
-            show_pane(self.simulator_group, 0, 0)
+            self.drt_tools_group.grid_remove()
+            self.simulator_group.grid()
             self._update_status("Spectra Simulator mode")
             self._refresh_plot(rescale=True)
         elif drt_mode:
             self.show_drt_var.set(True)
             self.show_drt_recovered_var.set(True)
-            hide_pane(self.model_group)
-            hide_pane(self.parameters_group)
+            self.model_group.grid_remove()
+            self.parameters_group.grid_remove()
             self.refine_fit_button.grid_remove()
-            hide_pane(self.simulator_group)
-            show_pane(self.drt_tools_group, 0, 0)
+            self.drt_tools_group.grid()
+            self.simulator_group.grid_remove()
             self.toggle_drt_view()
             self.toggle_drt_recovered_visibility()
             self._update_status("DRT analysis mode")
         else:
-            show_pane(self.model_group, 0, 0)
-            show_pane(self.parameters_group, 1, 2)
+            self.model_group.grid()
+            self.parameters_group.grid()
             self.refine_fit_button.grid()
-            hide_pane(self.drt_tools_group)
-            hide_pane(self.simulator_group)
+            self.drt_tools_group.grid_remove()
+            self.simulator_group.grid_remove()
             self._update_status("EEC fitting mode")
 
     def _capture_detached_eec_parameters(self) -> bool:
