@@ -6992,7 +6992,7 @@ class EISApplication:
                 text="Calculate DRT" if drt_mode else "Fit selected"
             )
         paned = self.controls_paned
-        model_pane_index = 0
+
         def pane_index(pane) -> int:
             panes = paned.panes()
             for index, candidate in enumerate(panes):
@@ -7008,7 +7008,8 @@ class EISApplication:
             if pane_index(self.drt_tools_group) >= 0:
                 paned.forget(self.drt_tools_group)
             if pane_index(self.simulator_group) < 0:
-                paned.add(self.simulator_group, weight=0)
+                paned.insert(0, self.simulator_group)
+                paned.paneconfigure(self.simulator_group, weight=0)
             self._update_status("Spectra Simulator mode")
             self._refresh_plot(rescale=True)
         elif drt_mode:
@@ -7020,11 +7021,7 @@ class EISApplication:
                 paned.forget(self.parameters_group)
             self.refine_fit_button.grid_remove()
             if pane_index(self.drt_tools_group) < 0:
-                actions_index = pane_index(self.actions_group)
-                paned.insert(
-                    actions_index if actions_index >= 0 else tk.END,
-                    self.drt_tools_group,
-                )
+                paned.insert(0, self.drt_tools_group)
                 paned.paneconfigure(self.drt_tools_group, weight=0)
             if pane_index(self.simulator_group) >= 0:
                 paned.forget(self.simulator_group)
@@ -7033,10 +7030,11 @@ class EISApplication:
             self._update_status("DRT analysis mode")
         else:
             if pane_index(self.model_group) < 0:
-                paned.insert(model_pane_index, self.model_group, weight=0)
+                paned.insert(0, self.model_group)
+                paned.paneconfigure(self.model_group, weight=0)
             if pane_index(self.parameters_group) < 0:
-                parameters_index = pane_index(self.model_group) + 1
-                paned.insert(parameters_index, self.parameters_group, weight=2)
+                paned.insert(1, self.parameters_group)
+                paned.paneconfigure(self.parameters_group, weight=2)
             self.refine_fit_button.grid()
             if pane_index(self.drt_tools_group) >= 0:
                 paned.forget(self.drt_tools_group)
