@@ -6210,6 +6210,33 @@ class EISApplication:
             else:
                 self._set_explorer_selection([item], primary=item)
 
+    def _add_controls_sash(self, key: str, group: ttk.LabelFrame, row: int) -> None:
+        sash = tk.Frame(
+            group.master, height=6, highlightthickness=0, background="#c9c9c9"
+        )
+        sash.grid(row=row, column=0, sticky="ew", pady=(2, 1))
+        sash.configure(cursor="sb_v_double_arrow")
+
+        state = {"start_y": None, "start_height": None, "min_height": None}
+
+        def on_press(event) -> None:
+            if state["min_height"] is None:
+                state["min_height"] = group.winfo_reqheight()
+            state["start_y"] = event.y_root
+            state["start_height"] = max(group.winfo_height(), group.winfo_reqheight())
+
+        def on_motion(event) -> None:
+            if state["start_y"] is None:
+                return
+            requested = state["start_height"] + (event.y_root - state["start_y"])
+            requested = max(state["min_height"], requested)
+            group.grid_propagate(False)
+            group.configure(height=requested)
+
+        sash.bind("<Button-1>", on_press)
+        sash.bind("<B1-Motion>", on_motion)
+        self._controls_sashes[key] = (sash, group)
+
     def _build_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
@@ -6261,9 +6288,11 @@ class EISApplication:
         self.analysis_mode_box.bind(
             "<<ComboboxSelected>>", self._on_analysis_mode_selected
         )
+        self._controls_sashes: dict[str, tuple[ttk.Frame, object]] = {}
         model_group = ttk.LabelFrame(parent, text="Fitting model", padding=8)
         self.model_group = model_group
-        model_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        model_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self._add_controls_sash("model", model_group, row=1)
         model_group.columnconfigure(0, weight=1)
         model_group.columnconfigure(1, weight=1)
         model_group.columnconfigure(2, weight=1)
@@ -6317,10 +6346,11 @@ class EISApplication:
         )
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
         self.parameters_group = parameters_group
-        parameters_group.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
+        parameters_group.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
+        self._add_controls_sash("parameters", parameters_group, row=3)
         parameters_group.columnconfigure(0, weight=1)
         parameters_group.rowconfigure(0, weight=1)
-        parent.rowconfigure(2, weight=1)
+        parent.rowconfigure(4, weight=1)
         parameter_canvas_frame = ttk.Frame(parameters_group)
         parameter_canvas_frame.grid(row=0, column=0, sticky="nsew")
         parameter_canvas_frame.columnconfigure(0, weight=1)
@@ -6373,7 +6403,8 @@ class EISApplication:
 
         options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
         self.options_group = options_group
-        options_group.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        options_group.grid(row=6, column=0, sticky="ew", pady=(0, 8))
+        self._add_controls_sash("options", options_group, row=5)
         options_group.columnconfigure(1, weight=1)
         options_group.columnconfigure(3, weight=1)
         options_group.columnconfigure(4, weight=1)
@@ -6456,7 +6487,8 @@ class EISApplication:
 
         actions = ttk.LabelFrame(parent, text="Actions", padding=8)
         self.actions_group = actions
-        actions.grid(row=4, column=0, sticky="ew")
+        actions.grid(row=8, column=0, sticky="ew")
+        self._add_controls_sash("actions", actions, row=7)
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         self.fit_button = ttk.Button(actions, text="Fit spectrum", command=self.fit)
@@ -6508,7 +6540,8 @@ class EISApplication:
         )
         self.stop_fit_button.grid(row=7, column=0, columnspan=2, pady=3, sticky="ew")
         self.drt_tools_group = ttk.LabelFrame(parent, text="DRT analysis", padding=8)
-        self.drt_tools_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.drt_tools_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self._add_controls_sash("drt", self.drt_tools_group, row=1)
         self.drt_tools_group.columnconfigure(1, weight=1)
         self.drt_tools_group.columnconfigure(2, weight=1)
         ttk.Label(self.drt_tools_group, text="Method").grid(
@@ -6703,7 +6736,8 @@ class EISApplication:
     def _build_simulator_controls(self, parent: ttk.Frame) -> None:
         group = ttk.LabelFrame(parent, text="Spectra Simulator", padding=8)
         self.simulator_group = group
-        group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        self._add_controls_sash("simulator", group, row=1)
         group.columnconfigure(1, weight=1)
         group.columnconfigure(3, weight=1)
         self.simulator_circuit_var = tk.StringVar(value=self.model_var.get())
@@ -6990,7 +7024,20 @@ class EISApplication:
             self.drt_fit_button.configure(
                 text="Calculate DRT" if drt_mode else "Fit selected"
             )
+        def show_sash(key: str) -> None:
+            entry = getattr(self, "_controls_sashes", {}).get(key)
+            if entry is not None:
+                entry[0].grid()
+
+        def hide_sash(key: str) -> None:
+            entry = getattr(self, "_controls_sashes", {}).get(key)
+            if entry is not None:
+                entry[0].grid_remove()
+
         if simulator_mode:
+            hide_sash("model")
+            hide_sash("drt")
+            show_sash("simulator")
             self.model_group.grid_remove()
             self.parameters_group.grid_remove()
             self.refine_fit_button.grid_remove()
@@ -7001,6 +7048,9 @@ class EISApplication:
         elif drt_mode:
             self.show_drt_var.set(True)
             self.show_drt_recovered_var.set(True)
+            hide_sash("model")
+            hide_sash("simulator")
+            show_sash("drt")
             self.model_group.grid_remove()
             self.parameters_group.grid_remove()
             self.refine_fit_button.grid_remove()
@@ -7010,6 +7060,9 @@ class EISApplication:
             self.toggle_drt_recovered_visibility()
             self._update_status("DRT analysis mode")
         else:
+            show_sash("model")
+            hide_sash("drt")
+            hide_sash("simulator")
             self.model_group.grid()
             self.parameters_group.grid()
             self.refine_fit_button.grid()
