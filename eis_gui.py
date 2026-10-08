@@ -6250,10 +6250,18 @@ class EISApplication:
                 height = max(minimum_of(group), state["start_heights"][group] + delta)
                 apply_height(group, height)
                 return
-            delta = max(delta, minimum_of(above) - state["start_heights"][above])
-            delta = min(delta, state["start_heights"][group] - minimum_of(group))
-            apply_height(above, state["start_heights"][above] + delta)
-            apply_height(group, state["start_heights"][group] - delta)
+            if delta >= 0:
+                new_group = max(
+                    minimum_of(group), state["start_heights"][group] - delta
+                )
+                apply_height(group, new_group)
+            else:
+                new_above = max(
+                    minimum_of(above), state["start_heights"][above] + delta
+                )
+                grown = state["start_heights"][above] - new_above
+                apply_height(above, new_above)
+                apply_height(group, state["start_heights"][group] + grown)
 
         sash.bind("<Button-1>", on_press)
         sash.bind("<B1-Motion>", on_motion)
