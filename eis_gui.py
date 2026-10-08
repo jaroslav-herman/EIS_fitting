@@ -6210,28 +6210,50 @@ class EISApplication:
             else:
                 self._set_explorer_selection([item], primary=item)
 
-    def _add_controls_sash(self, key: str, group: ttk.LabelFrame, row: int) -> None:
+    def _add_controls_sash(
+        self, key: str, group: ttk.LabelFrame, row: int, above: tk.Misc | None = None
+    ) -> None:
         sash = tk.Frame(
             group.master, height=6, highlightthickness=0, background="#c9c9c9"
         )
         sash.grid(row=row, column=0, sticky="ew", pady=(2, 1))
         sash.configure(cursor="sb_v_double_arrow")
 
-        state = {"start_y": None, "start_height": None, "min_height": None}
+        mins = self._controls_min_heights
+        state = {"start_y": None, "start_heights": {}}
+
+        def minimum_of(widget: tk.Misc) -> int:
+            if widget not in mins:
+                mins[widget] = widget.winfo_reqheight()
+            return mins[widget]
+
+        def apply_height(widget: tk.Misc, height: int) -> None:
+            minimum_of(widget)
+            widget.grid_propagate(False)
+            widget.configure(height=height)
 
         def on_press(event) -> None:
-            if state["min_height"] is None:
-                state["min_height"] = group.winfo_reqheight()
             state["start_y"] = event.y_root
-            state["start_height"] = max(group.winfo_height(), group.winfo_reqheight())
+            state["start_heights"] = {}
+            for widget in (group, above):
+                if widget is None:
+                    continue
+                state["start_heights"][widget] = max(
+                    widget.winfo_height(), minimum_of(widget)
+                )
 
         def on_motion(event) -> None:
             if state["start_y"] is None:
                 return
-            requested = state["start_height"] + (event.y_root - state["start_y"])
-            requested = max(state["min_height"], requested)
-            group.grid_propagate(False)
-            group.configure(height=requested)
+            delta = event.y_root - state["start_y"]
+            if above is None:
+                height = max(minimum_of(group), state["start_heights"][group] + delta)
+                apply_height(group, height)
+                return
+            delta = max(delta, minimum_of(above) - state["start_heights"][above])
+            delta = min(delta, state["start_heights"][group] - minimum_of(group))
+            apply_height(above, state["start_heights"][above] + delta)
+            apply_height(group, state["start_heights"][group] - delta)
 
         sash.bind("<Button-1>", on_press)
         sash.bind("<B1-Motion>", on_motion)
@@ -6289,6 +6311,7 @@ class EISApplication:
             "<<ComboboxSelected>>", self._on_analysis_mode_selected
         )
         self._controls_sashes: dict[str, tuple[ttk.Frame, object]] = {}
+        self._controls_min_heights: dict[tk.Misc, int] = {}
         model_group = ttk.LabelFrame(parent, text="Fitting model", padding=8)
         self.model_group = model_group
         model_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
@@ -6347,7 +6370,7 @@ class EISApplication:
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
         self.parameters_group = parameters_group
         parameters_group.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
-        self._add_controls_sash("parameters", parameters_group, row=3)
+        self._add_controls_sash("parameters", parameters_group, row=3, above=model_group)
         parameters_group.columnconfigure(0, weight=1)
         parameters_group.rowconfigure(0, weight=1)
         parent.rowconfigure(4, weight=1)
@@ -6404,7 +6427,7 @@ class EISApplication:
         options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
         self.options_group = options_group
         options_group.grid(row=6, column=0, sticky="ew", pady=(0, 8))
-        self._add_controls_sash("options", options_group, row=5)
+        self._add_controls_sash("options", options_group, row=5, above=parameters_group)
         options_group.columnconfigure(1, weight=1)
         options_group.columnconfigure(3, weight=1)
         options_group.columnconfigure(4, weight=1)
@@ -6488,7 +6511,7 @@ class EISApplication:
         actions = ttk.LabelFrame(parent, text="Actions", padding=8)
         self.actions_group = actions
         actions.grid(row=8, column=0, sticky="ew")
-        self._add_controls_sash("actions", actions, row=7)
+        self._add_controls_sash("actions", actions, row=7, above=options_group)
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         self.fit_button = ttk.Button(actions, text="Fit spectrum", command=self.fit)
