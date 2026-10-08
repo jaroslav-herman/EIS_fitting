@@ -6654,6 +6654,7 @@ class EISApplication:
         )
         self.controls_paned.forget(self.drt_tools_group)
         self._build_simulator_controls(parent)
+        self.controls_paned.forget(self.simulator_group)
         self.action_buttons = (
             self.fit_button,
             self.fit_selected_button,
@@ -6994,9 +6995,9 @@ class EISApplication:
         paned = self.controls_paned
 
         def pane_index(pane) -> int:
-            panes = paned.panes()
-            for index, candidate in enumerate(panes):
-                if candidate is pane:
+            target = str(pane)
+            for index, candidate in enumerate(paned.panes()):
+                if str(candidate) == target:
                     return index
             return -1
         if simulator_mode:
