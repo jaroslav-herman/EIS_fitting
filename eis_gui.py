@@ -6210,63 +6210,6 @@ class EISApplication:
             else:
                 self._set_explorer_selection([item], primary=item)
 
-    def _add_controls_sash(
-        self, key: str, group: ttk.LabelFrame, row: int, above: tk.Misc | None = None
-    ) -> None:
-        sash = tk.Frame(
-            group.master, height=6, highlightthickness=0, background="#c9c9c9"
-        )
-        sash.grid(row=row, column=0, sticky="ew", pady=(2, 1))
-        sash.configure(cursor="sb_v_double_arrow")
-
-        mins = self._controls_min_heights
-        state = {"start_y": None, "start_heights": {}}
-
-        def minimum_of(widget: tk.Misc) -> int:
-            if widget not in mins:
-                mins[widget] = widget.winfo_reqheight()
-            return mins[widget]
-
-        def apply_height(widget: tk.Misc, height: int) -> None:
-            minimum_of(widget)
-            widget.grid_propagate(False)
-            widget.configure(height=height)
-
-        def on_press(event) -> None:
-            state["start_y"] = event.y_root
-            state["start_heights"] = {}
-            for widget in (group, above):
-                if widget is None:
-                    continue
-                state["start_heights"][widget] = max(
-                    widget.winfo_height(), minimum_of(widget)
-                )
-
-        def on_motion(event) -> None:
-            if state["start_y"] is None:
-                return
-            delta = event.y_root - state["start_y"]
-            if above is None:
-                height = max(minimum_of(group), state["start_heights"][group] + delta)
-                apply_height(group, height)
-                return
-            if delta >= 0:
-                new_group = max(
-                    minimum_of(group), state["start_heights"][group] - delta
-                )
-                apply_height(group, new_group)
-            else:
-                new_above = max(
-                    minimum_of(above), state["start_heights"][above] + delta
-                )
-                grown = state["start_heights"][above] - new_above
-                apply_height(above, new_above)
-                apply_height(group, state["start_heights"][group] + grown)
-
-        sash.bind("<Button-1>", on_press)
-        sash.bind("<B1-Motion>", on_motion)
-        self._controls_sashes[key] = (sash, group)
-
     def _build_controls(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
@@ -6318,12 +6261,9 @@ class EISApplication:
         self.analysis_mode_box.bind(
             "<<ComboboxSelected>>", self._on_analysis_mode_selected
         )
-        self._controls_sashes: dict[str, tuple[ttk.Frame, object]] = {}
-        self._controls_min_heights: dict[tk.Misc, int] = {}
         model_group = ttk.LabelFrame(parent, text="Fitting model", padding=8)
         self.model_group = model_group
-        model_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        self._add_controls_sash("model", model_group, row=1)
+        model_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         model_group.columnconfigure(0, weight=1)
         model_group.columnconfigure(1, weight=1)
         model_group.columnconfigure(2, weight=1)
@@ -6377,41 +6317,18 @@ class EISApplication:
         )
         parameters_group = ttk.LabelFrame(parent, text="Circuit parameters", padding=8)
         self.parameters_group = parameters_group
-        parameters_group.grid(row=4, column=0, sticky="nsew", pady=(0, 8))
-        self._add_controls_sash("parameters", parameters_group, row=3, above=model_group)
+        parameters_group.grid(row=2, column=0, sticky="nsew", pady=(0, 8))
         parameters_group.columnconfigure(0, weight=1)
         parameters_group.rowconfigure(0, weight=1)
-        parent.rowconfigure(4, weight=1)
-        parameter_canvas_frame = ttk.Frame(parameters_group)
-        parameter_canvas_frame.grid(row=0, column=0, sticky="nsew")
-        parameter_canvas_frame.columnconfigure(0, weight=1)
-        parameter_canvas_frame.rowconfigure(0, weight=1)
-        self.parameter_canvas = tk.Canvas(parameter_canvas_frame, highlightthickness=0)
-        self.parameter_canvas.grid(row=0, column=0, sticky="nsew")
-        self.parameter_scrollbar = ttk.Scrollbar(
-            parameter_canvas_frame, orient=tk.VERTICAL, command=self.parameter_canvas.yview
-        )
-        self.parameter_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.parameter_canvas.configure(yscrollcommand=self.parameter_scrollbar.set)
-        parameter_contents = ttk.Frame(self.parameter_canvas)
+        parent.rowconfigure(2, weight=1)
+        parameter_contents = ttk.Frame(parameters_group)
         self.parameter_contents = parameter_contents
-        parameter_window = self.parameter_canvas.create_window(
-            (0, 0), window=parameter_contents, anchor="nw"
-        )
-        parameter_contents.bind(
-            "<Configure>",
-            lambda _event: self._update_parameter_scroll_region(),
-        )
-        self.parameter_canvas.bind(
-            "<Configure>",
-            lambda event: self.parameter_canvas.itemconfigure(
-                parameter_window, width=event.width
-            ),
-        )
+        parameter_contents.grid(row=0, column=0, sticky="ew")
+        parameter_contents.columnconfigure(0, weight=1)
         self.parameter_table = ParameterTable(parameter_contents)
-        self.parameter_table.pack(fill=tk.BOTH, expand=True)
+        self.parameter_table.grid(row=0, column=0, sticky="ew")
         parameter_actions = ttk.Frame(parameter_contents)
-        parameter_actions.pack(fill=tk.X, pady=(8, 0))
+        parameter_actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         for column in range(2):
             parameter_actions.columnconfigure(column, weight=1)
         self.parameters_selected_button = ttk.Button(
@@ -6428,14 +6345,10 @@ class EISApplication:
         self.parameters_limits_button.grid(
             row=1, column=0, columnspan=2, pady=(4, 0), sticky="ew"
         )
-        self.root.bind_all("<MouseWheel>", self._parameter_mousewheel, add="+")
-        self.root.bind_all("<Button-4>", self._parameter_mousewheel, add="+")
-        self.root.bind_all("<Button-5>", self._parameter_mousewheel, add="+")
 
         options_group = ttk.LabelFrame(parent, text="Selection", padding=8)
         self.options_group = options_group
-        options_group.grid(row=6, column=0, sticky="ew", pady=(0, 8))
-        self._add_controls_sash("options", options_group, row=5, above=parameters_group)
+        options_group.grid(row=3, column=0, sticky="ew", pady=(0, 8))
         options_group.columnconfigure(1, weight=1)
         options_group.columnconfigure(3, weight=1)
         options_group.columnconfigure(4, weight=1)
@@ -6518,8 +6431,7 @@ class EISApplication:
 
         actions = ttk.LabelFrame(parent, text="Actions", padding=8)
         self.actions_group = actions
-        actions.grid(row=8, column=0, sticky="ew")
-        self._add_controls_sash("actions", actions, row=7, above=options_group)
+        actions.grid(row=4, column=0, sticky="ew")
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         self.fit_button = ttk.Button(actions, text="Fit spectrum", command=self.fit)
@@ -6571,8 +6483,7 @@ class EISApplication:
         )
         self.stop_fit_button.grid(row=7, column=0, columnspan=2, pady=3, sticky="ew")
         self.drt_tools_group = ttk.LabelFrame(parent, text="DRT analysis", padding=8)
-        self.drt_tools_group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        self._add_controls_sash("drt", self.drt_tools_group, row=1)
+        self.drt_tools_group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         self.drt_tools_group.columnconfigure(1, weight=1)
         self.drt_tools_group.columnconfigure(2, weight=1)
         ttk.Label(self.drt_tools_group, text="Method").grid(
@@ -6767,8 +6678,7 @@ class EISApplication:
     def _build_simulator_controls(self, parent: ttk.Frame) -> None:
         group = ttk.LabelFrame(parent, text="Spectra Simulator", padding=8)
         self.simulator_group = group
-        group.grid(row=2, column=0, sticky="ew", pady=(0, 8))
-        self._add_controls_sash("simulator", group, row=1)
+        group.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         group.columnconfigure(1, weight=1)
         group.columnconfigure(3, weight=1)
         self.simulator_circuit_var = tk.StringVar(value=self.model_var.get())
@@ -6815,20 +6725,6 @@ class EISApplication:
         group.grid_remove()
         self._ensure_simulator_parameters()
 
-    def _update_parameter_scroll_region(self) -> None:
-        if not hasattr(self, "parameter_canvas"):
-            return
-        self.parameter_canvas.configure(
-            scrollregion=self.parameter_canvas.bbox("all") or (0, 0, 0, 0)
-        )
-        content_height = self.parameter_contents.winfo_reqheight()
-        canvas_height = self.parameter_canvas.winfo_height()
-        if content_height > canvas_height + 1:
-            self.parameter_scrollbar.grid()
-        else:
-            self.parameter_scrollbar.grid_remove()
-            self.parameter_canvas.yview_moveto(0)
-
     def _update_controls_scroll_region(self) -> None:
         if not hasattr(self, "controls_canvas"):
             return
@@ -6865,27 +6761,6 @@ class EISApplication:
         self.controls_canvas.yview_scroll(direction, "units")
         return "break"
 
-    def _parameter_mousewheel(self, event):
-        try:
-            widget = self.root.winfo_containing(event.x_root, event.y_root)
-        except (KeyError, tk.TclError):
-            return None
-        inside = False
-        while widget is not None:
-            if widget is self.parameters_group:
-                inside = True
-                break
-            widget = getattr(widget, "master", None)
-        if not inside or not self.parameter_scrollbar.winfo_ismapped():
-            return None
-        if getattr(event, "num", None) == 4:
-            direction = -1
-        elif getattr(event, "num", None) == 5:
-            direction = 1
-        else:
-            direction = -1 if event.delta > 0 else 1
-        self.parameter_canvas.yview_scroll(direction, "units")
-        return "break"
 
     def _ensure_simulator_parameters(self) -> None:
         circuit = self.simulator_circuit_var.get().strip()
@@ -7055,20 +6930,7 @@ class EISApplication:
             self.drt_fit_button.configure(
                 text="Calculate DRT" if drt_mode else "Fit selected"
             )
-        def show_sash(key: str) -> None:
-            entry = getattr(self, "_controls_sashes", {}).get(key)
-            if entry is not None:
-                entry[0].grid()
-
-        def hide_sash(key: str) -> None:
-            entry = getattr(self, "_controls_sashes", {}).get(key)
-            if entry is not None:
-                entry[0].grid_remove()
-
         if simulator_mode:
-            hide_sash("model")
-            hide_sash("drt")
-            show_sash("simulator")
             self.model_group.grid_remove()
             self.parameters_group.grid_remove()
             self.refine_fit_button.grid_remove()
@@ -7079,9 +6941,6 @@ class EISApplication:
         elif drt_mode:
             self.show_drt_var.set(True)
             self.show_drt_recovered_var.set(True)
-            hide_sash("model")
-            hide_sash("simulator")
-            show_sash("drt")
             self.model_group.grid_remove()
             self.parameters_group.grid_remove()
             self.refine_fit_button.grid_remove()
@@ -7091,9 +6950,6 @@ class EISApplication:
             self.toggle_drt_recovered_visibility()
             self._update_status("DRT analysis mode")
         else:
-            show_sash("model")
-            hide_sash("drt")
-            hide_sash("simulator")
             self.model_group.grid()
             self.parameters_group.grid()
             self.refine_fit_button.grid()
