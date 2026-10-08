@@ -6994,53 +6994,43 @@ class EISApplication:
             )
         paned = self.controls_paned
 
-        def pane_index(pane) -> int:
+        def show_pane(pane, index: int, weight: int) -> None:
             target = str(pane)
-            for index, candidate in enumerate(paned.panes()):
-                if str(candidate) == target:
-                    return index
-            return -1
+            if target in (str(existing) for existing in paned.panes()):
+                paned.forget(pane)
+            paned.insert(index, pane)
+            paned.paneconfigure(pane, weight=weight)
+
+        def hide_pane(pane) -> None:
+            target = str(pane)
+            if target in (str(existing) for existing in paned.panes()):
+                paned.forget(pane)
+
         if simulator_mode:
-            if pane_index(self.model_group) >= 0:
-                paned.forget(self.model_group)
-            if pane_index(self.parameters_group) >= 0:
-                paned.forget(self.parameters_group)
+            hide_pane(self.model_group)
+            hide_pane(self.parameters_group)
             self.refine_fit_button.grid_remove()
-            if pane_index(self.drt_tools_group) >= 0:
-                paned.forget(self.drt_tools_group)
-            if pane_index(self.simulator_group) < 0:
-                paned.insert(0, self.simulator_group)
-                paned.paneconfigure(self.simulator_group, weight=0)
+            hide_pane(self.drt_tools_group)
+            show_pane(self.simulator_group, 0, 0)
             self._update_status("Spectra Simulator mode")
             self._refresh_plot(rescale=True)
         elif drt_mode:
             self.show_drt_var.set(True)
             self.show_drt_recovered_var.set(True)
-            if pane_index(self.model_group) >= 0:
-                paned.forget(self.model_group)
-            if pane_index(self.parameters_group) >= 0:
-                paned.forget(self.parameters_group)
+            hide_pane(self.model_group)
+            hide_pane(self.parameters_group)
             self.refine_fit_button.grid_remove()
-            if pane_index(self.drt_tools_group) < 0:
-                paned.insert(0, self.drt_tools_group)
-                paned.paneconfigure(self.drt_tools_group, weight=0)
-            if pane_index(self.simulator_group) >= 0:
-                paned.forget(self.simulator_group)
+            hide_pane(self.simulator_group)
+            show_pane(self.drt_tools_group, 0, 0)
             self.toggle_drt_view()
             self.toggle_drt_recovered_visibility()
             self._update_status("DRT analysis mode")
         else:
-            if pane_index(self.model_group) < 0:
-                paned.insert(0, self.model_group)
-                paned.paneconfigure(self.model_group, weight=0)
-            if pane_index(self.parameters_group) < 0:
-                paned.insert(1, self.parameters_group)
-                paned.paneconfigure(self.parameters_group, weight=2)
+            show_pane(self.model_group, 0, 0)
+            show_pane(self.parameters_group, 1, 2)
             self.refine_fit_button.grid()
-            if pane_index(self.drt_tools_group) >= 0:
-                paned.forget(self.drt_tools_group)
-            if pane_index(self.simulator_group) >= 0:
-                paned.forget(self.simulator_group)
+            hide_pane(self.drt_tools_group)
+            hide_pane(self.simulator_group)
             self._update_status("EEC fitting mode")
 
     def _capture_detached_eec_parameters(self) -> bool:
