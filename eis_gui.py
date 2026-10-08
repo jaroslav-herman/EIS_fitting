@@ -6242,7 +6242,6 @@ class EISApplication:
         self.root.bind_all("<MouseWheel>", self._controls_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self._controls_mousewheel, add="+")
         self.root.bind_all("<Button-5>", self._controls_mousewheel, add="+")
-        self._bind_controls_drag(controls_shell)
         parent = controls_contents
         parent.columnconfigure(0, weight=1)
         mode_frame = ttk.Frame(parent)
@@ -6778,45 +6777,6 @@ class EISApplication:
         else:
             self.controls_scrollbar.grid_remove()
             self.controls_canvas.yview_moveto(0)
-
-    def _bind_controls_drag(self, shell: ttk.Frame) -> None:
-        self._controls_drag_y = None
-
-        def is_controls_widget(widget) -> bool:
-            while widget is not None:
-                if widget is shell:
-                    return True
-                widget = getattr(widget, "master", None)
-            return False
-
-        state = {"y": None}
-
-        def on_press(event) -> None:
-            try:
-                widget = self.root.winfo_containing(event.x_root, event.y_root)
-            except (KeyError, tk.TclError):
-                return
-            if not is_controls_widget(widget):
-                return
-            state["y"] = event.y_root
-
-        def on_motion(event) -> None:
-            if state["y"] is None:
-                return
-            delta = state["y"] - event.y_root
-            state["y"] = event.y_root
-            if delta:
-                first, _last = self.controls_canvas.yview()
-                if 0.0 < first < 1.0 or (delta > 0 and first > 0.0) or (delta < 0 and first < 1.0):
-                    self.controls_canvas.yview_scroll(delta, "pixels")
-
-        def on_release(_event) -> None:
-            state["y"] = None
-
-        self.root.bind_all("<B1-Motion>", on_motion, add="+")
-        self.root.bind_all("<ButtonRelease-1>", on_release, add="+")
-        for widget in (shell, self.controls_canvas, self.controls_contents):
-            widget.bind("<Button-1>", on_press, add="+")
 
     def _controls_mousewheel(self, event):
         try:
