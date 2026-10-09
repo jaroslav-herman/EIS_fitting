@@ -20,6 +20,7 @@ from .number_aware_pipeline import train_bundle
 DEFAULT_SOURCES = (
     Path("training_data/AEM/399.eisfit.json.gz"),
     Path("training_data/AEM/400.eisfit.json.gz"),
+    Path("training_data/AEM/486.eisfit.json.gz"),
     Path("training_data/AEM/490.eisfit.json.gz"),
 )
 DEFAULT_OUTPUT = Path("ml/analysis/number_aware_pipeline_aem_we")
