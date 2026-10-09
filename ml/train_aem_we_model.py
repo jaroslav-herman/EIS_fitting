@@ -1,0 +1,126 @@
+"""Train the AEM-WE ML bundle used by the eisyFIT GUI.
+
+AEM-WE is a deployment artifact for suggestions on related spectra.  Training
+projects are assigned explicit physical sample IDs and keep leave-one-sample
+provenance in the report.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import joblib
+import numpy as np
+
+from .dataset import load_eisfit_projects
+from .frequency_range import active_frequency_bounds
+from .number_aware_pipeline import train_bundle
+
+DEFAULT_SOURCES = (
+    Path("training_data/AEM/399.eisfit.json.gz"),
+    Path("training_data/AEM/400.eisfit.json.gz"),
+    Path("training_data/AEM/490.eisfit.json.gz"),
+)
+DEFAULT_OUTPUT = Path("ml/analysis/number_aware_pipeline_aem_we")
+MODEL_NAME = "AEM-WE"
+PIPELINE_NAME = "number_aware_staged_eis"
+PIPELINE_VERSION = "3"
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, default=list), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _sample_id(source: Path) -> str:
+    return source.name.split(".eisfit.json", 1)[0] or source.stem
+
+
+def train_aem_we(
+    sources: list[Path] | tuple[Path, ...] = DEFAULT_SOURCES,
+    output: Path = DEFAULT_OUTPUT,
+    *,
+    seed: int = 42,
+) -> dict:
+    sources = tuple(Path(source).resolve() for source in sources)
+    sample_ids = {}
+    for source in sources:
+        sample_id = _sample_id(source)
+        sample_ids[str(source)] = sample_id
+        sample_ids[str(source.resolve())] = sample_id
+    extraction = load_eisfit_projects(
+        list(sources),
+        sample_ids,
+        require_fit=True,
+        require_frequency_window=False,
+        allow_invalid_frequency_window=True,
+    )
+    if not extraction.records:
+        raise ValueError(f"no labelled training spectra were extracted from {sources}")
+    bundle, _ = train_bundle(
+        list(sources),
+        sample_ids,
+        seed,
+        allow_single_sample=True,
+        allow_invalid_frequency_window=True,
+    )
+
+    bounds = np.asarray([active_frequency_bounds(record) for record in extraction.records], dtype=float)
+    centers = (np.log10(bounds[:, 0]) + np.log10(bounds[:, 1])) / 2.0
+
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    temporary = output / "pipeline.joblib.tmp"
+    joblib.dump(bundle, temporary)
+    temporary.replace(output / "pipeline.joblib")
+
+    report = {
+        "model_name": MODEL_NAME,
+        "pipeline": PIPELINE_NAME,
+        "version": PIPELINE_VERSION,
+        "training_projects": [str(source) for source in sources],
+        "training_samples": list(bundle.training_samples),
+        "training_records": len(extraction.records),
+        "training_exclusion_counts": extraction.exclusion_counts,
+        "circuit_classes": list(bundle.circuit_classes),
+        "topology_classes": list(bundle.topology_classes),
+        "parameter_training": bundle.parameter_stats,
+        "parameter_model_specs": bundle.parameter_model_specs,
+        "parameter_limits": bundle.parameter_limits,
+        "frequency_target_source": "active_points",
+        "invalid_saved_frequency_windows_allowed": True,
+        "frequency_active_point_records": int(extraction.records and len(extraction.records)),
+        "frequency_active_bounds_min_hz": float(np.min(bounds[:, 0])),
+        "frequency_active_bounds_max_hz": float(np.max(bounds[:, 1])),
+        "frequency_target_center_min_decades": float(np.min(centers)),
+        "frequency_target_center_max_decades": float(np.max(centers)),
+        "validation": {
+            "mode": "leave_one_sample_out_provenance",
+            "loso_available": len(bundle.training_samples) > 1,
+            "warning": None
+            if len(bundle.training_samples) > 1
+            else "A single physical sample cannot provide independent sample-level validation.",
+        },
+        "gui_model_key": MODEL_NAME,
+        "artifact": str(output / "pipeline.joblib"),
+    }
+    _write_json(output / "report.json", report)
+    return report
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source", type=Path, action="append", default=None,
+                        help="training project; repeat for multiple physical samples")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args(argv)
+    print(json.dumps(train_aem_we(args.source or DEFAULT_SOURCES, args.output, seed=args.seed), indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
