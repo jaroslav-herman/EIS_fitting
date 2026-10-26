@@ -11,7 +11,9 @@ from eis_services import (
     SpectrumBatchFit,
     SpectrumBatchReport,
     SpectrumFitTarget,
+    batch_fit_from_cycle,
     batch_fit_spectra,
+    find_outliers_for_all_cycles,
 )
 
 
@@ -153,6 +155,103 @@ class BatchStopTests(unittest.TestCase):
         self.assertEqual(2, len(report.fits))
         self.assertEqual([10.0, 10.0], [call.args[2][0].initial for call in fit.call_args_list])
         self.assertEqual(20.0, parameters[0].initial)
+
+
+class BatchProgressTests(unittest.TestCase):
+    def setUp(self):
+        self.loaded = FakeLoaded([FakeCycle(1), FakeCycle(2), FakeCycle(3)])
+        self.parameters = self.loaded.state.parameters_for(1)
+        self.targets = [
+            SpectrumFitTarget(self.loaded, cycle, f"cycle {cycle}")
+            for cycle in (1, 2, 3)
+        ]
+
+    @patch("eis_services.fit_cycle", side_effect=fake_fit)
+    def test_progress_reports_start_and_completion_per_spectrum(self, _fit):
+        events = []
+        report = batch_fit_spectra(
+            self.targets,
+            self.parameters,
+            progress_callback=lambda done, total, label: events.append((done, total, label)),
+        )
+        self.assertEqual(3, len(report.fits))
+        self.assertEqual(
+            [
+                (0, 3, "cycle 1"),
+                (1, 3, "cycle 1"),
+                (1, 3, "cycle 2"),
+                (2, 3, "cycle 2"),
+                (2, 3, "cycle 3"),
+                (3, 3, "cycle 3"),
+            ],
+            events,
+        )
+
+    @patch("eis_services.fit_cycle", side_effect=fake_fit)
+    def test_progress_counts_failed_spectra_as_done(self, _fit):
+        _fit.side_effect = [
+            fake_fit(self.loaded.state.cycles[1], "R0", self.parameters),
+            RuntimeError("synthetic fit failure"),
+            fake_fit(self.loaded.state.cycles[3], "R0", self.parameters),
+        ]
+        events = []
+        report = batch_fit_spectra(
+            self.targets,
+            self.parameters,
+            progress_callback=lambda done, total, label: events.append((done, total, label)),
+        )
+        self.assertEqual(3, len(report.fits))
+        self.assertEqual((3, 3, "cycle 3"), events[-1])
+
+    @patch("eis_services.fit_cycle", side_effect=fake_fit)
+    def test_progress_stops_when_batch_is_stopped(self, _fit):
+        event = threading.Event()
+
+        def fit_and_stop(*args):
+            result = fake_fit(*args)
+            if _fit.call_count == 1:
+                event.set()
+            return result
+
+        _fit.side_effect = fit_and_stop
+        events = []
+        report = batch_fit_spectra(
+            self.targets,
+            self.parameters,
+            stop_event=event,
+            progress_callback=lambda done, total, label: events.append((done, total, label)),
+        )
+        self.assertTrue(report.stopped)
+        self.assertEqual((1, 3, "cycle 1"), events[-1])
+
+    @patch("eis_services.analyze_outliers")
+    def test_find_outliers_reports_progress_per_cycle(self, analyze):
+        analyze.return_value = object()
+        loaded = FakeLoaded([FakeCycle(1), FakeCycle(2)])
+        loaded.state.available_cycles = [1, 2]
+        events = []
+        find_outliers_for_all_cycles(
+            None,
+            loaded.state,
+            3.0,
+            progress_callback=lambda done, total, cycle: events.append((done, total, cycle)),
+        )
+        self.assertEqual([(0, 2, 1), (1, 2, 1), (1, 2, 2), (2, 2, 2)], events)
+
+    @patch("eis_services.fit_cycle", side_effect=fake_fit)
+    def test_batch_fit_from_cycle_reports_progress(self, _fit):
+        loaded = FakeLoaded([FakeCycle(1), FakeCycle(2)])
+        loaded.state.available_cycles = [1, 2]
+        events = []
+        report = batch_fit_from_cycle(
+            None,
+            loaded.state,
+            1,
+            self.parameters,
+            progress_callback=lambda done, total, cycle: events.append((done, total, cycle)),
+        )
+        self.assertEqual(2, len(report.fits))
+        self.assertEqual([(0, 2, 1), (1, 2, 1), (1, 2, 2), (2, 2, 2)], events)
 
 
 if __name__ == "__main__":

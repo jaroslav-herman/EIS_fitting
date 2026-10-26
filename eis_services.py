@@ -1574,12 +1574,16 @@ def find_outliers_for_all_cycles(
     project: ProjectState,
     threshold: float,
     stop_event=None,
+    progress_callback=None,
 ) -> dict[int, tuple[CycleState, RidgeInitialization]]:
     results: dict[int, tuple[CycleState, RidgeInitialization]] = {}
     cycle_numbers = list(project.available_cycles)
+    total = len(cycle_numbers)
     for index, cycle_number in enumerate(cycle_numbers):
         if stop_event is not None and stop_event.is_set():
             break
+        if progress_callback is not None:
+            progress_callback(len(results), total, cycle_number)
         cycle = project.cycles.get(cycle_number)
         if cycle is None:
             cycle = load_cycle(dataframe, cycle_number, project.control)
@@ -1592,6 +1596,8 @@ def find_outliers_for_all_cycles(
             project.parameters_for(cycle_number),
         )
         results[cycle_number] = (cycle, analysis)
+        if progress_callback is not None:
+            progress_callback(len(results), total, cycle_number)
     return results
 
 
@@ -2452,6 +2458,7 @@ def batch_fit_from_cycle(
     initial_circuit: str | None = None,
     fit_timeout_seconds: float | None = None,
     fit_options: FitOptions | None = None,
+    progress_callback=None,
 ) -> BatchFitReport:
     start_index = project.available_cycles.index(start_cycle)
     cycle_numbers = project.available_cycles[start_index:]
@@ -2463,6 +2470,7 @@ def batch_fit_from_cycle(
     ]
     next_circuit = initial_circuit or project.circuit
     completed: list[BatchCycleFit] = []
+    total = len(cycle_numbers)
     for index, cycle_number in enumerate(cycle_numbers):
         if stop_event is not None and stop_event.is_set():
             return BatchFitReport(
@@ -2470,6 +2478,8 @@ def batch_fit_from_cycle(
                 stopped=True,
                 skipped_cycles=cycle_numbers[index:],
             )
+        if progress_callback is not None:
+            progress_callback(len(completed), total, cycle_number)
         cycle = project.cycles.get(cycle_number)
         if cycle is None:
             cycle = load_cycle(dataframe, cycle_number, project.control)
@@ -2545,6 +2555,8 @@ def batch_fit_from_cycle(
         )
         next_parameters = fitted_parameters
         next_circuit = cycle_circuit
+        if progress_callback is not None:
+            progress_callback(len(completed), total, cycle_number)
         if stop_event is not None and stop_event.is_set():
             return BatchFitReport(
                 fits=completed,
@@ -2563,6 +2575,7 @@ def batch_fit_spectra(
     initial_circuit: str | None = None,
     fit_timeout_seconds: float | None = None,
     fit_options: FitOptions | None = None,
+    progress_callback=None,
 ) -> SpectrumBatchReport:
     if not targets:
         return SpectrumBatchReport([])
@@ -2581,6 +2594,7 @@ def batch_fit_spectra(
     ]
     next_circuit = initial_circuit or expected_circuit
     completed: list[SpectrumBatchFit] = []
+    total = len(targets)
     for index, target in enumerate(targets):
         if stop_event is not None and stop_event.is_set():
             return SpectrumBatchReport(
@@ -2588,6 +2602,8 @@ def batch_fit_spectra(
                 stopped=True,
                 skipped_labels=[item.label for item in targets[index:]],
             )
+        if progress_callback is not None:
+            progress_callback(len(completed), total, target.label)
         project = target.loaded.state
         cycle = project.cycles.get(target.cycle)
         if cycle is None:
@@ -2658,6 +2674,8 @@ def batch_fit_spectra(
                     error=f"{type(error).__name__}: {error}",
                 )
             )
+            if progress_callback is not None:
+                progress_callback(len(completed), total, target.label)
             if stop_event is not None and stop_event.is_set():
                 return SpectrumBatchReport(
                     completed,
@@ -2697,6 +2715,8 @@ def batch_fit_spectra(
         if not use_target_initial_parameters:
             next_parameters = fitted_parameters
             next_circuit = target_circuit
+        if progress_callback is not None:
+            progress_callback(len(completed), total, target.label)
         if stop_event is not None and stop_event.is_set():
             return SpectrumBatchReport(
                 completed,
@@ -2713,6 +2733,7 @@ def batch_fit_candidate_spectra(
     stop_event=None,
     fit_timeout_seconds: float | None = None,
     fit_options: FitOptions | None = None,
+    progress_callback=None,
 ) -> SpectrumBatchReport:
     """Fit ML-ranked EEC candidates and retain the best impedance result.
 
@@ -2720,9 +2741,12 @@ def batch_fit_candidate_spectra(
     fitting continue to use the explicitly selected circuit.
     """
     completed: list[SpectrumBatchFit] = []
+    total = len(targets)
     for index, target in enumerate(targets):
         if stop_event is not None and stop_event.is_set():
             return SpectrumBatchReport(completed, stopped=True, skipped_labels=[item.label for item in targets[index:]])
+        if progress_callback is not None:
+            progress_callback(len(completed), total, target.label)
         project = target.loaded.state
         cycle = project.cycles.get(target.cycle)
         if cycle is None:
@@ -2767,6 +2791,8 @@ def batch_fit_candidate_spectra(
                     error="; ".join(failures),
                 )
             )
+            if progress_callback is not None:
+                progress_callback(len(completed), total, target.label)
             if stop_event is not None and stop_event.is_set():
                 return SpectrumBatchReport(completed, stopped=True, skipped_labels=[item.label for item in targets[index + 1:]])
             continue
@@ -2799,4 +2825,6 @@ def batch_fit_candidate_spectra(
                 fit_provenance=provenance,
             ),
         ))
+        if progress_callback is not None:
+            progress_callback(len(completed), total, target.label)
     return SpectrumBatchReport(completed)

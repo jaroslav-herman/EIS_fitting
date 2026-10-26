@@ -8390,11 +8390,14 @@ class EISApplication:
             predictions = []
             inference_failures = list(failures)
             if bundle is not None:
-                for target, label in zip(targets, target_labels):
+                total = len(targets)
+                for index, (target, label) in enumerate(zip(targets, target_labels)):
+                    self._report_batch_progress(index, total, label)
                     try:
                         predictions.extend(infer_bundle_records(bundle, [target.record], threshold=threshold))
                     except Exception as error:
                         inference_failures.append((label, f"{type(error).__name__}: {error}"))
+                self._report_batch_progress(len(targets), total, target_labels[-1] if target_labels else "")
             if destination is not None:
                 write_ml_results(destination, predictions, source_project=str(self._current_stem()), pipeline={"name": model_name, "actions": list(actions), "outlier_threshold": threshold, "refine_z_threshold": float(refine_z), "refine_max_iterations": iterations})
             return destination, predictions, inference_failures, len(targets)
@@ -8664,6 +8667,7 @@ class EISApplication:
                 candidate_circuits,
                 stop_event=self._stop_event,
                 fit_timeout_seconds=self._fit_timeout_seconds,
+                progress_callback=self._report_batch_progress,
             ),
             lambda report: self._finish_ml_processing(report, len(missing)),
             "ML EEC fit failed",
@@ -10973,6 +10977,29 @@ class EISApplication:
         )
         self.status_var.set(f"{status} · {suffix}" if suffix else status)
 
+    def _report_batch_progress(self, completed: int, total: int, subject: object) -> None:
+        if not self.busy or not self.root.winfo_exists():
+            return
+        if self._operation_labels:
+            noun = "selected spectra"
+        elif isinstance(subject, int):
+            noun = "cycles"
+        else:
+            noun = "spectra"
+        operation = self._operation_name.lower()
+        if "fit" in operation:
+            verb = "fitted"
+        elif "drt" in operation:
+            verb = "calculated"
+        else:
+            verb = "processed"
+        self.root.after(
+            0,
+            lambda: self.status_var.set(
+                f"{self._operation_name}: {completed} out of {total} {noun} already {verb}"
+            ),
+        )
+
     def _clear_loaded_view(self, message: str) -> None:
         self.loaded = None
         self.state = None
@@ -11719,9 +11746,13 @@ class EISApplication:
 
         def select_models():
             results = []
+            total = len(targets)
             for dataset_id, cycle_number, cycle in targets:
                 if self._stop_event.is_set():
                     break
+                self._report_batch_progress(
+                    len(results), total, f"cycle {cycle_number}"
+                )
                 results.append(
                     (
                         dataset_id,
@@ -11731,6 +11762,9 @@ class EISApplication:
                             settings=copy.deepcopy(self._auto_model_settings),
                         ),
                     )
+                )
+                self._report_batch_progress(
+                    len(results), total, f"cycle {cycle_number}"
                 )
             return results
 
@@ -12281,6 +12315,7 @@ class EISApplication:
                 self.state,
                 threshold,
                 self._stop_event,
+                progress_callback=self._report_batch_progress,
             ),
             self._finish_all_outliers,
             "File-wide outlier search failed",
@@ -12361,16 +12396,27 @@ class EISApplication:
         self.status_var.set(
             f"Finding outliers in {spectrum_count} selected spectra..."
         )
-        self._submit(
-            lambda: {
-                dataset_id: find_outliers_for_all_cycles(
+        outlier_total = sum(
+            len(project.available_cycles) for _loaded, project in selected_projects.values()
+        )
+        def run_selected_outlier_search():
+            results = {}
+            completed = 0
+            for dataset_id, (loaded, project) in selected_projects.items():
+                results[dataset_id] = find_outliers_for_all_cycles(
                     loaded.dataframe,
                     project,
                     threshold,
                     self._stop_event,
+                    progress_callback=lambda done, _total, subject: self._report_batch_progress(
+                        completed + done, outlier_total, subject
+                    ),
                 )
-                for dataset_id, (loaded, project) in selected_projects.items()
-            },
+                completed += len(project.available_cycles)
+            return results
+
+        self._submit(
+            run_selected_outlier_search,
             self._finish_all_outliers,
             "Selected-spectra outlier search failed",
             operation_labels=[
@@ -12782,16 +12828,24 @@ class EISApplication:
 
         def calculate() -> dict[str, dict[int, RidgeInitialization]]:
             results: dict[str, dict[int, RidgeInitialization]] = {}
+            completed = 0
             for dataset_id, (_loaded, project) in batches.items():
                 dataset_results: dict[int, RidgeInitialization] = {}
                 results[dataset_id] = dataset_results
                 for cycle_number in project.available_cycles:
                     if self._stop_event.is_set():
                         return results
+                    self._report_batch_progress(
+                        completed, spectrum_count, f"cycle {cycle_number}"
+                    )
                     dataset_results[cycle_number] = analyze_outliers(
                         project.cycles[cycle_number],
                         threshold,
                         project.parameters_for(cycle_number),
+                    )
+                    completed += 1
+                    self._report_batch_progress(
+                        completed, spectrum_count, f"cycle {cycle_number}"
                     )
             return results
 
@@ -12852,14 +12906,22 @@ class EISApplication:
 
         def calculate() -> dict[str, dict[int, DRTComputation]]:
             results: dict[str, dict[int, DRTComputation]] = {}
+            completed = 0
             for dataset_id, (_loaded, project) in batches.items():
                 dataset_results: dict[int, DRTComputation] = {}
                 results[dataset_id] = dataset_results
                 for cycle_number in project.available_cycles:
                     if self._stop_event.is_set():
                         return results
+                    self._report_batch_progress(
+                        completed, spectrum_count, f"cycle {cycle_number}"
+                    )
                     dataset_results[cycle_number] = calculate_hybrid_drt(
                         project.cycles[cycle_number]
+                    )
+                    completed += 1
+                    self._report_batch_progress(
+                        completed, spectrum_count, f"cycle {cycle_number}"
                     )
             return results
 
@@ -13056,6 +13118,7 @@ class EISApplication:
                 stop_event=self._stop_event,
                 fit_timeout_seconds=self._fit_timeout_seconds,
                 fit_options=fit_options,
+                progress_callback=self._report_batch_progress,
             ),
             self._finish_explorer_batch_fit,
             "Selected fit failed",
@@ -13121,9 +13184,13 @@ class EISApplication:
         self.status_var.set(f"Refining fit for {len(targets)} selected spectra…")
         def refine():
             results = []
-            for dataset_id, _loaded, cycle_number, cycle, parameters, circuit in targets:
+            total = len(targets)
+            for dataset_id, loaded, cycle_number, cycle, parameters, circuit in targets:
                 if self._stop_event.is_set():
                     break
+                self._report_batch_progress(
+                    len(results), total, f"{loaded.dataset_label}, cycle {cycle_number}"
+                )
                 results.append(
                     (
                         dataset_id,
@@ -13137,6 +13204,9 @@ class EISApplication:
                             self._fit_timeout_seconds,
                         ),
                     )
+                )
+                self._report_batch_progress(
+                    len(results), total, f"{loaded.dataset_label}, cycle {cycle_number}"
                 )
             return results
 
@@ -13231,6 +13301,7 @@ class EISApplication:
                 self.state.circuit,
                 fit_timeout_seconds=self._fit_timeout_seconds,
                 fit_options=self._fit_options_from_controls(),
+                progress_callback=self._report_batch_progress,
             ),
             self._finish_batch_fit,
             "Batch fit failed",
@@ -13362,6 +13433,7 @@ class EISApplication:
                 initial_circuit=self.state.active.model(self.state.circuit),
                 fit_timeout_seconds=self._fit_timeout_seconds,
                 fit_options=self._fit_options_from_controls(),
+                progress_callback=self._report_batch_progress,
             ),
             self._finish_explorer_batch_fit,
             "Explorer batch fit failed",
@@ -13434,6 +13506,10 @@ class EISApplication:
         self._drt_peak_batch_template = [
             copy.deepcopy(peak) for peak in self.drt_peak_parameters
         ]
+        self._drt_peak_batch_total = len(self._drt_peak_batch_queue)
+        self.status_var.set(
+            f"DRT peak batch: 0 out of {self._drt_peak_batch_total} selected spectra already fitted"
+        )
         self._drt_peak_batch_next()
 
     def _drt_peak_batch_next(self) -> None:
@@ -13442,6 +13518,12 @@ class EISApplication:
         if not self._drt_peak_batch_queue:
             self._prepare_drt_peak_batch_direction()
             return
+        remaining = len(self._drt_peak_batch_queue)
+        total = getattr(self, "_drt_peak_batch_total", remaining)
+        self.status_var.set(
+            f"DRT peak batch: {total - remaining} "
+            f"out of {total} selected spectra already fitted"
+        )
         item = self._drt_peak_batch_queue.pop(0)
         dataset_id, loaded, spectrum = self._explorer_rows[item]
         self._switch_dataset(
@@ -13542,6 +13624,7 @@ class EISApplication:
                 stop_event=self._stop_event,
                 initial_circuit=self.state.active.model(self.state.circuit),
                 fit_timeout_seconds=self._fit_timeout_seconds,
+                progress_callback=self._report_batch_progress,
             ),
             self._finish_explorer_batch_fit,
             "Selected batch fit failed",
@@ -14245,6 +14328,7 @@ class EISApplication:
                         stop_event=self._stop_event,
                         fit_timeout_seconds=self._fit_timeout_seconds,
                         fit_options=fit_options,
+                        progress_callback=self._report_batch_progress,
                     ),
                     self._finish_explorer_batch_fit,
                     "Suggested EEC fit failed",
@@ -16085,9 +16169,13 @@ class EISApplication:
 
         def detect() -> list[tuple[object, np.ndarray | None, str | None]]:
             results = []
+            total = len(targets)
             for cycle in targets:
                 if self._stop_event.is_set():
                     break
+                self._report_batch_progress(
+                    len(results), total, f"cycle {cycle.cycle}"
+                )
                 try:
                     indices, _diagnostics = detect_outliers_in_active_points(
                         cycle.frequency_hz,
@@ -16098,6 +16186,9 @@ class EISApplication:
                     results.append((cycle, indices, None))
                 except Exception as error:
                     results.append((cycle, None, f"{type(error).__name__}: {error}"))
+                self._report_batch_progress(
+                    len(results), total, f"cycle {cycle.cycle}"
+                )
             return results
 
         self._submit(
@@ -16279,9 +16370,13 @@ class EISApplication:
             self.status_var.set(f"Calculating ridge DRT for {len(missing)} spectra...")
             def calculate_ridge():
                 results = []
+                total = len(missing)
                 for loaded, cycle in missing:
                     if self._stop_event.is_set():
                         break
+                    self._report_batch_progress(
+                        len(results), total, f"cycle {cycle.cycle}"
+                    )
                     results.append(
                         (
                             loaded,
@@ -16292,6 +16387,9 @@ class EISApplication:
                                 loaded.state.parameters_for(cycle.cycle),
                             ),
                         )
+                    )
+                    self._report_batch_progress(
+                        len(results), total, f"cycle {cycle.cycle}"
                     )
                 return results
 
@@ -16307,10 +16405,17 @@ class EISApplication:
 
         def calculate_hybrid():
             results = []
+            total = len(missing)
             for loaded, cycle in missing:
                 if self._stop_event.is_set():
                     break
+                self._report_batch_progress(
+                    len(results), total, f"cycle {cycle.cycle}"
+                )
                 results.append((loaded, cycle.cycle, calculate_hybrid_drt(cycle)))
+                self._report_batch_progress(
+                    len(results), total, f"cycle {cycle.cycle}"
+                )
             return results
 
         self._submit(
