@@ -8,6 +8,7 @@
 - For circuit comparison, parameter transfer, or topology changes, use `.agents/skills/eec-circuit-reasoning/SKILL.md`.
 - For state mutation, cache invalidation, project schema, or import/export compatibility, use `.agents/skills/eis-state-preservation/SKILL.md`.
 - For impedance signs, units, frequency/tau handling, CPEs, Nyquist/Bode, or DRT semantics, use `.agents/skills/eis-drt-conventions/SKILL.md`.
+- For larger or ambiguous updates where the desired behavior is not fully specified, use `.agents/skills/grill-me/SKILL.md` to interview the user before implementing.
 - Preserve unrelated user changes. This repository may contain experimental data and generated ML artifacts that are intentionally untracked or large.
 
 Agent workflow: after completing each task in this repository, commit the intended tracked changes and push them to the configured GitHub remote (GitHub) when finished. Always push to `main` — deliver directly on `main` rather than opening feature branches or PRs. Do not stage unrelated generated or untracked artifacts; preserve unrelated user changes and call out any ambiguity before committing.
