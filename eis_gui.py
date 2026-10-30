@@ -231,6 +231,84 @@ ML_TRAINED_MODELS = {
     "Flex": Path(__file__).resolve().parent / "ml" / "analysis" / "number_aware_pipeline_flex_181" / "pipeline.joblib",
 }
 
+# Ordered pipeline steps that can be configured per trained model in Preferences
+# and applied automatically from the ML Processing dialog.
+ML_PIPELINE_ACTION_LABELS = {
+    "frequency_limits": "Frequency limits",
+    "outliers": "Deterministic outliers removal",
+    "model": "ML EEC model selection",
+    "parameter_limits": "Parameters limits",
+    "initial_parameters": "ML initial parameters",
+    "fit": "Fit selected spectra",
+    "refine": "Refine fit",
+}
+ML_PIPELINE_ACTIONS = tuple(ML_PIPELINE_ACTION_LABELS)
+DEFAULT_ML_PIPELINES = {
+    name: {
+        "actions": list(ML_PIPELINE_ACTIONS),
+        "outlier_threshold": "4",
+        "refine_z_threshold": "3.5",
+        "refine_max_iterations": "5",
+    }
+    for name in ML_TRAINED_MODELS
+}
+
+
+def normalize_ml_pipeline(actions, outlier_threshold, refine_z_threshold, refine_max_iterations) -> dict:
+    """Validate and normalize one saved ML pipeline definition.
+
+    Raises ValueError with a user-readable message when any value is invalid;
+    unknown action keys are dropped so stale entries cannot break the runner.
+    """
+    if not isinstance(actions, (list, tuple)):
+        raise ValueError("pipeline actions must be a list")
+    normalized_actions = [action for action in actions if action in ML_PIPELINE_ACTION_LABELS]
+    if not normalized_actions:
+        raise ValueError("pipeline must contain at least one action")
+    threshold = float(outlier_threshold)
+    if not np.isfinite(threshold) or threshold <= 0:
+        raise ValueError("outlier threshold must be positive")
+    refine_z = float(refine_z_threshold)
+    if not np.isfinite(refine_z) or refine_z <= 0:
+        raise ValueError("refine Z threshold must be positive")
+    iterations = int(refine_max_iterations)
+    if iterations < 1:
+        raise ValueError("refinement iterations must be at least 1")
+    return {
+        "actions": normalized_actions,
+        "outlier_threshold": f"{threshold:g}",
+        "refine_z_threshold": f"{refine_z:g}",
+        "refine_max_iterations": str(iterations),
+    }
+
+
+def normalize_ml_pipelines(payload, defaults=None) -> dict[str, dict]:
+    """Normalize a ``ml_model_pipelines`` preferences payload per trained model.
+
+    Models without a saved entry (or with an unusable one) fall back to the
+    default pipeline so ML Processing always has something to apply.
+    """
+    defaults = defaults if defaults is not None else DEFAULT_ML_PIPELINES
+    pipelines: dict[str, dict] = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    for name in ML_TRAINED_MODELS:
+        fallback = defaults.get(name) or DEFAULT_ML_PIPELINES[name]
+        entry = payload.get(name)
+        if not isinstance(entry, dict):
+            pipelines[name] = copy.deepcopy(fallback)
+            continue
+        try:
+            pipelines[name] = normalize_ml_pipeline(
+                entry.get("actions", fallback["actions"]),
+                entry.get("outlier_threshold", fallback["outlier_threshold"]),
+                entry.get("refine_z_threshold", fallback["refine_z_threshold"]),
+                entry.get("refine_max_iterations", fallback["refine_max_iterations"]),
+            )
+        except (ValueError, TypeError):
+            pipelines[name] = copy.deepcopy(fallback)
+    return pipelines
+
 HELP_TOPICS: tuple[tuple[str, str, str], ...] = (
     ("Getting started", "quick-start.md", "Quick start"),
     ("eisyFIT overview", "overview.md", "eisyFIT overview"),
@@ -2017,6 +2095,7 @@ class EISApplication:
             "cpe_q": (1e-6, 1e3),
             "cpe_alpha": (0.5, 1.0),
         }
+        self._ml_model_pipelines = copy.deepcopy(DEFAULT_ML_PIPELINES)
         self._auto_model_settings = {
             "criterion": "lml-bic",
             "max_num_peaks": 10,
@@ -2117,6 +2196,9 @@ class EISApplication:
                 self._auto_model_settings["max_num_peaks"] = max(
                     int(self._auto_model_settings["max_num_peaks"]), 1
                 )
+            self._ml_model_pipelines = normalize_ml_pipelines(
+                payload.get("ml_model_pipelines"), defaults=self._ml_model_pipelines
+            )
             (
                 self._procedure_library_blocks,
                 self._procedure_library,
@@ -2197,6 +2279,10 @@ class EISApplication:
                         "refine_max_iterations": self.refine_max_iterations_var.get(),
                     },
                     "auto_model": self._auto_model_settings,
+                    "ml_model_pipelines": {
+                        name: copy.deepcopy(pipeline)
+                        for name, pipeline in self._ml_model_pipelines.items()
+                    },
                     "last_import_directory": str(self._last_import_directory),
                     "last_project_directory": str(self._last_project_directory),
                     "fit_timeout_seconds": self._fit_timeout_seconds,
@@ -2265,11 +2351,15 @@ class EISApplication:
         explorer_tab = ttk.Frame(notebook, padding=10)
         auto_tab = ttk.Frame(notebook, padding=10)
         thresholds_tab = ttk.Frame(notebook, padding=10)
+        ml_tab = ttk.Frame(notebook, padding=10)
         notebook.add(eec_tab, text="EEC models")
         notebook.add(optimizer_tab, text="EEC optimizer")
         notebook.add(explorer_tab, text="Explorers")
         notebook.add(auto_tab, text="Auto model selection")
         notebook.add(thresholds_tab, text="Thresholds & guidance")
+        notebook.add(ml_tab, text="ML pipelines")
+
+        ml_tab.columnconfigure(1, weight=1)
 
         eec_tab.columnconfigure(0, weight=1)
         eec_tab.rowconfigure(1, weight=1)
@@ -2784,6 +2874,149 @@ class EISApplication:
             justify=tk.LEFT,
         ).grid(row=3, column=0, sticky="w", pady=(12, 0))
 
+        ttk.Label(
+            ml_tab,
+            text=(
+                "Configure the pipeline (actions and settings) saved for each trained "
+                "model. In ML processing, enable \"Apply saved pipeline for the selected "
+                "model\" to run these steps automatically; leave it off to build the "
+                "pipeline manually."
+            ),
+            wraplength=620,
+            justify=tk.LEFT,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ttk.Label(ml_tab, text="Trained model").grid(row=1, column=0, sticky="w")
+        ml_model_var = tk.StringVar(value=next(iter(ML_TRAINED_MODELS)))
+        ml_model_box = ttk.Combobox(
+            ml_tab,
+            textvariable=ml_model_var,
+            values=tuple(ML_TRAINED_MODELS),
+            state="readonly",
+        )
+        ml_model_box.grid(row=1, column=1, sticky="ew")
+        ml_editors_frame = ttk.Frame(ml_tab)
+        ml_editors_frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        ml_tab.rowconfigure(2, weight=1)
+        ml_pipeline_editors: dict[str, dict] = {}
+
+        def build_ml_pipeline_editor(parent: ttk.Frame, model_name: str) -> dict:
+            saved = self._ml_model_pipelines.get(model_name) or DEFAULT_ML_PIPELINES[model_name]
+            editor: dict = {"actions": list(saved["actions"])}
+            parent.columnconfigure(1, weight=1)
+            ttk.Label(parent, text="Pipeline actions (top to bottom)").grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(0, 2)
+            )
+            action_var = tk.StringVar(value=ML_PIPELINE_ACTIONS[0])
+            ttk.Combobox(
+                parent,
+                textvariable=action_var,
+                values=ML_PIPELINE_ACTIONS,
+                state="readonly",
+                width=28,
+            ).grid(row=1, column=0, sticky="ew")
+            action_list = tk.Listbox(parent, height=6, width=38, exportselection=False)
+            action_list.grid(row=1, column=1, rowspan=3, sticky="ew", padx=(8, 0))
+
+            def render_actions() -> None:
+                action_list.delete(0, tk.END)
+                for action in editor["actions"]:
+                    action_list.insert(tk.END, ML_PIPELINE_ACTION_LABELS[action])
+
+            def add_action() -> None:
+                editor["actions"].append(action_var.get())
+                render_actions()
+
+            def remove_action() -> None:
+                selection = action_list.curselection()
+                if selection:
+                    editor["actions"].pop(selection[0])
+                    render_actions()
+
+            def move_action(direction: int) -> None:
+                selection = action_list.curselection()
+                if not selection:
+                    return
+                index = selection[0]
+                target = index + direction
+                if 0 <= target < len(editor["actions"]):
+                    editor["actions"][index], editor["actions"][target] = (
+                        editor["actions"][target],
+                        editor["actions"][index],
+                    )
+                    render_actions()
+                    action_list.selection_set(target)
+
+            ttk.Button(parent, text="Add", command=add_action).grid(
+                row=2, column=0, sticky="w", pady=3
+            )
+            editor_buttons = ttk.Frame(parent)
+            editor_buttons.grid(row=3, column=0, sticky="w")
+            ttk.Button(editor_buttons, text="Remove", command=remove_action).pack(
+                side=tk.LEFT
+            )
+            ttk.Button(
+                editor_buttons, text="Up", command=lambda: move_action(-1)
+            ).pack(side=tk.LEFT, padx=3)
+            ttk.Button(
+                editor_buttons, text="Down", command=lambda: move_action(1)
+            ).pack(side=tk.LEFT)
+            settings = ttk.LabelFrame(parent, text="Pipeline settings", padding=6)
+            settings.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+            ttk.Label(settings, text="Outlier threshold").grid(row=0, column=0, sticky="w")
+            threshold_var = tk.StringVar(value=str(saved["outlier_threshold"]))
+            ttk.Entry(settings, textvariable=threshold_var, width=10).grid(
+                row=0, column=1, padx=5
+            )
+            ttk.Label(settings, text="Refine Z threshold").grid(row=0, column=2, sticky="w")
+            refine_z_var = tk.StringVar(value=str(saved["refine_z_threshold"]))
+            ttk.Entry(settings, textvariable=refine_z_var, width=10).grid(
+                row=0, column=3, padx=5
+            )
+            ttk.Label(settings, text="Refine iterations").grid(row=0, column=4, sticky="w")
+            refine_iterations_var = tk.StringVar(value=str(saved["refine_max_iterations"]))
+            ttk.Entry(settings, textvariable=refine_iterations_var, width=8).grid(
+                row=0, column=5, padx=5
+            )
+
+            def reset_to_default() -> None:
+                default = DEFAULT_ML_PIPELINES[model_name]
+                editor["actions"] = list(default["actions"])
+                threshold_var.set(default["outlier_threshold"])
+                refine_z_var.set(default["refine_z_threshold"])
+                refine_iterations_var.set(default["refine_max_iterations"])
+                render_actions()
+
+            ttk.Button(
+                parent, text="Reset to default pipeline", command=reset_to_default
+            ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+            render_actions()
+            editor.update(
+                {
+                    "frame": parent,
+                    "threshold_var": threshold_var,
+                    "refine_z_var": refine_z_var,
+                    "refine_iterations_var": refine_iterations_var,
+                }
+            )
+            return editor
+
+        for model_name in ML_TRAINED_MODELS:
+            editor_frame = ttk.Frame(ml_editors_frame)
+            ml_pipeline_editors[model_name] = build_ml_pipeline_editor(
+                editor_frame, model_name
+            )
+
+        def show_ml_pipeline_editor(_event=None) -> None:
+            selected = ml_model_var.get()
+            for model_name, editor in ml_pipeline_editors.items():
+                if model_name == selected:
+                    editor["frame"].grid(row=0, column=0, sticky="nsew")
+                else:
+                    editor["frame"].grid_forget()
+
+        ml_model_box.bind("<<ComboboxSelected>>", show_ml_pipeline_editor)
+        show_ml_pipeline_editor()
+
         def add_circuit(_event=None) -> None:
             value = entry.get().strip()
             if value and value not in circuit_list.get(0, tk.END):
@@ -2867,10 +3100,22 @@ class EISApplication:
                     or fit_timeout_seconds <= 0
                 ):
                     raise ValueError("EEC fit time limit must be positive")
+                ml_pipelines = {}
+                for model_name, editor in ml_pipeline_editors.items():
+                    try:
+                        ml_pipelines[model_name] = normalize_ml_pipeline(
+                            editor["actions"],
+                            editor["threshold_var"].get(),
+                            editor["refine_z_var"].get(),
+                            editor["refine_iterations_var"].get(),
+                        )
+                    except (ValueError, TypeError) as error:
+                        raise ValueError(f"ML pipeline for '{model_name}': {error}")
                 self._fit_options_from_controls()
                 self._auto_model_settings = auto_settings
                 self._eec_parameter_bounds = parameter_bounds
                 self._fit_timeout_seconds = fit_timeout_seconds
+                self._ml_model_pipelines = ml_pipelines
                 self.threshold_var.set(f"{bayes_drt2_threshold:g}")
                 self.deterministic_threshold_var.set(f"{deterministic_threshold:g}")
                 self.refine_z_threshold_var.set(f"{refine_z_threshold:g}")
@@ -8262,24 +8507,23 @@ class EISApplication:
         ttk.Label(frame, text=f"Selected spectra: {len(selected_rows)}").grid(row=0, column=0, sticky="w")
         ttk.Label(frame, text="Trained model").grid(row=1, column=0, sticky="w", pady=(8, 2))
         model_var = tk.StringVar(value="Sputtered cathode")
-        ttk.Combobox(frame, textvariable=model_var, values=tuple(ML_TRAINED_MODELS), state="readonly", width=28).grid(row=1, column=1, sticky="ew", pady=(8, 2))
-        ttk.Label(frame, text="Pipeline actions (top to bottom)").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 2))
-        action_labels = {
-            "frequency_limits": "Frequency limits",
-            "outliers": "Deterministic outliers removal",
-            "model": "ML EEC model selection",
-            "parameter_limits": "Parameters limits",
-            "initial_parameters": "ML initial parameters",
-            "fit": "Fit selected spectra",
-            "refine": "Refine fit",
-        }
-        action_values = tuple(action_labels)
-        actions = ["frequency_limits", "outliers", "model", "parameter_limits", "initial_parameters", "fit", "refine"]
+        model_box = ttk.Combobox(frame, textvariable=model_var, values=tuple(ML_TRAINED_MODELS), state="readonly", width=28)
+        model_box.grid(row=1, column=1, sticky="ew", pady=(8, 2))
+        use_saved_pipeline_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="Apply saved pipeline for the selected model (from Preferences)",
+            variable=use_saved_pipeline_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        ttk.Label(frame, text="Pipeline actions (top to bottom)").grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        action_labels = ML_PIPELINE_ACTION_LABELS
+        action_values = ML_PIPELINE_ACTIONS
+        actions = list(ML_PIPELINE_ACTIONS)
         action_var = tk.StringVar(value="frequency_limits")
         action_box = ttk.Combobox(frame, textvariable=action_var, values=action_values, state="readonly", width=22)
-        action_box.grid(row=3, column=0, sticky="ew")
+        action_box.grid(row=4, column=0, sticky="ew")
         action_list = tk.Listbox(frame, height=6, width=38, exportselection=False)
-        action_list.grid(row=3, column=1, rowspan=3, sticky="ew", padx=(8, 0))
+        action_list.grid(row=4, column=1, rowspan=3, sticky="ew", padx=(8, 0))
         def render_actions():
             action_list.delete(0, tk.END)
             for action in actions:
@@ -8296,13 +8540,14 @@ class EISApplication:
             if 0 <= target < len(actions):
                 actions[index], actions[target] = actions[target], actions[index]
                 render_actions(); action_list.selection_set(target)
-        ttk.Button(frame, text="Add", command=add_action).grid(row=4, column=0, sticky="w", pady=3)
-        control_row = ttk.Frame(frame); control_row.grid(row=5, column=0, sticky="w")
+        add_button = ttk.Button(frame, text="Add", command=add_action)
+        add_button.grid(row=5, column=0, sticky="w", pady=3)
+        control_row = ttk.Frame(frame); control_row.grid(row=6, column=0, sticky="w")
         ttk.Button(control_row, text="Remove", command=remove_action).pack(side=tk.LEFT)
         ttk.Button(control_row, text="Up", command=lambda: move_action(-1)).pack(side=tk.LEFT, padx=3)
         ttk.Button(control_row, text="Down", command=lambda: move_action(1)).pack(side=tk.LEFT)
         settings = ttk.LabelFrame(frame, text="Deterministic/refinement settings", padding=6)
-        settings.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 4))
+        settings.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 4))
         ttk.Label(settings, text="Outlier threshold").grid(row=0, column=0, sticky="w")
         threshold_var = tk.StringVar(value=self.deterministic_threshold_var.get())
         ttk.Entry(settings, textvariable=threshold_var, width=10).grid(row=0, column=1, padx=5)
@@ -8314,7 +8559,40 @@ class EISApplication:
         ttk.Entry(settings, textvariable=refine_iterations_var, width=8).grid(row=0, column=5, padx=5)
         render_actions()
         save_results_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frame, text="Save ML results sidecar", variable=save_results_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 2))
+        ttk.Checkbutton(frame, text="Save ML results sidecar", variable=save_results_var).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 2))
+
+        def set_manual_controls_enabled(enabled: bool) -> None:
+            state = "normal" if enabled else "disabled"
+            for widget in (action_box, action_list):
+                widget.configure(state=state)
+            for child in control_row.winfo_children():
+                child.configure(state=state)
+            add_button.configure(state=state)
+            actions_label = frame.grid_slaves(row=3, column=0)
+            if actions_label:
+                actions_label[0].configure(state=state)
+            for child in settings.winfo_children():
+                if isinstance(child, ttk.Entry):
+                    child.configure(state=state)
+
+        def load_saved_pipeline(_event=None) -> None:
+            """Fill the manual controls with the pipeline saved for the selected model."""
+            saved = self._ml_model_pipelines.get(model_var.get()) or DEFAULT_ML_PIPELINES[model_var.get()]
+            actions[:] = list(saved["actions"])
+            threshold_var.set(str(saved["outlier_threshold"]))
+            refine_z_var.set(str(saved["refine_z_threshold"]))
+            refine_iterations_var.set(str(saved["refine_max_iterations"]))
+            render_actions()
+
+        def on_use_saved_pipeline_toggle() -> None:
+            if use_saved_pipeline_var.get():
+                load_saved_pipeline()
+                set_manual_controls_enabled(False)
+            else:
+                set_manual_controls_enabled(True)
+
+        use_saved_pipeline_var.trace_add("write", lambda *_args: on_use_saved_pipeline_toggle())
+        model_box.bind("<<ComboboxSelected>>", lambda _event: (load_saved_pipeline() if use_saved_pipeline_var.get() else None))
 
         def close() -> None:
             try:
@@ -8340,10 +8618,14 @@ class EISApplication:
                 if not destination:
                     return
             close()
-            self._start_named_ml_pipeline(model_var.get(), actions, threshold_var.get(), refine_z_var.get(), refine_iterations_var.get(), selected_rows, Path(destination) if destination else None)
+            if use_saved_pipeline_var.get():
+                saved = self._ml_model_pipelines.get(model_var.get()) or DEFAULT_ML_PIPELINES[model_var.get()]
+                self._start_named_ml_pipeline(model_var.get(), list(saved["actions"]), str(saved["outlier_threshold"]), str(saved["refine_z_threshold"]), str(saved["refine_max_iterations"]), selected_rows, Path(destination) if destination else None)
+            else:
+                self._start_named_ml_pipeline(model_var.get(), actions, threshold_var.get(), refine_z_var.get(), refine_iterations_var.get(), selected_rows, Path(destination) if destination else None)
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=8, column=0, columnspan=2, sticky="e")
+        buttons.grid(row=9, column=0, columnspan=2, sticky="e")
         ttk.Button(buttons, text="Cancel", command=close).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="Run", command=run).pack(side=tk.RIGHT, padx=(0, 8))
         popup.protocol("WM_DELETE_WINDOW", close)
@@ -8354,15 +8636,14 @@ class EISApplication:
             messagebox.showerror("ML model unavailable", f"Trained model '{model_name}' is not available:\n{model_path}", parent=self.root)
             return
         try:
-            threshold = float(outlier_threshold)
-            if not np.isfinite(threshold) or threshold <= 0:
-                raise ValueError("outlier threshold must be positive")
-            float(refine_z); iterations = int(refine_iterations)
-            if iterations < 1:
-                raise ValueError("refinement iterations must be at least 1")
-        except ValueError as error:
+            normalized = normalize_ml_pipeline(actions, outlier_threshold, refine_z, refine_iterations)
+        except (ValueError, TypeError) as error:
             messagebox.showerror("Invalid ML pipeline settings", str(error), parent=self.root)
             return
+        actions = list(normalized["actions"])
+        threshold = float(normalized["outlier_threshold"])
+        refine_z = float(normalized["refine_z_threshold"])
+        iterations = int(normalized["refine_max_iterations"])
         selected_keys = {(dataset_id, int(spectrum.cycle)) for dataset_id, _loaded, spectrum in selected_rows}
         needs_ml = bool(set(actions) & {"frequency_limits", "model", "parameter_limits", "initial_parameters"})
         targets = []
@@ -8399,9 +8680,9 @@ class EISApplication:
                         inference_failures.append((label, f"{type(error).__name__}: {error}"))
                 self._report_batch_progress(len(targets), total, target_labels[-1] if target_labels else "")
             if destination is not None:
-                write_ml_results(destination, predictions, source_project=str(self._current_stem()), pipeline={"name": model_name, "actions": list(actions), "outlier_threshold": threshold, "refine_z_threshold": float(refine_z), "refine_max_iterations": iterations})
+                write_ml_results(destination, predictions, source_project=str(self._current_stem()), pipeline={"name": model_name, "actions": list(actions), "outlier_threshold": threshold, "refine_z_threshold": refine_z, "refine_max_iterations": iterations})
             return destination, predictions, inference_failures, len(targets)
-        self._submit(work, lambda result: self._finish_named_ml_pipeline(result, actions, threshold, float(refine_z), iterations, selected_rows), "ML pipeline failed", operation_labels=[f"{loaded.dataset_label}, cycle {spectrum.cycle}" for _id, loaded, spectrum in selected_rows], operation_name="ML pipeline")
+        self._submit(work, lambda result: self._finish_named_ml_pipeline(result, actions, threshold, refine_z, iterations, selected_rows), "ML pipeline failed", operation_labels=[f"{loaded.dataset_label}, cycle {spectrum.cycle}" for _id, loaded, spectrum in selected_rows], operation_name="ML pipeline")
 
     def _finish_named_ml_pipeline(self, result, actions: list[str], threshold: float, refine_z: float, refine_iterations: int, selected_rows) -> None:
         destination, predictions, failures, processed = result

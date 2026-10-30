@@ -19,6 +19,14 @@ The dialog lets you choose operations for the selected spectra. Typical choices 
 - apply previously saved ML results,
 - fit affected spectra after applying suggestions.
 
+## Saved pipelines per model
+
+Each trained model (Sputtered cathode, AEM-WE, Flex) can have its own pipeline — the ordered actions plus outlier/refinement settings — saved in **Preferences → ML pipelines**.
+
+In the ML processing dialog, enable **Apply saved pipeline for the selected model (from Preferences)**. The dialog then loads the pipeline saved for the selected model, disables the manual action list and settings, and **Run** executes exactly that saved pipeline. Switching the model while the checkbox is enabled reloads the newly selected model's pipeline.
+
+When the checkbox is off, the dialog works manually as before: you build the action list and set the outlier/refinement values yourself.
+
 ## Load ML results
 
 Use **File → Load ML results file…** to load a saved ML results file. The results become available to the ML workflow and can be matched to spectra by the path-independent spectrum identifier.

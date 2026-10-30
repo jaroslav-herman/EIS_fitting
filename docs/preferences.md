@@ -37,6 +37,12 @@ These settings control single, selected, and batch EEC fitting:
 - Robust-refinement z threshold and maximum iterations.
 - Suggested defaults are shown next to advanced settings.
 
+## ML pipelines
+
+- Configure, per trained model (Sputtered cathode, AEM-WE, Flex), the ordered pipeline actions (frequency limits, outlier removal, model selection, parameter limits, initial parameters, fit, refine) and the outlier threshold, refine Z threshold, and refine iterations.
+- **Reset to default pipeline** restores the built-in full pipeline for the selected model.
+- These pipelines are applied in the **ML processing** dialog when **Apply saved pipeline for the selected model** is enabled there.
+
 ## EEC parameter limits
 
 Open **Parameters limits** from the Circuit parameters group (`Alt+W`) to set global bounds for:
