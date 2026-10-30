@@ -18,7 +18,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.14,<3.15"
 dependencies = [
     "eisyfit-bayes-drt2>=0.2",
     "eisyfit-hybrid-drt>=0.1",
