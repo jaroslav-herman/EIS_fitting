@@ -56,8 +56,8 @@ backends. Until the maintained forks of `bayes-drt2`, `hybrid-drt`, and the
 EIS-specific `wepy` package are published under installable PyPI names, use
 the GitHub installation below.
 
-The application requires Python 3.14 or newer and a desktop environment with
-Tk support. On some Linux distributions, Tk must be installed separately
+The application requires Python 3.14 and a desktop environment with Tk
+support. On some Linux distributions, Tk must be installed separately
 (for example, the `python3-tk` system package).
 
 ### Run from GitHub
