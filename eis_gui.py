@@ -1695,6 +1695,23 @@ class EISApplication:
         )
         self.fit_menu.add_separator()
         self.fit_menu.add_command(
+            label="Batch fit with refine (cycles)…",
+            command=lambda: self._batch_fit_with_refine_prompt(None),
+        )
+        self.fit_menu.add_command(
+            label="Batch fit selected down with refine…",
+            command=lambda: self._batch_fit_with_refine_prompt(1),
+        )
+        self.fit_menu.add_command(
+            label="Batch fit selected up with refine…",
+            command=lambda: self._batch_fit_with_refine_prompt(-1),
+        )
+        self.fit_menu.add_command(
+            label="Batch selected up and down with refine…",
+            command=lambda: self._batch_fit_with_refine_prompt(0),
+        )
+        self.fit_menu.add_separator()
+        self.fit_menu.add_command(
             label="Batch down to metadata value…",
             command=lambda: self.batch_fit_explorer(1, to_metadata_value=True),
         )
@@ -1776,6 +1793,10 @@ class EISApplication:
             "Batch fit selected up",
             "Batch selected up and down",
             "Batch up",
+            "Batch fit with refine (cycles)…",
+            "Batch fit selected down with refine…",
+            "Batch fit selected up with refine…",
+            "Batch selected up and down with refine…",
             "Batch down to metadata value…",
             "Batch up to metadata value…",
         )
@@ -2065,6 +2086,7 @@ class EISApplication:
         self._deterministic_threshold_preference = "4"
         self._refine_z_threshold_preference = "3.5"
         self._refine_max_iterations_preference = "5"
+        self._batch_fit_refine_settings = None
         self._fit_timeout_seconds = 10.0
         self._fit_pipeline_preference = "local only"
         self._fit_seed_preference = ""
@@ -6326,6 +6348,70 @@ class EISApplication:
         self.reset_plot_view()
         return "break"
 
+    def _prompt_batch_fit_refine_settings(self):
+        if self.analysis_mode_var.get() != "EEC":
+            messagebox.showerror(
+                "Batch fit with refine",
+                "Batch fit with refine is available in EEC analysis mode.",
+                parent=self.root,
+            )
+            return None
+        try:
+            default_z = float(self.refine_z_threshold_var.get())
+        except (TypeError, ValueError):
+            default_z = 3.5
+        try:
+            default_iterations = int(self.refine_max_iterations_var.get())
+        except (TypeError, ValueError):
+            default_iterations = 5
+        z_threshold = simpledialog.askfloat(
+            "Batch fit with refine",
+            "Robust z threshold (Refine fit)",
+            initialvalue=default_z,
+            parent=self.root,
+        )
+        if z_threshold is None:
+            return None
+        max_iterations = simpledialog.askinteger(
+            "Batch fit with refine",
+            "Maximum refine iterations",
+            initialvalue=default_iterations,
+            parent=self.root,
+        )
+        if max_iterations is None:
+            return None
+        try:
+            if not np.isfinite(z_threshold) or z_threshold <= 0:
+                raise ValueError("the robust z threshold must be positive")
+            if max_iterations < 1:
+                raise ValueError("the maximum iteration count must be at least 1")
+        except ValueError as error:
+            messagebox.showerror("Invalid refinement settings", str(error), parent=self.root)
+            return None
+        self.refine_z_threshold_var.set(f"{z_threshold:g}")
+        self.refine_max_iterations_var.set(str(max_iterations))
+        self._refine_z_threshold_preference = self.refine_z_threshold_var.get()
+        self._refine_max_iterations_preference = self.refine_max_iterations_var.get()
+        return (z_threshold, max_iterations)
+
+    def _take_batch_fit_refine_settings(self):
+        settings = getattr(self, "_batch_fit_refine_settings", None)
+        self._batch_fit_refine_settings = None
+        return settings
+
+    def _batch_fit_with_refine_prompt(self, direction) -> None:
+        if self.busy or self.state is None:
+            return
+        settings = self._prompt_batch_fit_refine_settings()
+        if settings is None:
+            return
+        if direction is None:
+            self.batch_fit(refine_settings=settings)
+        elif direction == 0:
+            self.batch_fit_selected_up_down(refine_settings=settings)
+        else:
+            self.batch_fit_selected_down(direction, refine_settings=settings)
+
     def _open_batch_fit_key_menu(self, _event=None):
         if self.busy:
             return "break"
@@ -6333,17 +6419,45 @@ class EISApplication:
         popup.title("Batch fit")
         popup.transient(self.root)
         popup.resizable(False, False)
-        ttk.Label(
+        base_text = (
+            "Batch fit selected spectra\n\n"
+            "↑  Up     ↓  Down     Enter  Up and Down\n"
+            "r  Batch fit with refine\n\n"
+            "Press another key to cancel."
+        )
+        info = ttk.Label(
             popup,
-            text="Batch fit selected spectra\n\n↑  Up     ↓  Down     Enter  Up and Down\n\nPress another key to cancel.",
+            text=base_text,
             padding=14,
             justify="center",
-        ).pack()
+        )
+        info.pack()
         popup.grab_set()
         popup.focus_force()
 
         def choose(event):
             keysym = event.keysym
+            if keysym in {"r", "R"} and self.analysis_mode_var.get() == "EEC":
+                if getattr(self, "_batch_fit_refine_settings", None) is not None:
+                    self._batch_fit_refine_settings = None
+                    info.configure(text=base_text)
+                    return
+                popup.grab_release()
+                settings = self._prompt_batch_fit_refine_settings()
+                popup.grab_set()
+                if settings is None:
+                    return
+                self._batch_fit_refine_settings = settings
+                info.configure(
+                    text=(
+                        "Batch fit with refine enabled "
+                        f"(z={settings[0]:g}, max iterations={settings[1]})\n\n"
+                        "↑  Up     ↓  Down     Enter  Up and Down\n"
+                        "r  Disable refine\n\n"
+                        "Press another key to cancel."
+                    )
+                )
+                return
             popup.grab_release()
             popup.destroy()
             if keysym == "Up":
@@ -6360,10 +6474,12 @@ class EISApplication:
     def _start_drt_or_eec_batch(self, direction: int) -> None:
         if self.analysis_mode_var.get() == "DRT":
             self._start_drt_peak_batch(direction)
-        elif direction == 0:
-            self.batch_fit_selected_up_down()
+            return
+        refine_settings = self._take_batch_fit_refine_settings()
+        if direction == 0:
+            self.batch_fit_selected_up_down(refine_settings=refine_settings)
         else:
-            self.batch_fit_selected_down(direction)
+            self.batch_fit_selected_down(direction, refine_settings=refine_settings)
 
     def _toggle_legends_key(self, _event=None):
         self.hide_legends_var.set(not self.hide_legends_var.get())
@@ -13559,7 +13675,7 @@ class EISApplication:
                 f"{iteration_count} iterations"
             )
 
-    def batch_fit(self) -> None:
+    def batch_fit(self, refine_settings=None) -> None:
         if self.state is None or self.loaded is None or not self._capture_controls():
             return
         start_cycle = self.state.active_cycle
@@ -13569,9 +13685,19 @@ class EISApplication:
                 self.state.available_cycles.index(start_cycle) :
             ]
         )
-        self.status_var.set(
-            f"Batch fitting {cycle_count} cycles from cycle {start_cycle}…"
+        refine_z_threshold, refine_max_iterations = (
+            refine_settings if refine_settings is not None else (None, None)
         )
+        if refine_settings is not None:
+            self.status_var.set(
+                f"Batch fitting with refine {cycle_count} cycles from cycle "
+                f"{start_cycle} (z={refine_z_threshold:g}, max iterations "
+                f"{refine_max_iterations})…"
+            )
+        else:
+            self.status_var.set(
+                f"Batch fitting {cycle_count} cycles from cycle {start_cycle}…"
+            )
         self._submit(
             lambda: batch_fit_from_cycle(
                 self.loaded.dataframe,
@@ -13583,6 +13709,8 @@ class EISApplication:
                 fit_timeout_seconds=self._fit_timeout_seconds,
                 fit_options=self._fit_options_from_controls(),
                 progress_callback=self._report_batch_progress,
+                refine_z_threshold=refine_z_threshold,
+                refine_max_iterations=refine_max_iterations,
             ),
             self._finish_batch_fit,
             "Batch fit failed",
@@ -13598,6 +13726,7 @@ class EISApplication:
     def _finish_batch_fit(self, report: BatchFitReport) -> None:
         if self.state is None:
             return
+        refined_points = 0
         for result in report.fits:
             cycle = result.cycle
             cycle.parameters = result.parameters
@@ -13606,6 +13735,15 @@ class EISApplication:
             cycle.fit_impedance = result.fit_impedance
             cycle.fit_at_data_impedance = result.fit_at_data_impedance
             cycle.fit_provenance = dict(result.fit_provenance)
+            outlier_indices = np.asarray(result.refined_outlier_indices, dtype=int)
+            valid_indices = outlier_indices[
+                (outlier_indices >= 0) & (outlier_indices < cycle.frequency_hz.size)
+            ]
+            if valid_indices.size:
+                cycle.outliers[valid_indices] = True
+                cycle.manually_included[valid_indices] = False
+                cycle.invalidate_drt_cache()
+                refined_points += len(valid_indices)
             self.state.cycles[cycle.cycle] = cycle
         self._restore_controls()
         self._refresh_plot(rescale=True)
@@ -13619,7 +13757,13 @@ class EISApplication:
             )
             return
         if report.failed_cycle is None:
-            self._update_status(f"batch fit completed for {len(report.fits)} cycles")
+            if refined_points:
+                self._update_status(
+                    f"batch fit with refine completed for {len(report.fits)} cycles "
+                    f"({refined_points} outlier points deactivated)"
+                )
+            else:
+                self._update_status(f"batch fit completed for {len(report.fits)} cycles")
             return
         self._update_status(
             f"batch fit stopped at cycle {report.failed_cycle}; "
@@ -13641,6 +13785,7 @@ class EISApplication:
         direction: int,
         *,
         to_metadata_value: bool = False,
+        refine_settings=None,
     ) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
@@ -13702,10 +13847,20 @@ class EISApplication:
                 )
             )
         parameters = self.state.parameters_for(self.state.active_cycle)
-        self.status_var.set(
-            f"Batch fitting {len(targets)} spectra {direction_name}"
-            f"{target_description}…"
+        refine_z_threshold, refine_max_iterations = (
+            refine_settings if refine_settings is not None else (None, None)
         )
+        if refine_settings is not None:
+            self.status_var.set(
+                f"Batch fitting with refine {len(targets)} spectra {direction_name} "
+                f"(z={refine_z_threshold:g}, max iterations {refine_max_iterations})"
+                f"{target_description}…"
+            )
+        else:
+            self.status_var.set(
+                f"Batch fitting {len(targets)} spectra {direction_name}"
+                f"{target_description}…"
+            )
         self._submit(
             lambda: batch_fit_spectra(
                 targets,
@@ -13715,6 +13870,8 @@ class EISApplication:
                 fit_timeout_seconds=self._fit_timeout_seconds,
                 fit_options=self._fit_options_from_controls(),
                 progress_callback=self._report_batch_progress,
+                refine_z_threshold=refine_z_threshold,
+                refine_max_iterations=refine_max_iterations,
             ),
             self._finish_explorer_batch_fit,
             "Explorer batch fit failed",
@@ -13843,7 +14000,7 @@ class EISApplication:
         self._refresh_drt_peak_artists()
         self.fit_drt_peaks()
 
-    def batch_fit_selected_down(self, direction: int = 1) -> None:
+    def batch_fit_selected_down(self, direction: int = 1, refine_settings=None) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
         visible_items = list(self.explorer.get_children(""))
@@ -13895,9 +14052,19 @@ class EISApplication:
                 )
             )
         parameters = self.state.parameters_for(self.state.active_cycle)
-        self.status_var.set(
-            f"Batch fitting {len(targets)} selected spectra {direction_name}..."
+        refine_z_threshold, refine_max_iterations = (
+            refine_settings if refine_settings is not None else (None, None)
         )
+        if refine_settings is not None:
+            self.status_var.set(
+                f"Batch fitting with refine {len(targets)} selected spectra "
+                f"{direction_name} (z={refine_z_threshold:g}, max iterations "
+                f"{refine_max_iterations})..."
+            )
+        else:
+            self.status_var.set(
+                f"Batch fitting {len(targets)} selected spectra {direction_name}..."
+            )
         self._submit(
             lambda: batch_fit_spectra(
                 targets,
@@ -13906,6 +14073,8 @@ class EISApplication:
                 initial_circuit=self.state.active.model(self.state.circuit),
                 fit_timeout_seconds=self._fit_timeout_seconds,
                 progress_callback=self._report_batch_progress,
+                refine_z_threshold=refine_z_threshold,
+                refine_max_iterations=refine_max_iterations,
             ),
             self._finish_explorer_batch_fit,
             "Selected batch fit failed",
@@ -13917,6 +14086,7 @@ class EISApplication:
         if self.state is None:
             return
         failed_count = 0
+        refined_points = 0
         for result in report.fits:
             if result.fit is not None:
                 cycle = result.fit.cycle
@@ -13926,6 +14096,16 @@ class EISApplication:
                 cycle.fit_impedance = result.fit.fit_impedance
                 cycle.fit_at_data_impedance = result.fit.fit_at_data_impedance
                 cycle.fit_provenance = dict(result.fit.fit_provenance)
+                outlier_indices = np.asarray(result.fit.refined_outlier_indices, dtype=int)
+                valid_indices = outlier_indices[
+                    (outlier_indices >= 0)
+                    & (outlier_indices < cycle.frequency_hz.size)
+                ]
+                if valid_indices.size:
+                    cycle.outliers[valid_indices] = True
+                    cycle.manually_included[valid_indices] = False
+                    cycle.invalidate_drt_cache()
+                    refined_points += len(valid_indices)
                 result.loaded.state.cycles[cycle.cycle] = cycle
             else:
                 failed_count += 1
@@ -13996,9 +14176,16 @@ class EISApplication:
         # Count failures
         failed_count = sum(1 for result in report.fits if result.error is not None)
         if failed_count == 0:
-            self._update_status(
-                f"explorer batch fit completed for {len(report.fits)} spectra"
-            )
+            if refined_points:
+                self._update_status(
+                    f"explorer batch fit with refine completed for "
+                    f"{len(report.fits)} spectra "
+                    f"({refined_points} outlier points deactivated)"
+                )
+            else:
+                self._update_status(
+                    f"explorer batch fit completed for {len(report.fits)} spectra"
+                )
             return
         self._update_status(
             f"explorer batch fit completed: {len(report.fits) - failed_count} succeeded, "
@@ -14016,20 +14203,22 @@ class EISApplication:
                 parent=self.root,
             )
 
-    def batch_fit_selected_up_down(self) -> None:
+    def batch_fit_selected_up_down(self, refine_settings=None) -> None:
         if self.busy or self.state is None:
             return
         selected = self._selected_spectrum_rows()
         if not selected:
             self._update_status("select one or more spectra in the explorer first")
             return
+        self._batch_fit_refine_settings = refine_settings
         self._batch_fit_both_pending = True
         self._batch_fit_both_stage = "up"
         self._batch_fit_both_up_completed = 0
         self._batch_fit_both_down_completed = 0
-        self.batch_fit_selected_down(1)
+        self.batch_fit_selected_down(1, refine_settings=refine_settings)
         if not self.busy:
             self._batch_fit_both_pending = False
+            self._batch_fit_refine_settings = None
             return
         self.root.after(100, self._continue_batch_fit_selected_up_down)
 
@@ -14041,6 +14230,7 @@ class EISApplication:
             return
         if self._stop_event.is_set():
             self._batch_fit_both_pending = False
+            self._batch_fit_refine_settings = None
             self._update_status(
                 "Batch fit up and down stopped by user. "
                 f"Up: {self._batch_fit_both_up_completed} completed. "
@@ -14048,9 +14238,12 @@ class EISApplication:
             )
             return
         self._batch_fit_both_stage = "down"
-        self.batch_fit_selected_down(-1)
+        self.batch_fit_selected_down(
+            -1, refine_settings=self._take_batch_fit_refine_settings()
+        )
         if not self.busy:
             self._batch_fit_both_pending = False
+            self._batch_fit_refine_settings = None
 
     def copy_neighbor_drt_peaks(self, direction: int) -> None:
         if self.state is None or self.busy:

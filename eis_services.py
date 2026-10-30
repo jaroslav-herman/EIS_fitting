@@ -639,6 +639,9 @@ class BatchCycleFit:
     fit_impedance: np.ndarray
     fit_at_data_impedance: np.ndarray
     fit_provenance: dict[str, object] = field(default_factory=dict)
+    refined_outlier_indices: np.ndarray = field(
+        default_factory=lambda: np.asarray([], dtype=int)
+    )
 
 
 @dataclass
@@ -2459,6 +2462,8 @@ def batch_fit_from_cycle(
     fit_timeout_seconds: float | None = None,
     fit_options: FitOptions | None = None,
     progress_callback=None,
+    refine_z_threshold: float | None = None,
+    refine_max_iterations: int | None = None,
 ) -> BatchFitReport:
     start_index = project.available_cycles.index(start_cycle)
     cycle_numbers = project.available_cycles[start_index:]
@@ -2553,6 +2558,63 @@ def batch_fit_from_cycle(
                 fit_provenance=_fit_provenance(fit_result),
             )
         )
+        if refine_z_threshold is not None and refine_max_iterations is not None:
+            if stop_event is not None and stop_event.is_set():
+                return BatchFitReport(
+                    fits=completed,
+                    stopped=True,
+                    skipped_cycles=cycle_numbers[index + 1 :],
+                )
+            try:
+                cycle.fit_parameters = fitted
+                cycle.fit_frequency_hz = fit_frequency
+                cycle.fit_impedance = fit_impedance
+                cycle.fit_at_data_impedance = fit_at_data
+                refined_result, removed_indices, _iterations = refine_fit_cycle(
+                    cycle,
+                    cycle_circuit,
+                    fitted_parameters,
+                    refine_z_threshold,
+                    refine_max_iterations,
+                    fit_timeout_seconds,
+                    fit_options,
+                )
+                refined, refined_errors = (
+                    refined_result.fitted_parameters,
+                    refined_result.errors_percent,
+                )
+                fitted_parameters = [
+                    ParameterValue(
+                        parameter.name,
+                        parameter.unit,
+                        float(value),
+                        parameter.lower,
+                        parameter.upper,
+                        float(error_percent),
+                        parameter.fixed,
+                    )
+                    for parameter, value, error_percent in zip(
+                        fitted_parameters, refined, refined_errors
+                    )
+                ]
+                completed[-1] = BatchCycleFit(
+                    cycle=cycle,
+                    parameters=fitted_parameters,
+                    fitted_parameters=refined,
+                    fitted_errors_percent=refined_errors,
+                    fit_frequency_hz=refined_result.fit_frequency_hz,
+                    fit_impedance=refined_result.fit_impedance,
+                    fit_at_data_impedance=refined_result.fit_at_data_impedance,
+                    fit_provenance=_fit_provenance(refined_result),
+                    refined_outlier_indices=np.asarray(removed_indices, dtype=int),
+                )
+            except Exception as error:
+                return BatchFitReport(
+                    fits=completed,
+                    failed_cycle=cycle_number,
+                    error=f"{type(error).__name__}: {error}",
+                    skipped_cycles=cycle_numbers[index + 1 :],
+                )
         next_parameters = fitted_parameters
         next_circuit = cycle_circuit
         if progress_callback is not None:
@@ -2576,6 +2638,8 @@ def batch_fit_spectra(
     fit_timeout_seconds: float | None = None,
     fit_options: FitOptions | None = None,
     progress_callback=None,
+    refine_z_threshold: float | None = None,
+    refine_max_iterations: int | None = None,
 ) -> SpectrumBatchReport:
     if not targets:
         return SpectrumBatchReport([])
@@ -2697,6 +2761,69 @@ def batch_fit_spectra(
                 fit_parameters, fitted, errors_percent
             )
         ]
+        removed_indices = np.asarray([], dtype=int)
+        fit_provenance = _fit_provenance(fit_result)
+        should_refine = (
+            refine_z_threshold is not None
+            and refine_max_iterations is not None
+            and not (stop_event is not None and stop_event.is_set())
+        )
+        if should_refine:
+            try:
+                cycle.fit_parameters = fitted
+                cycle.fit_frequency_hz = fit_frequency
+                cycle.fit_impedance = fit_impedance
+                cycle.fit_at_data_impedance = fit_at_data
+                refined_result, removed_indices, _iterations = refine_fit_cycle(
+                    cycle,
+                    fit_circuit,
+                    fitted_parameters,
+                    refine_z_threshold,
+                    refine_max_iterations,
+                    fit_timeout_seconds,
+                    fit_options,
+                )
+                refined, refined_errors = (
+                    refined_result.fitted_parameters,
+                    refined_result.errors_percent,
+                )
+                fitted_parameters = [
+                    ParameterValue(
+                        parameter.name,
+                        parameter.unit,
+                        float(value),
+                        parameter.lower,
+                        parameter.upper,
+                        float(error_percent),
+                        parameter.fixed,
+                    )
+                    for parameter, value, error_percent in zip(
+                        fitted_parameters, refined, refined_errors
+                    )
+                ]
+                fitted, errors_percent = refined, refined_errors
+                fit_frequency = refined_result.fit_frequency_hz
+                fit_impedance = refined_result.fit_impedance
+                fit_at_data = refined_result.fit_at_data_impedance
+                fit_provenance = _fit_provenance(refined_result)
+                removed_indices = np.asarray(removed_indices, dtype=int)
+            except Exception as error:
+                completed.append(
+                    SpectrumBatchFit(
+                        loaded=target.loaded,
+                        fit=None,
+                        error=f"{type(error).__name__}: {error}",
+                    )
+                )
+                if progress_callback is not None:
+                    progress_callback(len(completed), total, target.label)
+                if stop_event is not None and stop_event.is_set():
+                    return SpectrumBatchReport(
+                        completed,
+                        stopped=True,
+                        skipped_labels=[item.label for item in targets[index + 1 :]],
+                    )
+                continue
         completed.append(
             SpectrumBatchFit(
                 loaded=target.loaded,
@@ -2707,8 +2834,9 @@ def batch_fit_spectra(
                     fitted_errors_percent=errors_percent,
                     fit_frequency_hz=fit_frequency,
                     fit_impedance=fit_impedance,
-                fit_at_data_impedance=fit_at_data,
-                fit_provenance=_fit_provenance(fit_result),
+                    fit_at_data_impedance=fit_at_data,
+                    fit_provenance=fit_provenance,
+                    refined_outlier_indices=removed_indices,
                 ),
             )
         )

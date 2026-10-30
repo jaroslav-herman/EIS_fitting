@@ -7,6 +7,7 @@ import numpy as np
 from eis_model import ParameterValue
 from eis_services import (
     BatchCycleFit,
+    FitResult,
     LoadedProject,
     SpectrumBatchFit,
     SpectrumBatchReport,
@@ -252,6 +253,135 @@ class BatchProgressTests(unittest.TestCase):
         )
         self.assertEqual(2, len(report.fits))
         self.assertEqual([(0, 2, 1), (1, 2, 1), (1, 2, 2), (2, 2, 2)], events)
+
+
+def fake_refine(state, _circuit, parameters, z_threshold, max_iterations, *args, **kwargs):
+    values = np.asarray([parameter.initial for parameter in parameters], dtype=float) * 2.0
+    result = FitResult(
+        fitted_parameters=values,
+        errors_percent=np.full_like(values, 0.5),
+        fit_frequency_hz=np.array([1.0]),
+        fit_impedance=np.array([2.0 + 0j]),
+        fit_at_data_impedance=np.array([2.0 + 0j]),
+        objective=0.0,
+        rmse=0.0,
+        converged=True,
+    )
+    return result, np.asarray([0], dtype=int), 1
+
+
+class BatchFitWithRefineTests(unittest.TestCase):
+    def setUp(self):
+        self.loaded = FakeLoaded([FakeCycle(1), FakeCycle(2), FakeCycle(3)])
+        self.parameters = self.loaded.state.parameters_for(1)
+        self.targets = [
+            SpectrumFitTarget(self.loaded, cycle, f"cycle {cycle}")
+            for cycle in (1, 2, 3)
+        ]
+
+    @patch("eis_services.refine_fit_cycle", side_effect=fake_refine)
+    @patch("eis_services.fit_cycle", side_effect=fake_fit)
+    def test_refined_parameters_become_initials_for_next_spectrum(self, fit, _refine):
+        report = batch_fit_spectra(
+            self.targets,
+            self.parameters,
+            refine_z_threshold=3.5,
+            refine_max_iterations=5,
+        )
+        self.assertEqual(3, len(report.fits))
+        self.assertEqual(
+            [1.0, 2.0, 4.0],
+            [call.args[2][0].initial for call in fit.call_args_list],
+        )
+        self.assertEqual([2.0, 4.0, 8.0], [f.fit.fitted_parameters[0] for f in report.fits])
+        for result in report.fits:
+            self.assertEqual([0], list(result.fit.refined_outlier_indices))
+            self.assertEqual(0.5, result.fit.parameters[0].error_percent)
+
+    @patch("eis_services.refine_fit_cycle", side_effect=fake_refine)
+    @patch("eis_services.fit_cycle", side_effect=fake_fit)
+    def test_stop_between_fit_and_refine_keeps_fit_without_refine(self, fit, _refine):
+        event = threading.Event()
+
+        def fit_and_stop(*args):
+            result = fake_fit(*args)
+            if fit.call_count == 2:
+                event.set()
+            return result
+
+        fit.side_effect = fit_and_stop
+        report = batch_fit_spectra(
+            self.targets,
+            self.parameters,
+            stop_event=event,
+            refine_z_threshold=3.5,
+            refine_max_iterations=5,
+        )
+        self.assertTrue(report.stopped)
+        self.assertEqual(2, len(report.fits))
+        self.assertEqual(["cycle 3"], report.skipped_labels)
+        self.assertEqual([0], list(report.fits[0].fit.refined_outlier_indices))
+        self.assertEqual([], list(report.fits[1].fit.refined_outlier_indices))
+
+    @patch("eis_services.fit_cycle", side_effect=fake_fit)
+    def test_refine_failure_continues_with_next_spectrum(self, _fit):
+        with patch(
+            "eis_services.refine_fit_cycle",
+            side_effect=[fake_refine(*[None, None, self.parameters, 3.5, 5]), RuntimeError("refine failed"), fake_refine(*[None, None, self.parameters, 3.5, 5])],
+        ):
+            report = batch_fit_spectra(
+                self.targets,
+                self.parameters,
+                refine_z_threshold=3.5,
+                refine_max_iterations=5,
+            )
+        self.assertEqual(3, len(report.fits))
+        self.assertIsNone(report.fits[0].error)
+        self.assertIn("refine failed", report.fits[1].error)
+        self.assertIsNone(report.fits[2].error)
+        self.assertFalse(report.stopped)
+
+    @patch("eis_services.refine_fit_cycle", side_effect=fake_refine)
+    @patch("eis_services.fit_cycle", side_effect=fake_fit)
+    def test_batch_fit_from_cycle_chains_refined_parameters(self, fit, _refine):
+        loaded = FakeLoaded([FakeCycle(1), FakeCycle(2)])
+        loaded.state.available_cycles = [1, 2]
+        report = batch_fit_from_cycle(
+            None,
+            loaded.state,
+            1,
+            self.parameters,
+            refine_z_threshold=3.5,
+            refine_max_iterations=5,
+        )
+        self.assertEqual(2, len(report.fits))
+        self.assertEqual(
+            [1.0, 2.0],
+            [call.args[2][0].initial for call in fit.call_args_list],
+        )
+        self.assertEqual([2.0, 4.0], [f.fitted_parameters[0] for f in report.fits])
+        for result in report.fits:
+            self.assertEqual([0], list(result.refined_outlier_indices))
+
+    @patch("eis_services.refine_fit_cycle", side_effect=fake_refine)
+    @patch("eis_services.fit_cycle", side_effect=fake_fit)
+    def test_batch_fit_from_cycle_stop_skips_remaining_cycles(self, fit, _refine):
+        event = threading.Event()
+        event.set()
+        loaded = FakeLoaded([FakeCycle(1), FakeCycle(2)])
+        loaded.state.available_cycles = [1, 2]
+        report = batch_fit_from_cycle(
+            None,
+            loaded.state,
+            1,
+            self.parameters,
+            stop_event=event,
+            refine_z_threshold=3.5,
+            refine_max_iterations=5,
+        )
+        self.assertEqual([], report.fits)
+        self.assertTrue(report.stopped)
+        self.assertEqual([1, 2], report.skipped_cycles)
 
 
 if __name__ == "__main__":
