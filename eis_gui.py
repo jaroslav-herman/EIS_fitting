@@ -12591,8 +12591,8 @@ class EISApplication:
         ]:
             return False
         original_parameters = dict(parameters_by_name)
-        for destination, (destination_id, _tau) in enumerate(ordered_groups):
-            source_id = groups[destination][0]
+        for destination, (destination_id, _tau) in enumerate(groups):
+            source_id = ordered_groups[destination][0]
             for suffix in ("", "_0", "_1"):
                 destination_name = (
                     f"R{destination_id}" if suffix == "" else f"CPE{destination_id}{suffix}"
@@ -12617,8 +12617,8 @@ class EISApplication:
                 for name, value in zip(original_parameter_names, cycle.fit_parameters)
             }
             original_fitted = dict(fitted_by_name)
-            for destination, (destination_id, _tau) in enumerate(ordered_groups):
-                source_id = groups[destination][0]
+            for destination, (destination_id, _tau) in enumerate(groups):
+                source_id = ordered_groups[destination][0]
                 for suffix in ("", "_0", "_1"):
                     destination_name = (
                         f"R{destination_id}" if suffix == "" else f"CPE{destination_id}{suffix}"

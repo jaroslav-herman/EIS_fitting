@@ -74,6 +74,45 @@ class CircuitStructureTests(unittest.TestCase):
         self.assertEqual([8.0, 9.0, 10.0], cycle.fit_parameters[2:5].tolist())
         self.assertEqual([2.0, 3.0, 4.0], cycle.fit_parameters[8:11].tolist())
 
+    def test_sort_by_tau_orders_blocks_values_and_limits(self):
+        circuit = "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)"
+        parameters = [
+            ParameterValue("R0", "Ohm", 0.02, 0.0, 10.0),
+            ParameterValue("R1", "Ohm", 0.3, 1.0, 10.0),
+            ParameterValue("CPE1_0", "F", 1.0, 0.0, 20.0),
+            ParameterValue("CPE1_1", "", 1.0, 0.5, 1.0),
+            ParameterValue("R2", "Ohm", 0.1, 2.0, 20.0),
+            ParameterValue("CPE2_0", "F", 1.0, 0.0, 20.0),
+            ParameterValue("CPE2_1", "", 1.0, 0.5, 1.0),
+            ParameterValue("R3", "Ohm", 0.2, 3.0, 30.0),
+            ParameterValue("CPE3_0", "F", 1.0, 0.0, 20.0),
+            ParameterValue("CPE3_1", "", 1.0, 0.5, 1.0),
+        ]
+        cycle = CycleState(
+            1,
+            np.array([1.0, 2.0, 3.0]),
+            np.ones(3, dtype=complex),
+            parameters=parameters,
+            fit_parameters=np.arange(len(parameters), dtype=float),
+            circuit=circuit,
+        )
+        state = SimpleNamespace(circuit=circuit)
+        app = object.__new__(EISApplication)
+
+        self.assertTrue(EISApplication._sort_cycle_parameters_by_tau(app, state, cycle))
+        by_name = {parameter.name: parameter for parameter in cycle.parameters}
+        self.assertEqual(0.1, by_name["R1"].initial)
+        self.assertEqual(0.2, by_name["R2"].initial)
+        self.assertEqual(0.3, by_name["R3"].initial)
+        self.assertEqual((2.0, 20.0), (by_name["R1"].lower, by_name["R1"].upper))
+        self.assertEqual((3.0, 30.0), (by_name["R2"].lower, by_name["R2"].upper))
+        self.assertEqual((1.0, 10.0), (by_name["R3"].lower, by_name["R3"].upper))
+        self.assertEqual([4.0, 5.0, 6.0], cycle.fit_parameters[1:4].tolist())
+        self.assertEqual([7.0, 8.0, 9.0], cycle.fit_parameters[4:7].tolist())
+        self.assertEqual([1.0, 2.0, 3.0], cycle.fit_parameters[7:10].tolist())
+
+        self.assertFalse(EISApplication._sort_cycle_parameters_by_tau(app, state, cycle))
+
 
 if __name__ == "__main__":
     unittest.main()
