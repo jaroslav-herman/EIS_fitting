@@ -74,6 +74,15 @@ class CircuitStructureTests(unittest.TestCase):
         self.assertEqual([8.0, 9.0, 10.0], cycle.fit_parameters[2:5].tolist())
         self.assertEqual([2.0, 3.0, 4.0], cycle.fit_parameters[8:11].tolist())
 
+    def test_block_pair_from_selection_accepts_any_two_blocks(self):
+        group_ids = ("1", "2", "3")
+        self.assertEqual(("1", "3"), EISApplication._block_pair_from_selection(group_ids, (0, 2)))
+        self.assertEqual(("2", "3"), EISApplication._block_pair_from_selection(group_ids, (1, 2)))
+        self.assertIsNone(EISApplication._block_pair_from_selection(group_ids, (0,)))
+        self.assertIsNone(EISApplication._block_pair_from_selection(group_ids, (0, 1, 2)))
+        self.assertIsNone(EISApplication._block_pair_from_selection(group_ids, (1, 1)))
+        self.assertIsNone(EISApplication._block_pair_from_selection(group_ids, (0, 5)))
+
     def test_switch_parameter_blocks_swaps_values_limits_and_fit(self):
         circuit = "R0-p(R1,CPE1)-p(R2,CPE2)-p(R3,CPE3)"
         parameters = [

@@ -12467,51 +12467,63 @@ class EISApplication:
         else:
             self._update_status("restored default circuit parameter limits")
 
+    @staticmethod
+    def _block_pair_from_selection(
+        group_ids: tuple[str, ...], selected_indices: tuple[int, ...]
+    ) -> tuple[str, str] | None:
+        if len(selected_indices) != 2:
+            return None
+        first, second = selected_indices
+        if first == second or not (0 <= first < len(group_ids)) or not (0 <= second < len(group_ids)):
+            return None
+        return group_ids[first], group_ids[second]
+
     def _choose_parameter_blocks(self, group_ids: tuple[str, ...]) -> tuple[str, str] | None:
         popup = tk.Toplevel(self.root)
         popup.title("Switch parameter blocks")
         popup.transient(self.root)
         popup.resizable(False, False)
-        popup.columnconfigure(1, weight=1)
+        popup.columnconfigure(0, weight=1)
         result: list[tuple[str, str] | None] = [None]
         block_values = tuple(f"Block {group_id} (R{group_id}, CPE{group_id})" for group_id in group_ids)
-        display_to_id = dict(zip(block_values, group_ids))
-        first_var = tk.StringVar(value=block_values[0])
-        second_var = tk.StringVar(value=block_values[1])
 
         ttk.Label(
             popup,
-            text="Select the two R/CPE blocks whose complete parameter groups should be exchanged.",
+            text="Select the two R/CPE blocks to exchange, e.g. block 1 with block 3. "
+            "Their values, limits, errors, fixed flags, and fitted values are swapped.",
             wraplength=430,
             justify=tk.LEFT,
-        ).grid(row=0, column=0, columnspan=2, padx=14, pady=(14, 12), sticky="w")
-        ttk.Label(popup, text="First block").grid(row=1, column=0, padx=(14, 8), pady=4, sticky="w")
-        ttk.Combobox(
-            popup, textvariable=first_var, values=block_values, state="readonly", width=30
-        ).grid(row=1, column=1, padx=(0, 14), pady=4, sticky="ew")
-        ttk.Label(popup, text="Second block").grid(row=2, column=0, padx=(14, 8), pady=4, sticky="w")
-        ttk.Combobox(
-            popup, textvariable=second_var, values=block_values, state="readonly", width=30
-        ).grid(row=2, column=1, padx=(0, 14), pady=4, sticky="ew")
+        ).grid(row=0, column=0, padx=14, pady=(14, 12), sticky="w")
+        block_list = tk.Listbox(
+            popup,
+            selectmode=tk.MULTIPLE,
+            exportselection=False,
+            height=len(block_values),
+            width=36,
+        )
+        for value in block_values:
+            block_list.insert(tk.END, value)
+        block_list.grid(row=1, column=0, padx=14, pady=4, sticky="ew")
 
         buttons = ttk.Frame(popup)
-        buttons.grid(row=3, column=0, columnspan=2, padx=14, pady=(12, 14), sticky="e")
+        buttons.grid(row=2, column=0, padx=14, pady=(12, 14), sticky="e")
 
         def close() -> None:
             popup.grab_release()
             popup.destroy()
 
         def confirm() -> None:
-            first_id = display_to_id[first_var.get()]
-            second_id = display_to_id[second_var.get()]
-            if first_id == second_id:
+            block_pair = EISApplication._block_pair_from_selection(
+                group_ids, block_list.curselection()
+            )
+            if block_pair is None:
                 messagebox.showerror(
-                    "Choose two different blocks",
-                    "Select two different R/CPE blocks to switch.",
+                    "Choose two blocks",
+                    "Select exactly two different R/CPE blocks to switch.",
                     parent=popup,
                 )
                 return
-            result[0] = (first_id, second_id)
+            result[0] = block_pair
             close()
 
         ttk.Button(buttons, text="Switch", command=confirm).pack(side=tk.LEFT, padx=3)
