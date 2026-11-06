@@ -12283,6 +12283,8 @@ class EISApplication:
             first = parameters[first_name]
             second = parameters[second_name]
             first.initial, second.initial = second.initial, first.initial
+            first.lower, second.lower = second.lower, first.lower
+            first.upper, second.upper = second.upper, first.upper
             first.error_percent, second.error_percent = (
                 second.error_percent,
                 first.error_percent,

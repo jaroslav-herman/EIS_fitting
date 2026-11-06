@@ -116,7 +116,7 @@ Right-click a plot for **Save graph**, **Copy to Clipboard**, **Export data**, a
 | Set model | Applies the model box value to the displayed spectrum. |
 | Set model for selected | Applies the model box value to all selected spectra. |
 | Sort by tau | Orders selected circuit parameter blocks by their characteristic time constant. |
-| Switch blocks | Switches selected equivalent parallel/series blocks without changing the circuit. |
+| Switch blocks | Exchanges the complete parameter groups (values, limits, errors, fixed flags, and fitted values) of two chosen R/CPE blocks, e.g. block 1 with block 3, without changing the circuit. |
 | Open EEC analysis window | Opens a detached EEC model/parameter editor for the active spectrum. |
 | Auto model: selected (Hybrid DRT) | Selects an EEC model automatically from a Hybrid DRT analysis of the selected spectra. |
 
