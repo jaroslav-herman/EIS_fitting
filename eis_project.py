@@ -327,18 +327,259 @@ def dataframe_from_payload(payload: str):
     return pd.read_json(StringIO(payload), orient="split")
 
 
+def _history_entry_to_payload(entry) -> dict[str, object]:
+    return {
+        "label": entry.label,
+        "current_dataset_id": entry.current_dataset_id,
+        "procedure_blocks": entry.procedure_blocks,
+        "procedures": entry.procedures,
+        "datasets": [
+            {
+                "dataset_id": dataset_id,
+                "dataset_label": loaded.dataset_label,
+                "technique": loaded.technique,
+                "state": _state_to_payload(loaded.state),
+                "dataframe": _dataframe_to_payload(loaded.dataframe),
+            }
+            for dataset_id, loaded in entry.datasets
+        ],
+    }
+
+
+def history_to_payload(history) -> dict[str, object]:
+    return {
+        "limit": int(history.limit),
+        "undo": [_history_entry_to_payload(entry) for entry in history.undo_stack],
+        "redo": [_history_entry_to_payload(entry) for entry in history.redo_stack],
+    }
+
+
+def _history_entry_from_payload(data: dict[str, object], path: Path):
+    from eis_services import HistoryEntry, catalog_spectra, load_project_from_dataframe
+
+    datasets: list[tuple[str, object]] = []
+    for dataset in data.get("datasets", []):
+        if not isinstance(dataset, dict):
+            continue
+        state_payload = dataset.get("state")
+        if not isinstance(state_payload, dict) or "dataframe" not in dataset:
+            continue
+        dataframe = dataframe_from_payload(dataset["dataframe"])
+        source_path = Path(str(state_payload.get("source_path", "restored.eisfit")))
+        loaded = load_project_from_dataframe(
+            dataframe,
+            source_path,
+            int(state_payload.get("active_cycle", 1)),
+            str(state_payload.get("control", "working")),
+            str(state_payload.get("circuit", "R0")),
+            technique=str(dataset.get("technique") or "Saved project"),
+        )
+        restored = load_project_file(loaded.state, dataframe, path, payload=state_payload)
+        loaded.state = restored
+        loaded.spectra = catalog_spectra(
+            dataframe,
+            restored.available_cycles,
+            restored.control,
+            {
+                cycle_number: {**cycle.custom_metadata, "time_s": cycle.time_s}
+                for cycle_number, cycle in restored.cycles.items()
+            },
+        )
+        loaded.dataset_id = str(dataset.get("dataset_id") or loaded.dataset_id)
+        loaded.dataset_label = str(dataset.get("dataset_label") or loaded.dataset_label)
+        datasets.append((loaded.dataset_id, loaded))
+    procedure_blocks = data.get("procedure_blocks")
+    procedures = data.get("procedures")
+    current_dataset_id = data.get("current_dataset_id")
+    return HistoryEntry(
+        label=str(data.get("label") or "change"),
+        current_dataset_id=(
+            str(current_dataset_id) if current_dataset_id else None
+        ),
+        datasets=datasets,
+        procedure_blocks=(
+            procedure_blocks if isinstance(procedure_blocks, dict) else {}
+        ),
+        procedures=procedures if isinstance(procedures, dict) else {},
+    )
+
+
+def load_project_history(history_payload, path: Path):
+    from eis_services import UndoHistory
+
+    history = UndoHistory()
+    if not isinstance(history_payload, dict):
+        return history
+    limit = history_payload.get("limit")
+    if isinstance(limit, int) and limit > 0:
+        history.limit = limit
+    for key, stack in (("undo", history.undo_stack), ("redo", history.redo_stack)):
+        entries = history_payload.get(key)
+        if not isinstance(entries, list):
+            continue
+        for entry_payload in entries:
+            if isinstance(entry_payload, dict):
+                stack.append(_history_entry_from_payload(entry_payload, path))
+    return history
+
+
+_HISTORY_CYCLE_KEY_GROUPS: tuple[tuple[frozenset[str], str], ...] = (
+    (frozenset({"manually_included", "outliers"}), "points"),
+    (frozenset({"frequency_window", "auto_max_frequency"}), "frequency window"),
+    (frozenset({"parameters"}), "parameters"),
+    (
+        frozenset(
+            {
+                "fit_parameters",
+                "fit_frequency_hz",
+                "fit_impedance",
+                "fit_at_data_impedance",
+                "fit_provenance",
+            }
+        ),
+        "fit",
+    ),
+    (frozenset({"circuit"}), "circuit"),
+    (
+        frozenset(
+            {
+                "ridge_tau_s",
+                "ridge_gamma_ohm",
+                "drt_label",
+                "saved_ridge_tau_s",
+                "saved_ridge_gamma_ohm",
+                "saved_ridge_included_mask",
+                "saved_ridge_outlier_indices",
+                "saved_ridge_parameters",
+                "saved_ridge_threshold",
+                "saved_ridge_peak_count",
+                "saved_ridge_ohmic_resistance",
+                "saved_ridge_inductance",
+                "saved_ridge_peak_parameters",
+                "saved_hybrid_tau_s",
+                "saved_hybrid_gamma_ohm",
+                "saved_hybrid_included_mask",
+                "saved_hybrid_ohmic_resistance",
+                "saved_hybrid_inductance",
+                "saved_hybrid_peak_parameters",
+                "kk_fit_impedance",
+                "kk_residual_real",
+                "kk_residual_imag",
+                "kk_included_mask",
+            }
+        ),
+        "DRT/KK",
+    ),
+    (
+        frozenset({"custom_metadata", "potential_v", "current_ma", "time_s"}),
+        "metadata",
+    ),
+)
+
+
+def _describe_state_change(
+    old_state: dict[str, object],
+    new_state: dict[str, object],
+    dataframe_changed: bool,
+) -> list[str]:
+    hints: list[str] = []
+    if old_state.get("circuit") != new_state.get("circuit"):
+        hints.append("circuit")
+    if old_state.get("active_cycle") != new_state.get("active_cycle"):
+        hints.append("active cycle")
+    if old_state.get("all_frequency_window") != new_state.get("all_frequency_window"):
+        hints.append("frequency window")
+    if old_state.get("default_parameters") != new_state.get("default_parameters"):
+        hints.append("default parameters")
+    if dataframe_changed:
+        hints.append("metadata")
+    old_cycles = old_state.get("cycles", {})
+    new_cycles = new_state.get("cycles", {})
+    if isinstance(old_cycles, dict) and isinstance(new_cycles, dict):
+        for cycle_text in sorted(
+            set(old_cycles) | set(new_cycles), key=str
+        ):
+            old_cycle = old_cycles.get(cycle_text)
+            new_cycle = new_cycles.get(cycle_text)
+            if not isinstance(old_cycle, dict) or not isinstance(new_cycle, dict):
+                if old_cycle is not new_cycle:
+                    hints.append(f"cycle {cycle_text} changed")
+                continue
+            if old_cycle == new_cycle:
+                continue
+            changed_keys = [
+                key for key in set(old_cycle) | set(new_cycle)
+                if old_cycle.get(key) != new_cycle.get(key)
+            ]
+            covered = {
+                key for keys, _group_name in _HISTORY_CYCLE_KEY_GROUPS for key in keys
+            }
+            groups = [
+                group_name
+                for keys, group_name in _HISTORY_CYCLE_KEY_GROUPS
+                if any(key in keys for key in changed_keys)
+            ]
+            if any(key not in covered for key in changed_keys):
+                groups.append("state")
+            hints.append(f"cycle {cycle_text}: {', '.join(groups)}")
+    return hints
+
+
+def describe_history_change(old_payload, new_payload) -> str:
+    if not old_payload or not new_payload:
+        return "project change"
+    old_by_id = {
+        str(dataset.get("dataset_id")): dataset
+        for dataset in old_payload
+        if isinstance(dataset, dict)
+    }
+    new_by_id = {
+        str(dataset.get("dataset_id")): dataset
+        for dataset in new_payload
+        if isinstance(dataset, dict)
+    }
+    hints: list[str] = []
+    for dataset_id, new_dataset in new_by_id.items():
+        old_dataset = old_by_id.get(dataset_id)
+        if old_dataset is None:
+            hints.append(f"added dataset {dataset_id}")
+            continue
+        old_state = old_dataset.get("state", {})
+        new_state = new_dataset.get("state", {})
+        if isinstance(old_state, dict) and isinstance(new_state, dict):
+            hints.extend(
+                _describe_state_change(
+                    old_state,
+                    new_state,
+                    old_dataset.get("dataframe") != new_dataset.get("dataframe"),
+                )
+            )
+    for dataset_id in old_by_id:
+        if dataset_id not in new_by_id:
+            hints.append(f"removed dataset {dataset_id}")
+    hints = [hint for hint in hints if hint]
+    if not hints:
+        return "project change"
+    if len(hints) > 3:
+        return ", ".join(hints[:3]) + ", \u2026"
+    return ", ".join(hints)
+
+
 def save_project_file(
     state: ProjectState,
     path: Path,
     datasets: list[tuple[str, ProjectState, object]] | None = None,
     procedure_blocks: dict[str, list[dict[str, str]]] | None = None,
     procedures: dict[str, list[dict[str, object]]] | None = None,
+    history=None,
 ) -> None:
     payload = _state_to_payload(state)
     if procedure_blocks is not None:
         payload["procedure_blocks"] = procedure_blocks
     if procedures is not None:
         payload["procedures"] = procedures
+    if history is not None:
+        payload["history"] = history_to_payload(history)
     if datasets:
         payload["datasets"] = [
             {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import copy
+from dataclasses import dataclass, field, replace
 import multiprocessing as mp
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ from eis_model import (
     ProjectState,
     as_1d_array,
     copy_parameter_values,
+    copy_project_state,
     sort_spectrum,
 )
 from circuit_structure import circuits_equivalent, map_parameter_name, parameter_name_mapping
@@ -512,6 +514,79 @@ class LoadedProject:
 class ProjectImportReport:
     loaded: list[tuple[str, LoadedProject]]
     errors: list[tuple[Path, str]]
+
+
+HISTORY_LIMIT = 50
+
+
+@dataclass
+class HistoryEntry:
+    label: str
+    current_dataset_id: str | None
+    datasets: list[tuple[str, LoadedProject]]
+    procedure_blocks: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    procedures: dict[str, list[dict[str, object]]] = field(default_factory=dict)
+
+
+def copy_loaded_project(loaded: LoadedProject) -> LoadedProject:
+    return LoadedProject(
+        dataframe=loaded.dataframe.copy(deep=True),
+        state=copy_project_state(loaded.state),
+        technique=loaded.technique,
+        spectra=[
+            replace(spectrum, custom_metadata=dict(spectrum.custom_metadata))
+            for spectrum in loaded.spectra
+        ],
+        dataset_id=loaded.dataset_id,
+        dataset_label=loaded.dataset_label,
+        skipped_cycles=loaded.skipped_cycles,
+    )
+
+
+class UndoHistory:
+    def __init__(self, limit: int = HISTORY_LIMIT) -> None:
+        self.limit = max(1, int(limit))
+        self.undo_stack: list[HistoryEntry] = []
+        self.redo_stack: list[HistoryEntry] = []
+
+    @property
+    def can_undo(self) -> bool:
+        return bool(self.undo_stack)
+
+    @property
+    def can_redo(self) -> bool:
+        return bool(self.redo_stack)
+
+    @property
+    def undo_label(self) -> str:
+        return self.undo_stack[-1].label if self.undo_stack else ""
+
+    @property
+    def redo_label(self) -> str:
+        return self.redo_stack[-1].label if self.redo_stack else ""
+
+    def push(self, entry: HistoryEntry) -> None:
+        self.undo_stack.append(entry)
+        del self.undo_stack[: -self.limit]
+        self.redo_stack.clear()
+
+    def push_undo(self, entry: HistoryEntry) -> None:
+        self.undo_stack.append(entry)
+        del self.undo_stack[: -self.limit]
+
+    def pop_undo(self) -> HistoryEntry:
+        return self.undo_stack.pop()
+
+    def push_redo(self, entry: HistoryEntry) -> None:
+        self.redo_stack.append(entry)
+        del self.redo_stack[: -self.limit]
+
+    def pop_redo(self) -> HistoryEntry:
+        return self.redo_stack.pop()
+
+    def clear(self) -> None:
+        self.undo_stack.clear()
+        self.redo_stack.clear()
 
 
 @dataclass

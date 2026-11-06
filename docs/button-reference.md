@@ -16,6 +16,15 @@ This page explains what the visible buttons and menu entries do. Menu labels end
 | Load ML results file… | Loads saved machine-learning predictions and makes them available to the ML workflow. |
 | Exit | Closes the application and asks whether to save unsaved changes. |
 
+### Edit
+
+| Menu item | What it does |
+| --- | --- |
+| Undo (`Ctrl+Z`) | Reverts the most recent project change (points, parameters, circuit, frequency window, fits, DRT results, metadata, imported datasets). The menu label shows what will be undone. |
+| Redo (`Ctrl+Y`) | Reapplies the most recently undone change. |
+
+The undo history keeps the last 50 changes and is stored inside the saved `.eisfit.json` project, so it survives saving and reloading.
+
 ### Fit
 
 | Menu item | What it does |
@@ -219,6 +228,8 @@ Both the **Fit parameters explorer** and **DRT parameters explorer** provide:
 | `Alt+V` | Initialize values from ridge analysis |
 | `Alt+F` | Open the batch-fit direction menu |
 | `Alt+Y` | Toggle the analysis mode |
+| `Ctrl+Z` | Undo the last project change |
+| `Ctrl+Y` | Redo the last undone change |
 | `Ctrl+N` | New project |
 | `Ctrl+I` | Import data |
 | `Ctrl+L` | Load project |

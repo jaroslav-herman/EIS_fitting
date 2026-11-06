@@ -33,6 +33,86 @@ def sort_spectrum(
     return frequency_hz[order], impedance[order]
 
 
+def _copy_array(values) -> np.ndarray | None:
+    if values is None:
+        return None
+    return np.array(values, copy=True)
+
+
+def copy_cycle_state(cycle: CycleState) -> CycleState:
+    return CycleState(
+        cycle=cycle.cycle,
+        frequency_hz=np.array(cycle.frequency_hz, copy=True),
+        impedance=np.array(cycle.impedance, copy=True),
+        potential_v=cycle.potential_v,
+        current_ma=cycle.current_ma,
+        time_s=cycle.time_s,
+        manually_included=np.array(cycle.manually_included, copy=True),
+        outliers=np.array(cycle.outliers, copy=True),
+        frequency_window=(
+            tuple(cycle.frequency_window)
+            if cycle.frequency_window is not None
+            else None
+        ),
+        auto_max_frequency=cycle.auto_max_frequency,
+        parameters=copy_parameter_values(cycle.parameters),
+        fit_parameters=_copy_array(cycle.fit_parameters),
+        fit_frequency_hz=_copy_array(cycle.fit_frequency_hz),
+        fit_impedance=_copy_array(cycle.fit_impedance),
+        fit_at_data_impedance=_copy_array(cycle.fit_at_data_impedance),
+        fit_provenance=dict(cycle.fit_provenance),
+        ridge_tau_s=_copy_array(cycle.ridge_tau_s),
+        ridge_gamma_ohm=_copy_array(cycle.ridge_gamma_ohm),
+        drt_label=cycle.drt_label,
+        saved_ridge_tau_s=_copy_array(cycle.saved_ridge_tau_s),
+        saved_ridge_gamma_ohm=_copy_array(cycle.saved_ridge_gamma_ohm),
+        saved_ridge_included_mask=_copy_array(cycle.saved_ridge_included_mask),
+        saved_ridge_outlier_indices=_copy_array(cycle.saved_ridge_outlier_indices),
+        saved_ridge_parameters=copy_parameter_values(cycle.saved_ridge_parameters),
+        saved_ridge_threshold=cycle.saved_ridge_threshold,
+        saved_ridge_peak_count=cycle.saved_ridge_peak_count,
+        saved_ridge_ohmic_resistance=cycle.saved_ridge_ohmic_resistance,
+        saved_ridge_inductance=cycle.saved_ridge_inductance,
+        saved_ridge_peak_parameters=[
+            dict(peak) for peak in cycle.saved_ridge_peak_parameters
+        ],
+        saved_hybrid_tau_s=_copy_array(cycle.saved_hybrid_tau_s),
+        saved_hybrid_gamma_ohm=_copy_array(cycle.saved_hybrid_gamma_ohm),
+        saved_hybrid_included_mask=_copy_array(cycle.saved_hybrid_included_mask),
+        saved_hybrid_ohmic_resistance=cycle.saved_hybrid_ohmic_resistance,
+        saved_hybrid_inductance=cycle.saved_hybrid_inductance,
+        saved_hybrid_peak_parameters=[
+            dict(peak) for peak in cycle.saved_hybrid_peak_parameters
+        ],
+        kk_fit_impedance=_copy_array(cycle.kk_fit_impedance),
+        kk_residual_real=_copy_array(cycle.kk_residual_real),
+        kk_residual_imag=_copy_array(cycle.kk_residual_imag),
+        kk_included_mask=_copy_array(cycle.kk_included_mask),
+        custom_metadata=dict(cycle.custom_metadata),
+        circuit=cycle.circuit,
+    )
+
+
+def copy_project_state(state: ProjectState) -> ProjectState:
+    return ProjectState(
+        source_path=state.source_path,
+        circuit=state.circuit,
+        control=state.control,
+        available_cycles=list(state.available_cycles),
+        active_cycle=state.active_cycle,
+        default_parameters=copy_parameter_values(state.default_parameters),
+        cycles={
+            cycle_number: copy_cycle_state(cycle)
+            for cycle_number, cycle in state.cycles.items()
+        },
+        all_frequency_window=(
+            tuple(state.all_frequency_window)
+            if state.all_frequency_window is not None
+            else None
+        ),
+    )
+
+
 @dataclass
 class ParameterValue:
     name: str

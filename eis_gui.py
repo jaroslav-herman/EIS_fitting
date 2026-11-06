@@ -58,7 +58,9 @@ from eis_project import (
     export_fit_parameters,
     export_fit_parameters_for_states,
     export_python_workspace as write_python_workspace,
+    describe_history_change,
     load_project_file,
+    load_project_history,
     load_json_payload,
     save_project_file,
 )
@@ -71,10 +73,13 @@ from eis_services import (
     FittedEECRecord,
     FitTimeoutError,
     FitOptions,
+    HistoryEntry,
     KKResiduals,
     LoadedProject,
     ProjectImportReport,
     RidgeInitialization,
+    UndoHistory,
+    copy_loaded_project,
     SPECTRUM_METADATA_COLUMN,
     WORKING_POTENTIAL_COLUMN,
     COUNTER_POTENTIAL_COLUMN,
@@ -1405,6 +1410,12 @@ class EISApplication:
         self.path = path.resolve() if path is not None else None
         self.project_path: Path | None = None
         self._saved_project_signature: str | None = None
+        self.history = UndoHistory()
+        self._history_entry: HistoryEntry | None = None
+        self._history_payload: list | None = None
+        self._history_signature: str | None = None
+        self._history_checkpoint_scheduled = False
+        self._history_suspended = False
         self.current_dataset_id: str | None = None
         self.requested_cycle = cycle
         self.control = control
@@ -1551,6 +1562,12 @@ class EISApplication:
         self.root.bind("<Alt-d>", self._on_alt_d)
         self.root.bind("<Alt-D>", self._on_alt_d)
         self.root.bind("<Alt-e>", self.toggle_point_edit_mode)
+        self.root.bind("<Control-z>", self.undo)
+        self.root.bind("<Control-Z>", self.undo)
+        self.root.bind("<Control-y>", self.redo)
+        self.root.bind("<Control-Y>", self.redo)
+        self.root.bind_all("<ButtonRelease>", self._on_history_event, add="+")
+        self.root.bind_all("<KeyRelease>", self._on_history_event, add="+")
         self.root.bind("<Alt-m>", self.edit_metadata_column_from_clipboard)
         self.root.bind("<Alt-M>", self.edit_metadata_column_from_clipboard)
         self.root.bind("<Alt-q>", self._active_zoom_key)
@@ -1658,6 +1675,20 @@ class EISApplication:
             "Save project…",
             "Load ML results file…",
         )
+        self.edit_menu = tk.Menu(menu_bar, tearoff=False)
+        self.edit_menu.add_command(
+            label="Undo",
+            accelerator="Ctrl+Z",
+            command=self.undo,
+            state=tk.DISABLED,
+        )
+        self.edit_menu.add_command(
+            label="Redo",
+            accelerator="Ctrl+Y",
+            command=self.redo,
+            state=tk.DISABLED,
+        )
+        menu_bar.add_cascade(label="Edit", menu=self.edit_menu)
         self.fit_menu = tk.Menu(menu_bar, tearoff=False)
         self.fit_menu.add_command(
             label="Fit selected spectrum",
@@ -8030,11 +8061,13 @@ class EISApplication:
             self._operation_labels = []
             self._set_controls_enabled(self.state is not None)
             self._fit_parameter_snapshot = None
+            self._schedule_history_checkpoint()
             return
         success(result)
         self._fit_parameter_snapshot = None
         self._operation_labels = []
         self._set_controls_enabled(self.state is not None)
+        self._schedule_history_checkpoint()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         state = tk.NORMAL if enabled and not self.busy else tk.DISABLED
@@ -11403,6 +11436,11 @@ class EISApplication:
         self.current_dataset_id = None
         self.loaded_projects.clear()
         self._dataset_order.clear()
+        self.history.clear()
+        self._history_entry = None
+        self._history_payload = None
+        self._history_signature = None
+        self._update_history_menu()
         self._custom_metadata_columns.clear()
         self._explorer_rows.clear()
         self._explorer_lookup.clear()
@@ -11821,6 +11859,7 @@ class EISApplication:
         self.fit()
 
     def _update_status(self, suffix: str = "") -> None:
+        self._schedule_history_checkpoint()
         if self.state is None:
             return
         cycle = self.state.active
@@ -17554,7 +17593,7 @@ class EISApplication:
             f"{len(self._explorer_rows)} spectra loaded"
         )
 
-    def _project_signature(self) -> str | None:
+    def _project_payload(self) -> list | None:
         if self.state is None:
             return None
         datasets = []
@@ -17577,7 +17616,13 @@ class EISApplication:
                     "dataframe": _dataframe_to_payload(self.loaded.dataframe),
                 }
             )
-        return json.dumps(datasets, sort_keys=True, default=str)
+        return datasets
+
+    def _project_signature(self) -> str | None:
+        payload = self._project_payload()
+        if payload is None:
+            return None
+        return json.dumps(payload, sort_keys=True, default=str)
 
     def _project_has_unsaved_changes(self) -> bool:
         if self.state is None:
@@ -17587,6 +17632,161 @@ class EISApplication:
             self._saved_project_signature is None
             or current_signature != self._saved_project_signature
         )
+
+    def _on_history_event(self, _event=None) -> None:
+        self._schedule_history_checkpoint()
+
+    def _schedule_history_checkpoint(self) -> None:
+        if self._history_checkpoint_scheduled or self._history_suspended:
+            return
+        if self.state is None or self.busy:
+            return
+        if not self.root.winfo_exists():
+            return
+        self._history_checkpoint_scheduled = True
+        self.root.after_idle(self._run_history_checkpoint)
+
+    def _capture_history_entry(self, label: str) -> HistoryEntry:
+        datasets: list[tuple[str, LoadedProject]] = []
+        for dataset_id in self._dataset_order:
+            loaded = self.loaded_projects.get(dataset_id)
+            if loaded is not None:
+                datasets.append((dataset_id, copy_loaded_project(loaded)))
+        if not datasets and self.loaded is not None:
+            datasets.append((self.current_dataset_id, copy_loaded_project(self.loaded)))
+        return HistoryEntry(
+            label=label,
+            current_dataset_id=self.current_dataset_id,
+            datasets=datasets,
+            procedure_blocks=copy.deepcopy(self.procedure_blocks),
+            procedures=copy.deepcopy(self.procedures),
+        )
+
+    def _run_history_checkpoint(self) -> None:
+        self._history_checkpoint_scheduled = False
+        if self.state is None or self.busy or self._history_suspended:
+            return
+        payload = self._project_payload()
+        if payload is None:
+            return
+        signature = json.dumps(payload, sort_keys=True, default=str)
+        if signature == self._history_signature:
+            return
+        if self._history_signature is None:
+            self._history_payload = payload
+            self._history_signature = signature
+            self._history_entry = self._capture_history_entry("")
+            return
+        label = describe_history_change(self._history_payload, payload)
+        if self._history_entry is not None:
+            self._history_entry.label = label
+            self.history.push(self._history_entry)
+        self._history_payload = payload
+        self._history_signature = signature
+        self._history_entry = self._capture_history_entry("")
+        self._update_history_menu()
+
+    def _baseline_history(self) -> None:
+        self._history_suspended = True
+        try:
+            self._history_payload = self._project_payload()
+            self._history_signature = (
+                json.dumps(self._history_payload, sort_keys=True, default=str)
+                if self._history_payload is not None
+                else None
+            )
+            self._history_entry = (
+                self._capture_history_entry("") if self.state is not None else None
+            )
+        finally:
+            self._history_suspended = False
+        self._update_history_menu()
+
+    def _update_history_menu(self) -> None:
+        menu = getattr(self, "edit_menu", None)
+        if menu is None:
+            return
+        if self.history.can_undo:
+            menu.entryconfigure(
+                0, label=f"Undo: {self.history.undo_label}", state=tk.NORMAL
+            )
+        else:
+            menu.entryconfigure(0, label="Undo", state=tk.DISABLED)
+        if self.history.can_redo:
+            menu.entryconfigure(
+                1, label=f"Redo: {self.history.redo_label}", state=tk.NORMAL
+            )
+        else:
+            menu.entryconfigure(1, label="Redo", state=tk.DISABLED)
+
+    def _restore_history_entry(self, entry: HistoryEntry) -> None:
+        self._history_suspended = True
+        try:
+            self.loaded_projects = {}
+            self._dataset_order = []
+            for dataset_id, loaded in entry.datasets:
+                self._dataset_order.append(dataset_id)
+                self.loaded_projects[dataset_id] = loaded
+            current_id = entry.current_dataset_id
+            if current_id not in self.loaded_projects and self._dataset_order:
+                current_id = self._dataset_order[0]
+            self.current_dataset_id = current_id
+            loaded = self.loaded_projects.get(current_id)
+            if loaded is None:
+                return
+            self.loaded = loaded
+            self.state = loaded.state
+            self.path = loaded.state.source_path.resolve()
+            self.control = loaded.state.control
+            self.circuit = loaded.state.circuit
+            self.procedure_blocks = copy.deepcopy(entry.procedure_blocks)
+            self.procedures = copy.deepcopy(entry.procedures)
+            self.root.title(f"eisyFIT \u2014 {loaded.dataset_label}")
+            self.model_var.set(loaded.state.circuit)
+            self.cycle_var.set(str(loaded.state.active_cycle))
+            self._fit_parameter_snapshot = None
+            self._sync_custom_metadata_columns()
+            self._populate_explorer()
+            self._highlight_explorer_cycle(loaded.state.active_cycle)
+            self._restore_controls()
+            self._refresh_plot(rescale=True)
+            self._set_controls_enabled(True)
+            self._history_payload = self._project_payload()
+            self._history_signature = (
+                json.dumps(self._history_payload, sort_keys=True, default=str)
+                if self._history_payload is not None
+                else None
+            )
+            self._history_entry = self._capture_history_entry("")
+        finally:
+            self._history_suspended = False
+        self._update_history_menu()
+
+    def undo(self, _event=None):
+        if self.busy or self.state is None:
+            return "break"
+        self._run_history_checkpoint()
+        if not self.history.can_undo:
+            self._update_status("nothing to undo")
+            return "break"
+        entry = self.history.pop_undo()
+        self.history.push_redo(self._capture_history_entry(entry.label))
+        self._restore_history_entry(entry)
+        self._update_status(f"undone: {entry.label}")
+        return "break"
+
+    def redo(self, _event=None):
+        if self.busy or self.state is None:
+            return "break"
+        self._run_history_checkpoint()
+        if not self.history.can_redo:
+            self._update_status("nothing to redo")
+            return "break"
+        entry = self.history.pop_redo()
+        self.history.push_undo(self._capture_history_entry(entry.label))
+        self._restore_history_entry(entry)
+        self._update_status(f"redone: {entry.label}")
+        return "break"
 
     def _cancel_fit(self) -> None:
         if not self.busy:
@@ -17598,6 +17798,7 @@ class EISApplication:
     def save_project(self, path: Path | None = None) -> None:
         if self.busy or self.state is None or not self._capture_controls():
             return
+        self._run_history_checkpoint()
         if path is None:
             selected = filedialog.asksaveasfilename(
                 parent=self.root,
@@ -17640,6 +17841,7 @@ class EISApplication:
                 datasets=datasets,
                 procedure_blocks=self.procedure_blocks,
                 procedures=self.procedures,
+                history=self.history,
             )
         except Exception as error:
             messagebox.showerror(
@@ -18128,7 +18330,9 @@ class EISApplication:
         self.procedure_blocks, self.procedures = self._validate_procedure_data(
             payload.get("procedure_blocks"), payload.get("procedures")
         )
+        self.history = load_project_history(payload.get("history"), path)
         self._saved_project_signature = self._project_signature()
+        self._baseline_history()
         self.control = restored.control
         self.circuit = restored.circuit
         self.model_var.set(restored.circuit)
